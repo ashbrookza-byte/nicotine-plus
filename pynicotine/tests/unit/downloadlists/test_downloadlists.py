@@ -1430,6 +1430,75 @@ class DownloadListsTest(TestCase):
 
         self.assertEqual(item.download_candidates, [])
 
+    def test_remix_candidate_rejected_when_term_has_no_remix(self):
+        """The original term doesn't say "remix" -- a candidate that's some
+        specific remix is a different version of the track and must not be
+        picked, no matter how well its other words otherwise match."""
+
+        download_list = core.download_lists.add_list(
+            "No Remix List", quality="any", fuzzy_match_threshold=50, auto_download=True)
+        core.download_lists.add_list_items("No Remix List", ["Blissful Thinking - Das Pharaoh"])
+
+        item = download_list.items["Blissful Thinking - Das Pharaoh"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Das Pharaoh - Blissful Thinking (Someone Remix).mp3", 8000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "someuser", files)
+
+        core.download_lists._file_search_response(msg)
+
+        self.assertEqual(item.download_candidates, [])
+
+    def test_plain_candidate_rejected_when_term_wants_remix(self):
+        """The original term explicitly asks for a remix -- a candidate that's
+        the plain original mix is a different version and must not be picked."""
+
+        download_list = core.download_lists.add_list(
+            "Wants Remix List", quality="any", fuzzy_match_threshold=50, auto_download=True)
+        core.download_lists.add_list_items("Wants Remix List", ["Blissful Thinking (Someone Remix) - Das Pharaoh"])
+
+        item = download_list.items["Blissful Thinking (Someone Remix) - Das Pharaoh"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Das Pharaoh - Blissful Thinking (Original Mix).mp3", 8000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "someuser", files)
+
+        core.download_lists._file_search_response(msg)
+
+        self.assertEqual(item.download_candidates, [])
+
+    def test_remix_candidate_accepted_when_remix_status_agrees(self):
+        """Both non-remix-to-non-remix and remix-to-remix pairings are valid
+        candidates -- only a mismatch between the two is rejected."""
+
+        download_list = core.download_lists.add_list(
+            "Matching Remix List", quality="any", fuzzy_match_threshold=50, auto_download=True)
+        core.download_lists.add_list_items(
+            "Matching Remix List",
+            ["Blissful Thinking - Das Pharaoh", "Blissful Thinking (Someone Remix) - Das Pharaoh"]
+        )
+
+        plain_item = download_list.items["Blissful Thinking - Das Pharaoh"]
+        remix_item = download_list.items["Blissful Thinking (Someone Remix) - Das Pharaoh"]
+
+        core.download_lists._dispatch_item(download_list, plain_item)
+        core.download_lists._dispatch_item(download_list, remix_item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+
+        plain_files = [(1, "@@abc\\Das Pharaoh - Blissful Thinking.mp3", 8000000, "mp3", attributes)]
+        core.download_lists._file_search_response(
+            self._make_response(plain_item.token, "someuser", plain_files))
+
+        remix_files = [(1, "@@abc\\Das Pharaoh - Blissful Thinking (Someone Remix).mp3", 8000000, "mp3", attributes)]
+        core.download_lists._file_search_response(
+            self._make_response(remix_item.token, "otheruser", remix_files))
+
+        self.assertEqual(len(plain_item.download_candidates), 1)
+        self.assertEqual(len(remix_item.download_candidates), 1)
+
     # Watch Folder #
 
     def _set_up_watch_folder(self, enabled=True):

@@ -1600,6 +1600,21 @@ class DownloadLists:
         return (score / len(term_words)) * 100
 
     @staticmethod
+    def _matches_remix_requirement(term_words, filename_lower):
+        """Whether a candidate's remix status agrees with the original search
+        term's. If the term doesn't say "remix", a candidate that's actually
+        some specific remix is a different version of the track and must not
+        match -- and if the term does ask for a remix, the plain original
+        mix must not match either. Checked against the filename specifically
+        (not the full path), since a "Remixes" folder or similar shouldn't
+        affect a track that isn't itself a remix."""
+
+        term_has_remix = "remix" in term_words
+        filename_has_remix = bool(re.search(r"\bremix\b", filename_lower))
+
+        return term_has_remix == filename_has_remix
+
+    @staticmethod
     def _parse_keywords(keywords_text):
         """"beatport, bp" -> ["beatport", "bp"]"""
 
@@ -1666,6 +1681,12 @@ class DownloadLists:
             if match_percentage < download_list.effective_fuzzy_match_threshold:
                 # Doesn't look enough like the original term, e.g. a search that was
                 # broadened to find any results at all matched an unrelated track
+                continue
+
+            if not self._matches_remix_requirement(term_words, filename_lower):
+                # A remix of the original term's plain track, or vice versa -- a
+                # different version of the song, no matter how well its other
+                # words otherwise match
                 continue
 
             _h_quality, bitrate, _h_length, length = FileListMessage.parse_audio_quality_length(size, attributes)
