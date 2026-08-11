@@ -414,6 +414,13 @@ class TreeView:
             title_label = _find_label_widget(title_widget)
 
             if title_label is not None:
+                # An ellipsized label doesn't request its natural width, so it needs
+                # to be told to actually claim the available header space, otherwise
+                # it collapses down to a tiny minimum size instead of filling the column
+                title_label.set_hexpand(True)
+                title_label.set_halign(
+                    Gtk.Align.END if xalign == 1 else Gtk.Align.CENTER if xalign == 0.5 else Gtk.Align.START
+                )
                 title_label.set_ellipsize(Pango.EllipsizeMode.END)
 
             if column_data.get("hide_header"):
