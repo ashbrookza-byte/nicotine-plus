@@ -17,6 +17,7 @@ class Window:
 
     active_dialogs = []  # Class variable keeping dialog objects alive
     activation_token = None
+    _fullscreen_suspended = False
 
     def __init__(self, widget):
 
@@ -110,6 +111,35 @@ class Window:
 
     def _on_suspended_darwin(self, *_args):
         self.widget.set_can_target(not self.widget.is_suspended())
+
+    @classmethod
+    def _suspend_main_window_fullscreen(cls, application):
+        """Workaround for GTK 4 / macOS bug where popup windows shown while the
+        main window is in native fullscreen (a separate Space) are stretched to
+        fill the entire screen instead of appearing as regular small windows."""
+
+        if sys.platform != "darwin" or cls._fullscreen_suspended:
+            return
+
+        main_window = getattr(application, "window", None)
+
+        if main_window is None or not main_window.is_fullscreen:
+            return
+
+        main_window.widget.unfullscreen()
+        cls._fullscreen_suspended = True
+
+    @classmethod
+    def _restore_main_window_fullscreen(cls, application):
+
+        if not cls._fullscreen_suspended or cls.active_dialogs:
+            return
+
+        cls._fullscreen_suspended = False
+        main_window = getattr(application, "window", None)
+
+        if main_window is not None:
+            main_window.widget.fullscreen()
 
     def _on_hide_broadway(self, *_args):
         self.widget.unrealize()

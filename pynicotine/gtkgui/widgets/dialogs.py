@@ -168,6 +168,7 @@ class Dialog(Window):
 
         Window.active_dialogs.remove(self)
         self.application.remove_window(self.widget)
+        Window._restore_main_window_fullscreen(self.application)
 
         if self.close_callback is not None:
             self.close_callback(self)
@@ -268,6 +269,8 @@ class Dialog(Window):
 
         if self not in Window.active_dialogs:
             Window.active_dialogs.append(self)
+
+        Window._suspend_main_window_fullscreen(self.application)
 
         # Shrink the dialog if it's larger than the parent window
         self._resize_dialog()
@@ -443,6 +446,7 @@ class MessageDialog(Window):
         if self in Window.active_dialogs:
             Window.active_dialogs.remove(self)
 
+        Window._restore_main_window_fullscreen(self.application)
         self.destroy()
 
     def _on_button_pressed(self, _button, response_type):
@@ -472,6 +476,8 @@ class MessageDialog(Window):
 
         if self not in Window.active_dialogs:
             Window.active_dialogs.append(self)
+
+        Window._suspend_main_window_fullscreen(self.application)
 
         if self.default_focus_widget:
             self.default_focus_widget.grab_focus()
