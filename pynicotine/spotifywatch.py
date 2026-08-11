@@ -230,7 +230,12 @@ class SpotifyWatch:
             playlist = self._api_get(f"/playlists/{playlist_id}", params={"fields": "name"})
 
         except SpotifyAPIError as error:
-            events.invoke_main_thread(result_callback, False, error.message)
+            message = error.message
+
+            if error.status == 403:
+                message += self._diagnose_403()
+
+            events.invoke_main_thread(result_callback, False, message)
             return
 
         list_name = self._unique_list_name(playlist.get("name") or playlist_id)
@@ -471,8 +476,72 @@ class SpotifyWatch:
         self._access_token = response.get("access_token")
         self._access_token_expires_at = time.time() + response.get("expires_in", 3600) - 30
 
-        events.invoke_main_thread(result_callback, True, _("Connected to Spotify."))
+        granted_scope = response.get("scope", "")
+        missing_scopes = [scope for scope in self.SCOPES.split() if scope not in granted_scope.split()]
+
+        log.add(_("Spotify: granted scopes: %s"), granted_scope or "(Spotify didn't report any)")
+
+        if missing_scopes:
+            log.add(
+                _("Spotify: requested scope(s) not granted: %s -- playlist reads will likely fail "
+                  "with 403 until this is resolved"),
+                ", ".join(missing_scopes)
+            )
+
+        message = _("Connected to Spotify.") + " " + self._describe_connected_identity()
+
+        events.invoke_main_thread(result_callback, True, message.strip())
         events.invoke_main_thread(self._ensure_polling)
+
+    def _describe_connected_identity(self):
+        """Best-effort "Connected as <name>" suffix, fetched right after
+        login via GET /me -- confirms which Spotify account actually got
+        linked (easy to get wrong if a browser has multiple Spotify
+        accounts logged in when the consent page opens), and doubles as an
+        immediate smoke test: if even /me fails, the problem is account- or
+        token-wide, not specific to any one playlist. Every detail Spotify
+        gives back (or the failure, if /me itself doesn't work) is logged
+        in full either way -- see the log window."""
+
+        try:
+            me = self._api_get("/me")
+
+        except SpotifyAPIError as error:
+            log.add(_("Spotify: identity check (GET /me) failed right after connecting: %s"), error.message)
+            return _("Couldn't verify the connected account (see log for GET /me failure) -- "
+                     "expect playlist reads to fail too.")
+
+        display_name = me.get("display_name") or me.get("id") or "?"
+        log.add(_("Spotify: connected as %(name)s (id: %(id)s, product: %(product)s)"), {
+            "name": display_name, "id": me.get("id", "?"), "product": me.get("product", "?")
+        })
+        return _("Connected as %s.") % display_name
+
+    def _diagnose_403(self):
+        """Appended to a playlist-specific 403's own message, to tell apart
+        two very differently-fixed problems that otherwise look identical:
+        the whole connection being broken (a bad/under-scoped token --
+        reconnecting fixes it) versus this one playlist specifically being
+        off-limits (a Spotify-side restriction this app can't work around
+        -- e.g. certain algorithmic/editorial playlists, or one belonging
+        to an account that hasn't granted access). A quick GET /me settles
+        which one it is: it uses the exact same token, so if /me works, the
+        token itself is fine and the problem is specific to this playlist."""
+
+        try:
+            self._api_get("/me")
+
+        except SpotifyAPIError as error:
+            log.add(_("Spotify: GET /me also failed after a playlist 403 -- connection-wide problem: %s"),
+                    error.message)
+            return _(" Your Spotify connection itself is also failing (GET /me: %s) -- "
+                     "try reconnecting in Wishlist Settings.") % error.message
+
+        log.add(_("Spotify: GET /me succeeded after a playlist 403 -- problem is specific to that playlist"))
+        return _(" Your Spotify connection itself works fine (GET /me succeeded) -- this looks specific "
+                 "to this particular playlist, which Spotify's API is refusing to hand over to this app "
+                 "(this isn't something Nicotine+ can work around; check the log window for the exact "
+                 "response Spotify gave, including any WWW-Authenticate detail).")
 
     def _token_request(self, data):
         """Raises SpotifyAPIError on any failure -- never returns None, so
@@ -527,12 +596,23 @@ class SpotifyWatch:
     @staticmethod
     def _send_request(request):
         """Performs an HTTP request and returns the parsed JSON body, or
-        raises SpotifyAPIError with a message that includes Spotify's own
-        explanation (its error responses are JSON: {"error": {"status",
-        "message"}}), not just the bare HTTP status -- needed to tell apart
-        e.g. a bad/expired token from a playlist Spotify's API restricts
-        third-party apps from reading at all, which are both plain 403s
-        otherwise."""
+        raises SpotifyAPIError with a message built from everything Spotify
+        told us about the failure, not just the bare HTTP status. Two
+        distinct pieces get combined here, because either one alone can be
+        useless: the JSON body's "message" is very often just a generic
+        word like "Forbidden" (Spotify Web API errors: {"error": {"status",
+        "message"}}), while the actual reason -- e.g. a missing/expired
+        scope, a bad token, rate limiting -- usually shows up in the
+        WWW-Authenticate response header instead (standard OAuth2 Bearer
+        challenge format: error="...", error_description="..."), which
+        Spotify's docs don't advertise but does populate on 401/403s. Every
+        failure is also always logged in full (method, URL, status, raw
+        body, that header) via log.add, regardless of what ends up in the
+        exception message shown in the GUI -- check the log window for the
+        complete picture if something still looks wrong."""
+
+        method = request.get_method()
+        url = request.full_url
 
         try:
             with urllib.request.urlopen(request, timeout=15) as handle:  # noqa: S310 (fixed https:// URLs only)
@@ -540,6 +620,8 @@ class SpotifyWatch:
 
         except urllib.error.HTTPError as error:
             body = error.read().decode("utf-8", "replace")
+            www_authenticate = (error.headers.get("WWW-Authenticate") if error.headers else None) or ""
+
             detail = body
 
             try:
@@ -553,13 +635,27 @@ class SpotifyWatch:
             except (ValueError, AttributeError):
                 pass
 
-            log.add(_("Spotify: request failed (%(status)s): %(detail)s"), {"status": error.code, "detail": body})
-            raise SpotifyAPIError(
-                _("Spotify error %(status)s: %(detail)s") % {"status": error.code, "detail": detail},
-                status=error.code
-            ) from error
+            log.add(
+                _("Spotify: %(method)s %(url)s failed (%(status)s): %(body)s%(auth)s"), {
+                    "method": method,
+                    "url": url,
+                    "status": error.code,
+                    "body": body or "(empty response body)",
+                    "auth": (_(" | WWW-Authenticate: %s") % www_authenticate) if www_authenticate else ""
+                }
+            )
+
+            message = _("Spotify error %(status)s: %(detail)s") % {"status": error.code, "detail": detail}
+
+            if www_authenticate:
+                message += " (%s)" % www_authenticate
+
+            raise SpotifyAPIError(message, status=error.code) from error
 
         except (urllib.error.URLError, OSError, ValueError) as error:
+            log.add(_("Spotify: %(method)s %(url)s failed to connect: %(error)s"), {
+                "method": method, "url": url, "error": error
+            })
             raise SpotifyAPIError(_("Couldn't reach Spotify: %s") % error) from error
 
     def _api_get(self, path, params=None):

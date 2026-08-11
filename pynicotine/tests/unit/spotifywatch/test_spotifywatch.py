@@ -335,8 +335,46 @@ class SpotifyWatchTest(TestCase):
 
         self._flush_main_thread_callbacks()
 
-        self.assertEqual(results, [(False, "nope")])
+        self.assertEqual(len(results), 1)
+        success, message = results[0]
+        self.assertFalse(success)
+        # A 403 also triggers a GET /me diagnostic to tell apart a connection-wide
+        # problem from one specific to this playlist -- the mock fails every call,
+        # so it lands in the "connection itself is also failing" branch
+        self.assertIn("nope", message)
+        self.assertIn("reconnecting", message)
         self.assertEqual(config.sections["spotify"]["watched_playlists"], [])
+
+    def test_add_watched_playlist_thread_403_diagnoses_playlist_specific_problem(self):
+        """When the token itself is fine (GET /me succeeds) but one
+        particular playlist still 403s, the diagnostic must say so instead
+        of suggesting to reconnect -- reconnecting wouldn't fix anything in
+        that case."""
+
+        config.sections["spotify"]["refresh_token"] = "some-refresh-token"
+
+        def fake_api_get(path, params=None):  # noqa: ARG001
+            if path == "/playlists/abc123":
+                raise SpotifyAPIError("nope", status=403)
+
+            if path == "/me":
+                return {"display_name": "Someone", "id": "someone", "product": "premium"}
+
+            raise AssertionError(f"Unexpected path requested: {path}")
+
+        results = []
+
+        with patch.object(SpotifyWatch, "_api_get", side_effect=fake_api_get):
+            core.spotify_watch._add_watched_playlist_thread(
+                "abc123", lambda success, message: results.append((success, message)))
+
+        self._flush_main_thread_callbacks()
+
+        self.assertEqual(len(results), 1)
+        success, message = results[0]
+        self.assertFalse(success)
+        self.assertIn("nope", message)
+        self.assertIn("specific to this particular playlist", message)
 
     # Polling #
 

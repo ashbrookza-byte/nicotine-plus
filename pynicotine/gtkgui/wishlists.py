@@ -690,7 +690,12 @@ class WishlistSettingsDialog(Dialog):
             # Dialog was closed while the login flow was still in progress
             return
 
-        self.spotify_status_label.set_text(message if not success else self._spotify_status_text())
+        # On success, message includes which account actually got connected
+        # (e.g. "Connected to Spotify. Connected as Alice.") -- worth
+        # keeping visible rather than collapsing to the generic status text,
+        # since connecting under an unexpected account is a common cause of
+        # playlists failing to load afterwards
+        self.spotify_status_label.set_text(message)
 
     def on_cancel(self, *_args):
         self.close()
