@@ -43,6 +43,7 @@ from pynicotine.logfacility import log
 from pynicotine.search import ResultFilterMode
 from pynicotine.shares import FileTypes
 from pynicotine.slskmessages import FileListMessage
+from pynicotine.transfers import TransferStatus
 from pynicotine.utils import factorize
 from pynicotine.utils import humanize
 from pynicotine.utils import human_size
@@ -50,12 +51,24 @@ from pynicotine.utils import human_speed
 
 
 class SearchResultFile:
-    __slots__ = ("path", "attributes", "is_downloading")
+    __slots__ = ("path", "attributes", "download_icon_name")
 
-    def __init__(self, path, attributes=None, is_downloading=False):
+    def __init__(self, path, attributes=None, download_icon_name=""):
         self.path = path
         self.attributes = attributes
-        self.is_downloading = is_downloading
+        self.download_icon_name = download_icon_name
+
+
+# Icon shown in the "Downloading" column of search results, based on the current transfer status.
+# Statuses not listed here (cancelled, filtered, errored, user logged off, etc.) clear the icon,
+# allowing the file to be downloaded again.
+DOWNLOAD_STATUS_ICON_NAMES = {
+    TransferStatus.QUEUED: "folder-download-symbolic",
+    TransferStatus.GETTING_STATUS: "folder-download-symbolic",
+    TransferStatus.TRANSFERRING: "folder-download-symbolic",
+    TransferStatus.PAUSED: "folder-download-symbolic",
+    TransferStatus.FINISHED: "object-select-symbolic"
+}
 
 
 class Searches(IconNotebook):
@@ -127,6 +140,7 @@ class Searches(IconNotebook):
             ("remove-wish", self.update_wish_button),
             ("search-failed", self.search_failed),
             ("show-search", self.show_search),
+            ("update-download", self.update_download),
             ("update-wish-filters", self.update_wish_filters)
         ):
             events.connect(event_name, callback)
@@ -135,6 +149,10 @@ class Searches(IconNotebook):
 
     def quit(self):
         self.freeze()
+
+    def update_download(self, transfer, _update_parent=True):
+        for tab in self.pages.values():
+            tab.update_download_status(transfer)
 
     def destroy(self):
 
@@ -1369,7 +1387,7 @@ class Search:
 
         for row in self.all_data:
             if self.check_filter(row):
-                row[8] = "folder-download-symbolic" if row[18].is_downloading else ""
+                row[8] = row[18].download_icon_name
                 self.add_row_to_model(row)
 
         self.row_id = end_row_id + 1
@@ -1713,8 +1731,8 @@ class Search:
                 user, file_path, folder_path=download_folder_path, size=size,
                 file_attributes=file_data.attributes)
 
-            file_data.is_downloading = True
-            self.tree_view.set_row_value(iterator, "downloading", "folder-download-symbolic")
+            file_data.download_icon_name = "folder-download-symbolic"
+            self.tree_view.set_row_value(iterator, "downloading", file_data.download_icon_name)
 
     def on_download_files_to_selected(self, selected_folder_paths, _data):
 
@@ -1760,8 +1778,37 @@ class Search:
             if user_file_path not in user_file_paths:
                 continue
 
-            file_data.is_downloading = True
-            self.tree_view.set_row_value(iterator, "downloading", "folder-download-symbolic")
+            file_data.download_icon_name = "folder-download-symbolic"
+            self.tree_view.set_row_value(iterator, "downloading", file_data.download_icon_name)
+
+    def update_download_status(self, transfer):
+        """Reflect a download's current status (queued, transferring, finished, etc.)
+        as an icon on the matching search result row, if one exists in this tab.
+
+        Rows in all_data are updated even if they're currently hidden by an active
+        filter, so they don't end up with a stale icon once the filter is cleared.
+        Note that "id_data" in all_data cannot be used to look up the row's tree
+        iterator here: add_row_to_model() reassigns it on a copy of the row when
+        folder grouping is enabled, leaving the id in all_data permanently stale.
+        Visible rows are therefore matched separately via the tree's own iterators."""
+
+        icon_name = DOWNLOAD_STATUS_ICON_NAMES.get(transfer.status, "")
+        username = transfer.username
+        virtual_path = transfer.virtual_path
+
+        for row in self.all_data:
+            file_data = row[18]
+
+            if row[0] == username and file_data.path == virtual_path:
+                file_data.download_icon_name = icon_name
+                row[8] = icon_name
+
+        for iterator in self.tree_view.iterators.values():
+            file_data = self.tree_view.get_row_value(iterator, "file_data")
+
+            if (file_data is not None and file_data.path == virtual_path
+                    and self.tree_view.get_row_value(iterator, "user") == username):
+                self.tree_view.set_row_value(iterator, "downloading", icon_name)
 
     def on_download_folders(self, *_args):
 
