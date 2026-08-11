@@ -555,6 +555,8 @@ class Wishlists:
     STATUS_LABELS = DownloadLists.STATUS_LABELS
     PAUSE_LABEL = _("_Pause")
     RESUME_LABEL = _("_Resume")
+    PIN_LABEL = _("_Pin")
+    UNPIN_LABEL = _("_Unpin")
 
     def __init__(self, window):
 
@@ -599,6 +601,11 @@ class Wishlists:
         self.lists_view = TreeView(
             window, parent=self.lists_container, select_row_callback=self.on_select_list_row,
             columns={
+                "pin": {
+                    "column_type": "text",
+                    "title": "",
+                    "width": 20
+                },
                 "name": {
                     "column_type": "text",
                     "title": _("List"),
@@ -620,6 +627,11 @@ class Wishlists:
             window, parent=self.items_container, multi_select=True,
             delete_accelerator_callback=self.on_remove_item,
             columns={
+                "position": {
+                    "column_type": "number",
+                    "title": _("#"),
+                    "width": 40
+                },
                 "term": {
                     "column_type": "text",
                     "title": _("Search Term"),
@@ -648,6 +660,11 @@ class Wishlists:
                     "title": _("Downloaded File"),
                     "width": 160
                 },
+                "match": {
+                    "column_type": "number",
+                    "title": _("Match %"),
+                    "width": 80
+                },
                 "quality": {
                     "column_type": "text",
                     "title": _("Quality"),
@@ -663,6 +680,7 @@ class Wishlists:
 
         self.lists_popup_menu = PopupMenu(window.application, self.lists_view.widget, self.on_popup_lists_menu)
         self.lists_popup_menu.add_items(
+            ("#" + self.PIN_LABEL, self.on_pin_unpin_list),
             ("#" + self.PAUSE_LABEL, self.on_pause_resume_list),
             ("#" + _("_Settings…"), self.on_list_settings),
             ("#" + _("Re_name…"), self.on_rename_list),
@@ -751,6 +769,8 @@ class Wishlists:
 
         return _("%(completed)s/%(total)s") % {"completed": completed, "total": total}
 
+    PIN_GLYPH = "\U0001F4CC"  # 📌
+
     def _add_list_row(self, name, select=False):
 
         download_list = core.download_lists.lists.get(name)
@@ -758,7 +778,9 @@ class Wishlists:
         if download_list is None:
             return
 
-        self.lists_view.add_row([name, self._list_summary_text(download_list)], select_row=select)
+        pin_glyph = self.PIN_GLYPH if download_list.pinned else ""
+        self.lists_view.add_row(
+            [pin_glyph, name, self._list_summary_text(download_list)], select_row=select)
 
     def _update_list_row(self, name):
 
@@ -772,16 +794,22 @@ class Wishlists:
         if download_list is None:
             return
 
-        self.lists_view.set_row_value(iterator, "summary", self._list_summary_text(download_list))
+        self.lists_view.set_row_values(
+            iterator,
+            ["pin", "summary"],
+            [self.PIN_GLYPH if download_list.pinned else "", self._list_summary_text(download_list)]
+        )
 
-    def _item_row_values(self, item):
+    def _item_row_values(self, item, position):
 
         return [
+            str(position),
             item.term,
             item.searched_term or "",
             self.STATUS_LABELS.get(item.status, item.status),
             item.download_percent,
             item.download_filename,
+            item.h_match_percentage,
             item.h_quality,
             item.h_length
         ]
@@ -806,12 +834,12 @@ class Wishlists:
 
         return query in haystack
 
-    def _add_item_row(self, item):
+    def _add_item_row(self, item, position):
 
         if not self._matches_items_search(item):
             return
 
-        self.items_view.add_row(self._item_row_values(item), select_row=False)
+        self.items_view.add_row(self._item_row_values(item, position), select_row=False)
 
     def _update_item_row(self, name, term):
 
@@ -831,9 +859,10 @@ class Wishlists:
 
         self.items_view.set_row_values(
             iterator,
-            ["searched_term", "status", "progress", "downloaded_file", "quality", "length"],
+            ["searched_term", "status", "progress", "downloaded_file", "match", "quality", "length"],
             [item.searched_term or "", self.STATUS_LABELS.get(item.status, item.status),
-             item.download_percent, item.download_filename, item.h_quality, item.h_length]
+             item.download_percent, item.download_filename, item.h_match_percentage,
+             item.h_quality, item.h_length]
         )
 
     def _pause_resume_label(self, download_list):
@@ -877,8 +906,11 @@ class Wishlists:
         self.items_view.clear()
 
         if download_list is not None:
-            for item in download_list.items.values():
-                self._add_item_row(item)
+            # Position reflects the order items were added to the list (dicts keep
+            # insertion order), independent of the current search filter or any
+            # column sort applied in the view — "3" always means the 3rd song added
+            for position, item in enumerate(download_list.items.values(), start=1):
+                self._add_item_row(item, position)
 
         self.items_view.unfreeze()
 
@@ -1001,6 +1033,21 @@ class Wishlists:
             break
 
         menu.update_item_label(self.PAUSE_LABEL, self._pause_resume_label(download_list))
+        menu.update_item_label(
+            self.PIN_LABEL,
+            self.UNPIN_LABEL if download_list is not None and download_list.pinned else self.PIN_LABEL
+        )
+
+    def on_pin_unpin_list(self, *_args):
+
+        for iterator in self.lists_view.get_selected_rows():
+            name = self.lists_view.get_row_value(iterator, "name")
+            download_list = core.download_lists.lists.get(name)
+
+            if download_list is not None:
+                core.download_lists.set_list_pinned(name, not download_list.pinned)
+
+            return
 
     def on_pause_resume_list(self, *_args):
 

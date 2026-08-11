@@ -63,13 +63,13 @@ class DownloadListItem:
     __slots__ = (
         "term", "list_name", "time_added", "status", "searched_term", "token",
         "download_username", "download_virtual_path", "download_size", "download_attributes",
-        "download_candidates", "variant_index", "collect_timer_id", "escalation_timer_id",
-        "download_percent", "stall_timer_id", "dispatch_time"
+        "download_match_percentage", "download_candidates", "variant_index", "collect_timer_id",
+        "escalation_timer_id", "download_percent", "stall_timer_id", "dispatch_time"
     )
 
     def __init__(self, term, list_name, time_added=None, status=DownloadListItemStatus.PENDING,
                  searched_term=None, download_username=None, download_virtual_path=None,
-                 download_size=0, download_attributes=None):
+                 download_size=0, download_attributes=None, download_match_percentage=None):
 
         self.term = term
         self.list_name = list_name
@@ -86,6 +86,7 @@ class DownloadListItem:
         self.download_virtual_path = download_virtual_path
         self.download_size = download_size
         self.download_attributes = download_attributes
+        self.download_match_percentage = download_match_percentage
 
         # Transient, session-only state
         self.token = None
@@ -125,6 +126,10 @@ class DownloadListItem:
 
         return self.download_virtual_path.replace("\\", "/").rsplit("/", 1)[-1]
 
+    @property
+    def h_match_percentage(self):
+        return "" if self.download_match_percentage is None else f"{self.download_match_percentage}%"
+
     def as_dict(self):
 
         attributes = self.download_attributes
@@ -137,6 +142,7 @@ class DownloadListItem:
             "download_username": self.download_username,
             "download_virtual_path": self.download_virtual_path,
             "download_size": self.download_size,
+            "download_match_percentage": self.download_match_percentage,
             "download_bitrate": attributes.bitrate if attributes else None,
             "download_length": attributes.length if attributes else None,
             "download_vbr": attributes.vbr if attributes else None,
@@ -149,12 +155,12 @@ class DownloadList:
     __slots__ = (
         "name", "download_folder_path", "quality", "prefer_longer", "prefer_lossless",
         "preferred_keywords", "fuzzy_match_threshold", "auto_download", "use_name_subfolder",
-        "time_added", "items"
+        "pinned", "time_added", "items"
     )
 
     def __init__(self, name, download_folder_path=None, quality=None, prefer_longer=None,
                  prefer_lossless=None, preferred_keywords=None, fuzzy_match_threshold=None,
-                 auto_download=None, use_name_subfolder=None, time_added=None, items=None):
+                 auto_download=None, use_name_subfolder=None, pinned=False, time_added=None, items=None):
 
         self.name = name
         self.download_folder_path = download_folder_path or None
@@ -168,6 +174,10 @@ class DownloadList:
         self.fuzzy_match_threshold = fuzzy_match_threshold
         self.auto_download = auto_download
         self.use_name_subfolder = use_name_subfolder
+
+        # Not a per-item-matching preference like the above; whether this list's
+        # queued items should be dispatched ahead of every other list's
+        self.pinned = bool(pinned)
 
         self.time_added = time_added if time_added is not None else int(time.time())
         self.items = items if items is not None else {}
@@ -265,6 +275,7 @@ class DownloadList:
             "fuzzy_match_threshold": self.fuzzy_match_threshold,
             "auto_download": self.auto_download,
             "use_name_subfolder": self.use_name_subfolder,
+            "pinned": self.pinned,
             "time_added": self.time_added,
             "items": [item.as_dict() for item in self.items.values()]
         }
@@ -461,7 +472,8 @@ class DownloadLists:
                     download_username=item_data.get("download_username"),
                     download_virtual_path=item_data.get("download_virtual_path"),
                     download_size=item_data.get("download_size", 0),
-                    download_attributes=attributes
+                    download_attributes=attributes,
+                    download_match_percentage=item_data.get("download_match_percentage")
                 )
 
             self.lists[name] = DownloadList(
@@ -474,6 +486,7 @@ class DownloadLists:
                 fuzzy_match_threshold=list_data.get("fuzzy_match_threshold"),
                 auto_download=list_data.get("auto_download"),
                 use_name_subfolder=list_data.get("use_name_subfolder"),
+                pinned=list_data.get("pinned", False),
                 time_added=list_data.get("time_added"),
                 items=items
             )
@@ -730,6 +743,23 @@ class DownloadLists:
             log.add(_("Cannot move download list folder from %(old)s to %(new)s: %(error)s"),
                     {"old": old_folder_path, "new": new_folder_path, "error": error})
 
+    def set_list_pinned(self, name, pinned):
+        """A pinned list's queued items are dispatched ahead of every other
+        list's, so it keeps making progress even behind a long queue elsewhere."""
+
+        download_list = self.lists.get(name)
+
+        if download_list is None or download_list.pinned == bool(pinned):
+            return
+
+        download_list.pinned = bool(pinned)
+
+        events.emit("update-download-list", name)
+        self._save()
+
+        if download_list.pinned:
+            self._kick_queue()
+
     def rename_list(self, old_name, new_name):
 
         new_name = new_name.strip()
@@ -901,6 +931,7 @@ class DownloadLists:
         item.download_virtual_path = None
         item.download_size = 0
         item.download_attributes = None
+        item.download_match_percentage = None
         item.download_percent = 0
 
         if download_list.effective_auto_download:
@@ -1156,6 +1187,20 @@ class DownloadLists:
             if item.status in (DownloadListItemStatus.SEARCHING, DownloadListItemStatus.DOWNLOADING)
         )
 
+    def _pop_next_queued_entry(self):
+        """Pop the next (list_name, term) to dispatch, preferring the first
+        queued entry belonging to a pinned list over plain queue order."""
+
+        for index, (name, _term) in enumerate(self._queue):
+            download_list = self.lists.get(name)
+
+            if download_list is not None and download_list.pinned:
+                entry = self._queue[index]
+                del self._queue[index]
+                return entry
+
+        return self._queue.popleft()
+
     def _pump_queue(self):
 
         self._dispatch_timer_id = None
@@ -1172,7 +1217,7 @@ class DownloadLists:
         headroom = self.max_concurrent_downloads - self._count_active_items()
 
         while headroom > 0 and self._queue:
-            name, term = self._queue.popleft()
+            name, term = self._pop_next_queued_entry()
             download_list = self.lists.get(name)
             item = download_list.items.get(term) if download_list is not None else None
 
@@ -1495,7 +1540,7 @@ class DownloadLists:
             return
 
         candidates.sort(key=itemgetter(0), reverse=True)
-        _score, username, virtual_path, size, attributes = candidates[0]
+        best_score, username, virtual_path, size, attributes = candidates[0]
 
         # Stop tracking the search itself; we're done with it now
         self._forget_search(item)
@@ -1509,6 +1554,9 @@ class DownloadLists:
         item.download_virtual_path = virtual_path
         item.download_size = size
         item.download_attributes = attributes
+        # First element of the score tuple is round(match_percentage) — how well
+        # this candidate's path matched every word of the original search term
+        item.download_match_percentage = best_score[0]
         item.download_percent = 0
         item.stall_timer_id = events.schedule(
             delay=self.stall_timeout, callback=lambda: self._handle_stalled_download(list_name, term))
@@ -1646,6 +1694,7 @@ class DownloadLists:
         item.download_virtual_path = None
         item.download_size = 0
         item.download_attributes = None
+        item.download_match_percentage = None
         item.download_percent = 0
 
         if download_list.effective_auto_download:

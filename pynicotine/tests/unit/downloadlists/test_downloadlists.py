@@ -114,6 +114,43 @@ class DownloadListsTest(TestCase):
         self.assertEqual(pending, 3)
         self.assertEqual(core.download_lists._count_active_items(), 2)
 
+    def test_pinned_list_is_dispatched_ahead_of_others(self):
+        """A pinned list's queued item is dispatched before an earlier-queued
+        item from a plain, unpinned list."""
+
+        from pynicotine.slskmessages import UserStatus
+
+        core.users.login_status = UserStatus.ONLINE
+        self.addCleanup(setattr, core.users, "login_status", UserStatus.OFFLINE)
+
+        core.download_lists.update_max_concurrent_downloads(1)
+        self.addCleanup(core.download_lists.update_max_concurrent_downloads, 3)
+
+        # Queued first, but not pinned
+        plain_list = core.download_lists.add_list("Plain List", auto_download=True)
+        core.download_lists.add_list_items("Plain List", ["Plain Song"])
+
+        # Queued second, but pinned -- should still go first
+        pinned_list = core.download_lists.add_list("Pinned List", auto_download=True)
+        core.download_lists.set_list_pinned("Pinned List", True)
+        core.download_lists.add_list_items("Pinned List", ["Pinned Song"])
+
+        core.download_lists._pump_queue()
+
+        self.assertEqual(pinned_list.items["Pinned Song"].status, DownloadListItemStatus.SEARCHING)
+        self.assertEqual(plain_list.items["Plain Song"].status, DownloadListItemStatus.PENDING)
+
+    def test_set_list_pinned_persists_and_toggles(self):
+
+        download_list = core.download_lists.add_list("Toggle Pin List")
+        self.assertFalse(download_list.pinned)
+
+        core.download_lists.set_list_pinned("Toggle Pin List", True)
+        self.assertTrue(download_list.pinned)
+
+        core.download_lists.set_list_pinned("Toggle Pin List", False)
+        self.assertFalse(download_list.pinned)
+
     def test_add_list_duplicate_name(self):
         """Adding a list with a name that's already taken is a no-op."""
 
@@ -352,6 +389,29 @@ class DownloadListsTest(TestCase):
         self.assertEqual(item.status, DownloadListItemStatus.PENDING)
         # The old transfer must be gone, not left running unabandoned in the background
         self.assertIsNone(core.downloads.transfers.get(transfer_key))
+        self.assertIsNone(item.download_match_percentage)
+
+    def test_finalize_item_records_the_winning_candidates_match_percentage(self):
+        """The chosen candidate's match percentage (how many of the original
+        term's words its path actually contained) is stored on the item."""
+
+        download_list = core.download_lists.add_list(
+            "Match List", quality="any", fuzzy_match_threshold=40, auto_download=True)
+        core.download_lists.add_list_items("Match List", ["Some Artist Full Title Here"])
+
+        item = download_list.items["Some Artist Full Title Here"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        # Path only contains "some", "artist", "here" out of 5 term words -> 60%
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Some Artist - Here.mp3", 8000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "someuser", files)
+
+        core.download_lists._file_search_response(msg)
+        core.download_lists._finalize_item("Match List", "Some Artist Full Title Here")
+
+        self.assertEqual(item.download_match_percentage, 60)
+        self.assertEqual(item.h_match_percentage, "60%")
 
     def test_reset_of_already_finished_download_marks_it_completed(self):
         """If the transfer backing a Downloading item already finished by the
@@ -781,6 +841,8 @@ class DownloadListsTest(TestCase):
         self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
         self.assertEqual(item.download_username, "someuser")
         self.assertTrue(item.download_virtual_path.endswith("Great Song.mp3"))
+        self.assertEqual(item.download_match_percentage, 100)
+        self.assertEqual(item.h_match_percentage, "100%")
 
         transfer = core.downloads.transfers.get("someuser" + item.download_virtual_path)
         self.assertIsNotNone(transfer)
