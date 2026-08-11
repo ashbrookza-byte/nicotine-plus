@@ -847,15 +847,34 @@ class DownloadLists:
             return
 
         if item.status == DownloadListItemStatus.DOWNLOADING and item.download_username:
-            # Actually cancel the in-flight transfer, not just stop tracking it —
-            # otherwise it keeps running in the background, finishes on its own
-            # a moment later, and the file lands in the download folder while
-            # this item has already moved on to a new search, looking like
-            # nothing happened even though the song did in fact download
             transfer_key = item.download_username + (item.download_virtual_path or "")
             transfer = core.downloads.transfers.get(transfer_key)
 
-            if transfer is not None and transfer.status != TransferStatus.FINISHED:
+            if transfer is not None and transfer.status == TransferStatus.FINISHED:
+                # This download actually already succeeded. Its completion may
+                # never have been routed back to this item — e.g. an orphaned
+                # _transfer_map entry left over from an earlier bug — but the
+                # transfer itself is proof the file landed. Recognize that
+                # directly from the transfer, rather than only through the map
+                # (which may no longer even reference this item), so Reset can
+                # never discard a download that, in fact, already finished
+                self._transfer_map.pop(transfer_key, None)
+
+                item.status = DownloadListItemStatus.COMPLETED
+                item.download_percent = 100
+                self._forget_item(item)
+
+                events.emit("update-download-list-item", name, term)
+                self._save()
+                self._check_list_complete(name)
+                return
+
+            if transfer is not None:
+                # Genuinely still in progress: actually cancel it, not just stop
+                # tracking it — otherwise it keeps running in the background,
+                # finishes on its own a moment later, and the file lands in the
+                # download folder while this item has already moved on to a new
+                # search, looking like nothing happened even though it did download
                 core.downloads.abort_downloads([transfer], status=TransferStatus.CANCELLED)
                 core.downloads.clear_downloads([transfer])
 
