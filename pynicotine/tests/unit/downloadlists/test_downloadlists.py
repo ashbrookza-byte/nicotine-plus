@@ -151,6 +151,7 @@ class DownloadListsTest(TestCase):
         core.download_lists.update_wishlist_default_settings(
             quality=defaults["downloadlistdefaultquality"],
             prefer_longer=defaults["downloadlistdefaultpreferlonger"],
+            prefer_lossless=defaults["downloadlistdefaultpreferlossless"],
             fuzzy_match_threshold=defaults["downloadlistdefaultfuzzy"],
             auto_download=defaults["downloadlistdefaultautodownload"],
             use_name_subfolder=defaults["downloadlistdefaultnamesubfolder"]
@@ -167,7 +168,7 @@ class DownloadListsTest(TestCase):
         self.assertTrue(download_list.effective_auto_download)
 
         core.download_lists.update_wishlist_default_settings(
-            quality="lossless", prefer_longer=False, fuzzy_match_threshold=55,
+            quality="lossless", prefer_longer=False, prefer_lossless=False, fuzzy_match_threshold=55,
             auto_download=False, use_name_subfolder=True
         )
 
@@ -186,7 +187,7 @@ class DownloadListsTest(TestCase):
         core.download_lists.update_list_settings("Overriding List", quality="high")
 
         core.download_lists.update_wishlist_default_settings(
-            quality="lossless", prefer_longer=True, fuzzy_match_threshold=70,
+            quality="lossless", prefer_longer=True, prefer_lossless=True, fuzzy_match_threshold=70,
             auto_download=True, use_name_subfolder=False
         )
 
@@ -197,7 +198,7 @@ class DownloadListsTest(TestCase):
         this list's override, reverting it to the overall default."""
 
         core.download_lists.update_wishlist_default_settings(
-            quality="good", prefer_longer=True, fuzzy_match_threshold=70,
+            quality="good", prefer_longer=True, prefer_lossless=True, fuzzy_match_threshold=70,
             auto_download=True, use_name_subfolder=False
         )
 
@@ -236,6 +237,53 @@ class DownloadListsTest(TestCase):
             "My Chart", download_folder_path="/tmp/downloads", use_name_subfolder=True)
 
         self.assertEqual(download_list.effective_download_folder_path, "/tmp/downloads/My Chart")
+
+    def test_prefer_lossless_affects_candidate_score_but_not_eligibility(self):
+        """Preferring lossless breaks ties in favor of a lossless candidate, but
+        (unlike a "Lossless only" quality requirement) doesn't reject lossy ones."""
+
+        download_list = core.download_lists.add_list(
+            "Lossless Preferring List", quality="any", fuzzy_match_threshold=50,
+            auto_download=True, prefer_lossless=True)
+        core.download_lists.add_list_items("Lossless Preferring List", ["Some Song"])
+
+        item = download_list.items["Some Song"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        lossy_attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        lossless_attributes = FileAttributes(bitrate=None, length=200, bit_depth=16)
+        files = [
+            (1, "@@abc\\Some Song (lossy).mp3", 8000000, "mp3", lossy_attributes),
+            (1, "@@abc\\Some Song (lossless).flac", 20000000, "flac", lossless_attributes),
+        ]
+        msg = self._make_response(item.token, "someuser", files)
+
+        core.download_lists._file_search_response(msg)
+
+        # Only the best-scoring file within a single response is kept as a candidate,
+        # and lossless should win the tie-break over the (otherwise equal) lossy file
+        self.assertEqual(len(item.download_candidates), 1)
+        _score, _username, virtual_path, _size, _attributes = item.download_candidates[0]
+        self.assertIn("lossless", virtual_path)
+
+    def test_apply_to_existing_lists_clears_overrides(self):
+        """apply_to_existing_lists=True clears every list's own override for the
+        matching/download settings, switching them all to the new defaults."""
+
+        self.addCleanup(self._restore_wishlist_defaults)
+
+        download_list = core.download_lists.add_list("Overridden List", quality="lossless", auto_download=False)
+        self.assertEqual(download_list.quality, "lossless")
+
+        core.download_lists.update_wishlist_default_settings(
+            quality="good", prefer_longer=True, prefer_lossless=True, fuzzy_match_threshold=70,
+            auto_download=True, use_name_subfolder=False, apply_to_existing_lists=True
+        )
+
+        self.assertIsNone(download_list.quality)
+        self.assertIsNone(download_list.auto_download)
+        self.assertEqual(download_list.effective_quality, "good")
+        self.assertTrue(download_list.effective_auto_download)
 
     def test_term_variants_strip_bracketed_content(self):
 

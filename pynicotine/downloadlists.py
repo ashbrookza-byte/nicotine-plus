@@ -142,13 +142,13 @@ class DownloadListItem:
 
 class DownloadList:
     __slots__ = (
-        "name", "download_folder_path", "quality", "prefer_longer", "fuzzy_match_threshold",
-        "auto_download", "use_name_subfolder", "time_added", "items"
+        "name", "download_folder_path", "quality", "prefer_longer", "prefer_lossless",
+        "fuzzy_match_threshold", "auto_download", "use_name_subfolder", "time_added", "items"
     )
 
     def __init__(self, name, download_folder_path=None, quality=None, prefer_longer=None,
-                 fuzzy_match_threshold=None, auto_download=None, use_name_subfolder=None,
-                 time_added=None, items=None):
+                 prefer_lossless=None, fuzzy_match_threshold=None, auto_download=None,
+                 use_name_subfolder=None, time_added=None, items=None):
 
         self.name = name
         self.download_folder_path = download_folder_path or None
@@ -157,6 +157,7 @@ class DownloadList:
         # rather than a value specific to this list
         self.quality = quality
         self.prefer_longer = prefer_longer
+        self.prefer_lossless = prefer_lossless
         self.fuzzy_match_threshold = fuzzy_match_threshold
         self.auto_download = auto_download
         self.use_name_subfolder = use_name_subfolder
@@ -174,6 +175,13 @@ class DownloadList:
             return self.prefer_longer
 
         return config.sections["transfers"]["downloadlistdefaultpreferlonger"]
+
+    @property
+    def effective_prefer_lossless(self):
+        if self.prefer_lossless is not None:
+            return self.prefer_lossless
+
+        return config.sections["transfers"]["downloadlistdefaultpreferlossless"]
 
     @property
     def effective_fuzzy_match_threshold(self):
@@ -238,6 +246,7 @@ class DownloadList:
             "download_folder_path": self.download_folder_path,
             "quality": self.quality,
             "prefer_longer": self.prefer_longer,
+            "prefer_lossless": self.prefer_lossless,
             "fuzzy_match_threshold": self.fuzzy_match_threshold,
             "auto_download": self.auto_download,
             "use_name_subfolder": self.use_name_subfolder,
@@ -412,6 +421,7 @@ class DownloadLists:
                 download_folder_path=list_data.get("download_folder_path"),
                 quality=list_data.get("quality"),
                 prefer_longer=list_data.get("prefer_longer"),
+                prefer_lossless=list_data.get("prefer_lossless"),
                 fuzzy_match_threshold=list_data.get("fuzzy_match_threshold"),
                 auto_download=list_data.get("auto_download"),
                 use_name_subfolder=list_data.get("use_name_subfolder"),
@@ -459,9 +469,11 @@ class DownloadLists:
     # List Management #
 
     def add_list(self, name, download_folder_path=None, quality=None, prefer_longer=None,
-                 fuzzy_match_threshold=None, auto_download=None, use_name_subfolder=None):
-        """quality/prefer_longer/fuzzy_match_threshold/auto_download/use_name_subfolder default
-        to None, meaning the list follows the overall wishlist defaults until overridden."""
+                 prefer_lossless=None, fuzzy_match_threshold=None, auto_download=None,
+                 use_name_subfolder=None):
+        """quality/prefer_longer/prefer_lossless/fuzzy_match_threshold/auto_download/
+        use_name_subfolder default to None, meaning the list follows the overall
+        wishlist defaults until overridden."""
 
         name = name.strip()
 
@@ -470,8 +482,9 @@ class DownloadLists:
 
         self.lists[name] = download_list = DownloadList(
             name=name, download_folder_path=download_folder_path, quality=quality,
-            prefer_longer=prefer_longer, fuzzy_match_threshold=fuzzy_match_threshold,
-            auto_download=auto_download, use_name_subfolder=use_name_subfolder
+            prefer_longer=prefer_longer, prefer_lossless=prefer_lossless,
+            fuzzy_match_threshold=fuzzy_match_threshold, auto_download=auto_download,
+            use_name_subfolder=use_name_subfolder
         )
 
         events.emit("add-download-list", name)
@@ -480,10 +493,12 @@ class DownloadLists:
         return download_list
 
     def update_list_settings(self, name, download_folder_path=_UNSET, quality=_UNSET, prefer_longer=_UNSET,
-                             fuzzy_match_threshold=_UNSET, auto_download=_UNSET, use_name_subfolder=_UNSET):
+                             prefer_lossless=_UNSET, fuzzy_match_threshold=_UNSET, auto_download=_UNSET,
+                             use_name_subfolder=_UNSET):
         """Each argument left at _UNSET (the default) is untouched. Passing an explicit
-        None for quality/prefer_longer/fuzzy_match_threshold/auto_download/use_name_subfolder
-        clears this list's override, so it follows the overall wishlist default instead."""
+        None for quality/prefer_longer/prefer_lossless/fuzzy_match_threshold/auto_download/
+        use_name_subfolder clears this list's override, so it follows the overall
+        wishlist default instead."""
 
         download_list = self.lists.get(name)
 
@@ -500,6 +515,9 @@ class DownloadLists:
 
         if prefer_longer is not _UNSET:
             download_list.prefer_longer = prefer_longer
+
+        if prefer_lossless is not _UNSET:
+            download_list.prefer_lossless = prefer_lossless
 
         if fuzzy_match_threshold is not _UNSET:
             download_list.fuzzy_match_threshold = fuzzy_match_threshold
@@ -532,26 +550,39 @@ class DownloadLists:
 
         self.update_list_settings(name, auto_download=True)
 
-    def update_wishlist_default_settings(self, quality, prefer_longer, fuzzy_match_threshold,
-                                         auto_download, use_name_subfolder):
+    def update_wishlist_default_settings(self, quality, prefer_longer, prefer_lossless, fuzzy_match_threshold,
+                                         auto_download, use_name_subfolder, apply_to_existing_lists=False):
         """Set the overall defaults new lists start with, and that any list without its
-        own override follows. Existing lists that override a given setting are unaffected."""
+        own override follows. By default, existing lists that override a given setting
+        are unaffected; pass apply_to_existing_lists=True to clear every list's override
+        for these settings, switching all of them over immediately (their download
+        folder, which isn't one of these settings, is left untouched either way)."""
 
         # Lists inheriting the default (auto_download is None) that are about to go from
         # paused to active need their pending items re-queued, just like update_list_settings
-        # does for a single list
-        newly_active = [
+        # does for a single list. Not needed when applying to every list below, since that
+        # path calls update_list_settings per list, which already handles this itself.
+        newly_active = [] if apply_to_existing_lists else [
             name for name, download_list in self.lists.items()
             if download_list.auto_download is None and not download_list.effective_auto_download and auto_download
         ]
 
         config.sections["transfers"]["downloadlistdefaultquality"] = quality
         config.sections["transfers"]["downloadlistdefaultpreferlonger"] = bool(prefer_longer)
+        config.sections["transfers"]["downloadlistdefaultpreferlossless"] = bool(prefer_lossless)
         config.sections["transfers"]["downloadlistdefaultfuzzy"] = int(fuzzy_match_threshold)
         config.sections["transfers"]["downloadlistdefaultautodownload"] = bool(auto_download)
         config.sections["transfers"]["downloadlistdefaultnamesubfolder"] = bool(use_name_subfolder)
 
         config.write_configuration()
+
+        if apply_to_existing_lists:
+            for name in list(self.lists):
+                self.update_list_settings(
+                    name, quality=None, prefer_longer=None, prefer_lossless=None,
+                    fuzzy_match_threshold=None, auto_download=None, use_name_subfolder=None
+                )
+            return
 
         for name in newly_active:
             download_list = self.lists[name]
@@ -1134,7 +1165,7 @@ class DownloadLists:
             score = (
                 round(match_percentage),
                 bool(msg.freeulslots),
-                is_lossless,
+                is_lossless if download_list.effective_prefer_lossless else False,
                 bitrate,
                 length if download_list.effective_prefer_longer else 0,
                 -msg.inqueue

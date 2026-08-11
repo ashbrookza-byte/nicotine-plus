@@ -184,6 +184,7 @@ class Config:
                 "downloadlistwatchfolder": "",
                 "downloadlistdefaultquality": "good",
                 "downloadlistdefaultpreferlonger": True,
+                "downloadlistdefaultpreferlossless": True,
                 "downloadlistdefaultfuzzy": 70,
                 "downloadlistdefaultautodownload": True,
                 "downloadlistdefaultnamesubfolder": False,

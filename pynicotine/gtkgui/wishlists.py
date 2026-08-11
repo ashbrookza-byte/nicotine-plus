@@ -69,6 +69,7 @@ class ListSettingsDialog(Dialog):
         self._add_override_switch()
         self._add_quality_option()
         self._add_prefer_longer_option()
+        self._add_prefer_lossless_option()
         self._add_fuzzy_option()
         self._add_auto_download_option()
         self._add_name_subfolder_option()
@@ -127,8 +128,8 @@ class ListSettingsDialog(Dialog):
         has_override = any(
             value is not None for value in (
                 self.download_list.quality, self.download_list.prefer_longer,
-                self.download_list.fuzzy_match_threshold, self.download_list.auto_download,
-                self.download_list.use_name_subfolder
+                self.download_list.prefer_lossless, self.download_list.fuzzy_match_threshold,
+                self.download_list.auto_download, self.download_list.use_name_subfolder
             )
         )
 
@@ -164,6 +165,17 @@ class ListSettingsDialog(Dialog):
             active=self.download_list.effective_prefer_longer, valign=Gtk.Align.CENTER, visible=True)
         self._labeled_row(
             _("Prefer longer/extended versions of a song"), self.prefer_longer_switch, track_override=True)
+
+    def _add_prefer_lossless_option(self):
+
+        self.prefer_lossless_switch = Gtk.Switch(
+            active=self.download_list.effective_prefer_lossless, valign=Gtk.Align.CENTER, visible=True)
+        self._labeled_row(
+            _("Prefer lossless (FLAC/WAV) over lossy when both are available"), self.prefer_lossless_switch,
+            track_override=True,
+            tooltip_text=_("Doesn't exclude lossy files by itself — pair with a minimum file quality "
+                            "of \"Lossless only\" above to require lossless.")
+        )
 
     def _add_fuzzy_option(self):
 
@@ -217,6 +229,7 @@ class ListSettingsDialog(Dialog):
             "download_folder_path": self.folder_chooser.get_path(),
             "quality": self.quality_combobox.get_selected_id() if is_overridden else None,
             "prefer_longer": self.prefer_longer_switch.get_active() if is_overridden else None,
+            "prefer_lossless": self.prefer_lossless_switch.get_active() if is_overridden else None,
             "fuzzy_match_threshold": self.fuzzy_spinner.get_value_as_int() if is_overridden else None,
             "auto_download": self.auto_download_switch.get_active() if is_overridden else None,
             "use_name_subfolder": self.name_subfolder_switch.get_active() if is_overridden else None
@@ -319,6 +332,13 @@ class WishlistSettingsDialog(Dialog):
             active=transfers["downloadlistdefaultpreferlonger"], valign=Gtk.Align.CENTER, visible=True)
         self._labeled_row(_("Prefer longer/extended versions of a song"), self.default_prefer_longer_switch)
 
+        self.default_prefer_lossless_switch = Gtk.Switch(
+            active=transfers["downloadlistdefaultpreferlossless"], valign=Gtk.Align.CENTER, visible=True)
+        self._labeled_row(
+            _("Prefer lossless (FLAC/WAV) over lossy when both are available"), self.default_prefer_lossless_switch,
+            tooltip_text=_("Doesn't exclude lossy files by itself — pair with a minimum file quality "
+                            "of \"Lossless only\" above to require lossless."))
+
         self.default_fuzzy_spinner = Gtk.SpinButton(
             adjustment=Gtk.Adjustment(
                 value=transfers["downloadlistdefaultfuzzy"], lower=0, upper=100,
@@ -338,6 +358,14 @@ class WishlistSettingsDialog(Dialog):
             active=transfers["downloadlistdefaultnamesubfolder"], valign=Gtk.Align.CENTER, visible=True)
         self._labeled_row(
             _("Save into a subfolder named after the list"), self.default_name_subfolder_switch)
+
+        self.apply_to_existing_switch = Gtk.Switch(active=False, valign=Gtk.Align.CENTER, visible=True)
+        self._labeled_row(
+            _("Apply to current lists"), self.apply_to_existing_switch,
+            tooltip_text=_("Clears every existing list's own override for the settings above, switching "
+                            "them all over to these defaults immediately. Off by default, since lists "
+                            "with their own override normally keep it. Doesn't touch download folders.")
+        )
 
     def _add_watch_folder_option(self):
 
@@ -411,9 +439,11 @@ class WishlistSettingsDialog(Dialog):
             watch_folder_path=folder_path,
             quality=self.default_quality_combobox.get_selected_id(),
             prefer_longer=self.default_prefer_longer_switch.get_active(),
+            prefer_lossless=self.default_prefer_lossless_switch.get_active(),
             fuzzy_match_threshold=self.default_fuzzy_spinner.get_value_as_int(),
             auto_download=self.default_auto_download_switch.get_active(),
-            use_name_subfolder=self.default_name_subfolder_switch.get_active()
+            use_name_subfolder=self.default_name_subfolder_switch.get_active(),
+            apply_to_existing_lists=self.apply_to_existing_switch.get_active()
         )
         self.close()
 
@@ -790,10 +820,12 @@ class Wishlists:
         core.download_lists.update_list_settings(name, **settings)
 
     def on_wishlist_settings_saved(self, watch_enabled, watch_folder_path, quality, prefer_longer,
-                                   fuzzy_match_threshold, auto_download, use_name_subfolder):
+                                   prefer_lossless, fuzzy_match_threshold, auto_download,
+                                   use_name_subfolder, apply_to_existing_lists):
         core.download_lists.update_watch_folder_settings(watch_enabled, watch_folder_path)
         core.download_lists.update_wishlist_default_settings(
-            quality, prefer_longer, fuzzy_match_threshold, auto_download, use_name_subfolder)
+            quality, prefer_longer, prefer_lossless, fuzzy_match_threshold, auto_download,
+            use_name_subfolder, apply_to_existing_lists=apply_to_existing_lists)
 
     def on_wishlist_settings(self, *_args):
         WishlistSettingsDialog(self.window.application, self.on_wishlist_settings_saved).present()
