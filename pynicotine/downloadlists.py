@@ -307,6 +307,14 @@ class DownloadLists:
         ".mp3", ".flac", ".wav", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".wma", ".ape", ".aiff", ".alac", ".mp4"
     }
 
+    # A continuous DJ mix/compilation album can still end up with a high word-match score
+    # (its title/filename often legitimately contains the artist and a track's title, e.g.
+    # a "Pure Intec 4 (Mixed By Carl Cox)" compilation, or a "Carl Cox Continuous Mix"), but
+    # is never actually the single track being searched for -- unlike naming conventions,
+    # which are inconsistent and easy to miss a variant of, an implausible length for a
+    # single track is a reliable, naming-agnostic tell
+    MAX_REASONABLE_TRACK_LENGTH = 20 * 60
+
     # Pacing between dispatching each queued item's initial search, so a big list doesn't flood the server
     DISPATCH_DELAY = 8
 
@@ -1609,6 +1617,33 @@ class DownloadLists:
 
         return (score / len(term_words)) * 100
 
+    def _purity_percentage(self, term_words, filename_lower):
+        """A stricter, display-only match score (see download_match_percentage
+        / the Verify Matches dialog) -- unlike _match_percentage (which only
+        checks how many of the term's words were found, deliberately lenient
+        so a good candidate isn't missed just for e.g. sitting in a
+        differently-named folder), this also penalizes EXTRA words in the
+        candidate's own filename beyond the term's, e.g. "(El Rancho Mix)"
+        tacked onto "Carl Cox - Pure". A candidate can still be accepted and
+        downloaded with a padded filename like that (see
+        _matches_remix_requirement's docstring -- that's deliberate), but it
+        shouldn't then look identical to a genuinely exact match: this is
+        the Jaccard similarity between the term's words and the filename's
+        (intersection over union), so missing OR extra words both pull it
+        below 100%."""
+
+        filename_stem = os.path.splitext(filename_lower)[0]
+        filename_words = set(self._term_words(filename_stem))
+        term_word_set = set(term_words)
+
+        if not term_word_set and not filename_words:
+            return 100.0
+
+        if not term_word_set or not filename_words:
+            return 0.0
+
+        return (len(term_word_set & filename_words) / len(term_word_set | filename_words)) * 100
+
     @staticmethod
     def _matches_remix_requirement(term_words, filename_lower):
         """Whether a candidate's remix status agrees with the original search
@@ -1617,7 +1652,10 @@ class DownloadLists:
         match -- and if the term does ask for a remix, the plain original
         mix must not match either. Checked against the filename specifically
         (not the full path), since a "Remixes" folder or similar shouldn't
-        affect a track that isn't itself a remix."""
+        affect a track that isn't itself a remix. Deliberately narrow: only
+        the literal word "remix" disqualifies a candidate -- a named/branded
+        mix (e.g. "El Rancho Mix") is not treated as a different version,
+        just a variant worth a lower match score (see _purity_percentage)."""
 
         term_has_remix = "remix" in term_words
         filename_has_remix = bool(re.search(r"\bremix\b", filename_lower))
@@ -1700,6 +1738,12 @@ class DownloadLists:
                 continue
 
             _h_quality, bitrate, _h_length, length = FileListMessage.parse_audio_quality_length(size, attributes)
+
+            if length > self.MAX_REASONABLE_TRACK_LENGTH:
+                # A continuous DJ mix/compilation, not the single track being searched for,
+                # no matter how well its title otherwise matches -- see the constant above
+                continue
+
             is_lossless = attributes.bit_depth is not None
 
             if not self._meets_quality_preference(download_list.effective_quality, is_lossless, bitrate):
@@ -1757,7 +1801,7 @@ class DownloadLists:
             return
 
         candidates.sort(key=itemgetter(0), reverse=True)
-        best_score, username, virtual_path, size, attributes = candidates[0]
+        _best_score, username, virtual_path, size, attributes = candidates[0]
 
         # Stop tracking the search itself; we're done with it now
         self._forget_search(item)
@@ -1771,9 +1815,11 @@ class DownloadLists:
         item.download_virtual_path = virtual_path
         item.download_size = size
         item.download_attributes = attributes
-        # First element of the score tuple is round(match_percentage) — how well
-        # this candidate's path matched every word of the original search term
-        item.download_match_percentage = best_score[0]
+        # Recomputed from the winning candidate's own filename, deliberately not just
+        # best_score[0] (the lenient score that decided which candidate to accept) --
+        # see _purity_percentage's docstring for why these are two different numbers
+        filename_lower = virtual_path.lower().replace("\\", "/").rsplit("/", 1)[-1]
+        item.download_match_percentage = round(self._purity_percentage(self._term_words(item.term), filename_lower))
         item.download_percent = 0
         item.stall_timer_id = events.schedule(
             delay=self.stall_timeout, callback=lambda: self._handle_stalled_download(list_name, term))

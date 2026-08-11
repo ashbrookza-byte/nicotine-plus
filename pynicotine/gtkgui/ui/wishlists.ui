@@ -145,6 +145,15 @@
                   </object>
                 </child>
                 <child>
+                  <object class="GtkButton" id="verify_matches_button">
+                    <property name="label" translatable="yes">_Verify Matches…</property>
+                    <property name="sensitive">False</property>
+                    <property name="use-underline">True</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_verify_matches"/>
+                  </object>
+                </child>
+                <child>
                   <object class="GtkButton" id="export_summary_button">
                     <property name="label" translatable="yes">_Export Summary…</property>
                     <property name="sensitive">False</property>

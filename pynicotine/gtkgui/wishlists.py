@@ -8,6 +8,7 @@ from gi.repository import Gtk
 from pynicotine.config import config
 from pynicotine.core import core
 from pynicotine.downloadlists import DownloadLists
+from pynicotine.downloadlists import DownloadListItemStatus
 from pynicotine.events import events
 from pynicotine.gtkgui.application import GTK_API_VERSION
 from pynicotine.gtkgui.widgets import ui
@@ -550,6 +551,80 @@ class WishlistSettingsDialog(Dialog):
         self.close()
 
 
+class VerifyMatchesDialog(Dialog):
+    """Review a list's completed items side by side: the original search
+    term, the actual downloaded file, and its match percentage -- stripped
+    down to just those three columns so a mismatched download (see
+    DownloadLists._purity_percentage's docstring for why the percentage
+    shown here can be less than 100% even for an accepted match) is easy to
+    spot and double check, without every other column's noise in the way."""
+
+    def __init__(self, application, download_list):
+
+        self.download_list = download_list
+
+        close_button = Gtk.Button(label=_("_Close"), use_underline=True, visible=True)
+        close_button.connect("clicked", self.on_close)
+
+        self.list_container = Gtk.ScrolledWindow(hexpand=True, vexpand=True, visible=True)
+
+        super().__init__(
+            application=application,
+            content_box=self.list_container,
+            buttons_end=(close_button,),
+            default_button=close_button,
+            title=_("Verify Matches — %s") % download_list.name,
+            width=760,
+            height=500
+        )
+
+        self.list_view = TreeView(
+            application.window, parent=self.list_container,
+            columns={
+                "match": {
+                    "column_type": "number",
+                    "title": _("Match %"),
+                    "width": 100,
+                    "default_sort_type": "ascending"
+                },
+                "term": {
+                    "column_type": "text",
+                    "title": _("Search Term"),
+                    "width": 260,
+                    "iterator_key": True
+                },
+                "downloaded_file": {
+                    "column_type": "text",
+                    "title": _("Downloaded File"),
+                    "width": 340,
+                    "expand_column": True
+                }
+            }
+        )
+
+        self._populate()
+
+    def destroy(self):
+        self.list_view.destroy()
+        self.__dict__.clear()
+
+    def _populate(self):
+
+        self.list_view.freeze()
+
+        for item in self.download_list.items.values():
+            if item.status != DownloadListItemStatus.COMPLETED:
+                continue
+
+            self.list_view.add_row(
+                [item.h_match_percentage, item.term, item.download_filename], select_row=False)
+
+        self.list_view.unfreeze()
+
+    def on_close(self, *_args):
+        self.close()
+
+
 class Wishlists:
 
     STATUS_LABELS = DownloadLists.STATUS_LABELS
@@ -575,6 +650,7 @@ class Wishlists:
             self.lists_container,
             self.lists_pane,
             self.pause_resume_button,
+            self.verify_matches_button,
             self.wishlist_settings_button,
             self.wishlists_paned
         ) = self.widgets = ui.load(scope=self, path="wishlists.ui")
@@ -1042,6 +1118,7 @@ class Wishlists:
         self.items_search_entry.set_sensitive(has_list)
         self.add_songs_button.set_sensitive(has_list)
         self.list_settings_button.set_sensitive(has_list)
+        self.verify_matches_button.set_sensitive(has_list)
         self.export_summary_button.set_sensitive(has_list)
         self.current_list_label.set_text(name if has_list else _("No list selected"))
         self._update_pause_resume_button(download_list)
@@ -1324,6 +1401,18 @@ class Wishlists:
             core.download_lists.remove_list_item(self.current_list_name, term)
 
         return True
+
+    def on_verify_matches(self, *_args):
+
+        if self.current_list_name is None:
+            return
+
+        download_list = core.download_lists.lists.get(self.current_list_name)
+
+        if download_list is None:
+            return
+
+        VerifyMatchesDialog(self.window.application, download_list).present()
 
     def on_export_summary_selected(self, selected, list_name):
 

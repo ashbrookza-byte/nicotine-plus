@@ -842,7 +842,7 @@ class DownloadListsTest(TestCase):
         lossless_attributes = FileAttributes(length=258, sample_rate=44100, bit_depth=16)
         files = [
             (1, "@@abc\\Kasablanca - Time Is A Circle.flac", 28100000, "flac", lossless_attributes),
-            (1, "@@abc\\Kasablanca - Time Is A Circle (Extended Club Mix).mp3", 13700000, "mp3", lossy_attributes),
+            (1, "@@abc\\Kasablanca - Time Is A Circle.mp3", 13700000, "mp3", lossy_attributes),
         ]
         msg = self._make_response(item.token, "someuser", files)
 
@@ -868,7 +868,7 @@ class DownloadListsTest(TestCase):
         lossless_attributes = FileAttributes(length=258, sample_rate=44100, bit_depth=16)
         files = [
             (1, "@@abc\\Kasablanca - Time Is A Circle.flac", 28100000, "flac", lossless_attributes),
-            (1, "@@abc\\Kasablanca - Time Is A Circle (Extended Club Mix).mp3", 13700000, "mp3", lossy_attributes),
+            (1, "@@abc\\Kasablanca - Time Is A Circle.mp3", 13700000, "mp3", lossy_attributes),
         ]
         msg = self._make_response(item.token, "someuser", files)
 
@@ -1498,6 +1498,82 @@ class DownloadListsTest(TestCase):
 
         self.assertEqual(len(plain_item.download_candidates), 1)
         self.assertEqual(len(remix_item.download_candidates), 1)
+
+    def test_named_mix_candidate_is_accepted_but_scored_honestly(self):
+        """Reported live: 'PURE - Carl Cox' (a plain term) matched and
+        downloaded 'Carl Cox - PURE (El Rancho Mix).mp3' at a claimed 100%
+        match. Confirmed as an acceptable match (a named/branded mix that
+        doesn't say "remix" isn't rejected) -- but a padded filename like
+        this must not be indistinguishable from a truly exact one, so its
+        displayed match percentage should honestly reflect the extra
+        "(El Rancho Mix)" content, not claim 100%."""
+
+        download_list = core.download_lists.add_list(
+            "Named Mix List", quality="any", fuzzy_match_threshold=50, auto_download=True)
+        core.download_lists.add_list_items("Named Mix List", ["PURE - Carl Cox"])
+
+        item = download_list.items["PURE - Carl Cox"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=479, vbr=0)
+        files = [(1, "@@abc\\Carl Cox - PURE (El Rancho Mix).mp3", 19000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "someuser", files)
+
+        core.download_lists._file_search_response(msg)
+        self.assertEqual(len(item.download_candidates), 1)
+
+        core.download_lists._finalize_item("Named Mix List", "PURE - Carl Cox")
+
+        # Term words {pure, carl, cox}; filename words {carl, cox, pure, el, rancho, mix}
+        # -> 3 shared / 6 total (Jaccard) = 50%, not the misleading 100% a plain
+        # "were all the term's words present" score would still claim
+        self.assertEqual(item.download_match_percentage, 50)
+
+    def test_exact_filename_match_still_scores_100_percent(self):
+        """The stricter, honest display score must not falsely dock a
+        candidate whose filename has no extra content beyond the term."""
+
+        download_list = core.download_lists.add_list(
+            "Exact Match List", quality="any", fuzzy_match_threshold=50, auto_download=True)
+        core.download_lists.add_list_items("Exact Match List", ["Carl Cox - Pure"])
+
+        item = download_list.items["Carl Cox - Pure"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=479, vbr=0)
+        files = [(1, "@@abc\\Carl Cox - Pure.mp3", 19000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "someuser", files)
+
+        core.download_lists._file_search_response(msg)
+        core.download_lists._finalize_item("Exact Match List", "Carl Cox - Pure")
+
+        self.assertEqual(item.download_match_percentage, 100)
+
+    def test_continuous_mix_compilation_rejected_regardless_of_naming(self):
+        """Reported live: the same 'PURE - Carl Cox' term also matched a full
+        80-minute continuous DJ mix compilation ("25. Carl Cox Continous Mix
+        ''Pure Intec 4''.mp3") whose title legitimately contains every term
+        word as plain, unparenthesized text -- no naming-convention check
+        could reliably catch every phrasing/misspelling of this, but an
+        implausible length for a single track always gives it away."""
+
+        download_list = core.download_lists.add_list(
+            "No Compilation List", quality="any", fuzzy_match_threshold=50, auto_download=True)
+        core.download_lists.add_list_items("No Compilation List", ["PURE - Carl Cox"])
+
+        item = download_list.items["PURE - Carl Cox"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=4836, vbr=0)  # ~80 minutes
+        files = [(
+            1, "media\\Pure Intec 4 (Mixed By Carl Cox & Jon Rundell) (2019)\\Disc 1\\"
+               "25. Carl Cox Continous Mix ''Pure Intec 4''.mp3", 193500000, "mp3", attributes
+        )]
+        msg = self._make_response(item.token, "someuser", files)
+
+        core.download_lists._file_search_response(msg)
+
+        self.assertEqual(item.download_candidates, [])
 
     def test_search_text_excludes_remix_when_term_has_no_remix(self):
         """"-word" is Soulseek search syntax excluding results containing that
