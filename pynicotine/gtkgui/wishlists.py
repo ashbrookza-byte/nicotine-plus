@@ -1113,18 +1113,23 @@ class Wishlists:
         (
             self.add_list_button,
             self.add_songs_button,
-            self.completed_lists_container,
-            self.completed_section,
             self.container,
             self.current_list_label,
             self.export_summary_button,
+            self.folders_completed_lists_container,
+            self.folders_completed_section,
+            self.folders_heading,
+            self.folders_lists_container,
             self.items_container,
             self.items_pane,
             self.items_search_entry,
             self.list_settings_button,
-            self.lists_container,
             self.lists_pane,
             self.pause_resume_button,
+            self.spotify_category_section,
+            self.spotify_completed_lists_container,
+            self.spotify_completed_section,
+            self.spotify_lists_container,
             self.verify_matches_button,
             self.wishlist_settings_button,
             self.wishlists_paned
@@ -1152,15 +1157,19 @@ class Wishlists:
         # placeholder bound to its visibility
         window.wishlists_content.set_visible(True)
 
-        # Active lists are shown in priority order (top = priority 1, pinned
-        # lists always grouped ahead of unpinned ones), reorderable by dragging
-        # a row or via Move Up/Down within its own pinned/unpinned group — see
-        # DownloadLists.reorder_lists/move_list_up/down — so they're
-        # intentionally left unsorted here rather than alphabetically
-        self.lists_view = TreeView(
-            window, parent=self.lists_container, select_row_callback=self.on_select_list_row,
-            reorder_callback=self.on_lists_view_reordered,
-            columns={
+        # The sidebar splits lists into two categories -- Folders (manually
+        # created, or populated by Watch Folder) and Spotify Playlists (each
+        # backed by a watched Spotify playlist, see SpotifyWatch) -- each
+        # with its own Active/Completed pair, identical in behavior to one
+        # another. Active lists are shown in priority order (top = priority
+        # 1, pinned lists always grouped ahead of unpinned ones), reorderable
+        # by dragging a row or via Move Up/Down within its own pinned/
+        # unpinned group — see DownloadLists.reorder_lists/move_list_up/down
+        # — so they're intentionally left unsorted here rather than
+        # alphabetically. Completed lists have no priority order to reorder,
+        # so alphabetical is more useful there instead.
+        def _active_columns():
+            return {
                 "pin": {
                     "column_type": "text",
                     "title": "",
@@ -1180,33 +1189,27 @@ class Wishlists:
                     "tabular": True
                 }
             }
-        )
 
-        # Completed lists (every item downloaded or not found) move here automatically;
-        # priority order doesn't matter for them anymore, so alphabetical is more useful
-        self.completed_lists_view = TreeView(
-            window, parent=self.completed_lists_container, select_row_callback=self.on_select_list_row,
-            columns={
-                "pin": {
-                    "column_type": "text",
-                    "title": "",
-                    "width": 20
-                },
-                "name": {
-                    "column_type": "text",
-                    "title": _("List"),
-                    "width": 120,
-                    "expand_column": True,
-                    "iterator_key": True,
-                    "default_sort_type": "ascending"
-                },
-                "summary": {
-                    "column_type": "text",
-                    "title": _("Progress"),
-                    "width": 0,
-                    "tabular": True
-                }
-            }
+        def _completed_columns():
+            columns = _active_columns()
+            columns["name"]["default_sort_type"] = "ascending"
+            return columns
+
+        self.folders_lists_view = TreeView(
+            window, parent=self.folders_lists_container, select_row_callback=self.on_select_list_row,
+            reorder_callback=self.on_folders_lists_view_reordered, columns=_active_columns()
+        )
+        self.folders_completed_lists_view = TreeView(
+            window, parent=self.folders_completed_lists_container, select_row_callback=self.on_select_list_row,
+            columns=_completed_columns()
+        )
+        self.spotify_lists_view = TreeView(
+            window, parent=self.spotify_lists_container, select_row_callback=self.on_select_list_row,
+            reorder_callback=self.on_spotify_lists_view_reordered, columns=_active_columns()
+        )
+        self.spotify_completed_lists_view = TreeView(
+            window, parent=self.spotify_completed_lists_container, select_row_callback=self.on_select_list_row,
+            columns=_completed_columns()
         )
 
         self.items_view = TreeView(
@@ -1264,8 +1267,7 @@ class Wishlists:
             }
         )
 
-        self.lists_popup_menu = PopupMenu(window.application, self.lists_view.widget, self.on_popup_lists_menu)
-        self.lists_popup_menu.add_items(
+        active_menu_items = (
             ("#" + self.PIN_LABEL, self.on_pin_unpin_list),
             ("#" + self.PAUSE_LABEL, self.on_pause_resume_list),
             ("#" + _("Move _Up"), self.on_move_list_up),
@@ -1275,12 +1277,9 @@ class Wishlists:
             ("", None),
             ("#" + _("_Remove"), self.on_remove_list)
         )
-
         # Completed lists have no priority order to reorder, but everything else
         # (pin to bring back to Active, settings, rename, remove) still applies
-        self.completed_lists_popup_menu = PopupMenu(
-            window.application, self.completed_lists_view.widget, self.on_popup_lists_menu)
-        self.completed_lists_popup_menu.add_items(
+        completed_menu_items = (
             ("#" + self.PIN_LABEL, self.on_pin_unpin_list),
             ("#" + self.PAUSE_LABEL, self.on_pause_resume_list),
             ("#" + _("_Settings…"), self.on_list_settings),
@@ -1288,6 +1287,22 @@ class Wishlists:
             ("", None),
             ("#" + _("_Remove"), self.on_remove_list)
         )
+
+        self.folders_lists_popup_menu = PopupMenu(
+            window.application, self.folders_lists_view.widget, self.on_popup_lists_menu)
+        self.folders_lists_popup_menu.add_items(*active_menu_items)
+
+        self.folders_completed_lists_popup_menu = PopupMenu(
+            window.application, self.folders_completed_lists_view.widget, self.on_popup_lists_menu)
+        self.folders_completed_lists_popup_menu.add_items(*completed_menu_items)
+
+        self.spotify_lists_popup_menu = PopupMenu(
+            window.application, self.spotify_lists_view.widget, self.on_popup_lists_menu)
+        self.spotify_lists_popup_menu.add_items(*active_menu_items)
+
+        self.spotify_completed_lists_popup_menu = PopupMenu(
+            window.application, self.spotify_completed_lists_view.widget, self.on_popup_lists_menu)
+        self.spotify_completed_lists_popup_menu.add_items(*completed_menu_items)
 
         self.items_popup_menu = PopupMenu(window.application, self.items_view.widget)
         self.items_popup_menu.add_items(
@@ -1314,16 +1329,20 @@ class Wishlists:
 
     def destroy(self):
 
-        self.lists_popup_menu.destroy()
-        self.completed_lists_popup_menu.destroy()
+        self.folders_lists_popup_menu.destroy()
+        self.folders_completed_lists_popup_menu.destroy()
+        self.spotify_lists_popup_menu.destroy()
+        self.spotify_completed_lists_popup_menu.destroy()
         self.items_popup_menu.destroy()
-        self.lists_view.destroy()
-        self.completed_lists_view.destroy()
+        self.folders_lists_view.destroy()
+        self.folders_completed_lists_view.destroy()
+        self.spotify_lists_view.destroy()
+        self.spotify_completed_lists_view.destroy()
         self.items_view.destroy()
         self.__dict__.clear()
 
     def on_focus(self, *_args):
-        self.lists_view.grab_focus()
+        self.folders_lists_view.grab_focus()
 
     def on_items_search_changed(self, entry, *_args):
 
@@ -1335,6 +1354,12 @@ class Wishlists:
     def on_items_search_stop(self, entry, *_args):
         entry.set_text("")
 
+    def _all_lists_views(self):
+        return (
+            self.folders_lists_view, self.folders_completed_lists_view,
+            self.spotify_lists_view, self.spotify_completed_lists_view
+        )
+
     def on_select_list_row(self, list_view, iterator):
 
         if self._suppress_selection_sync:
@@ -1344,28 +1369,61 @@ class Wishlists:
             self._show_list(None)
             return
 
-        # Only one of the Active/Completed lists can be selected at a time; clear
-        # whichever view didn't just receive this selection. Suppress selection
-        # events while doing so, since unselecting fires "changed" too, and would
-        # otherwise wipe out the selection we're in the middle of setting
-        other_view = self.completed_lists_view if list_view is self.lists_view else self.lists_view
+        # Only one row across all four category/status views can be selected
+        # at a time; clear whichever ones didn't just receive this selection.
+        # Suppress selection events while doing so, since unselecting fires
+        # "changed" too, and would otherwise wipe out the selection we're in
+        # the middle of setting
         self._suppress_selection_sync = True
-        other_view.unselect_all_rows()
+
+        for other_view in self._all_lists_views():
+            if other_view is not list_view:
+                other_view.unselect_all_rows()
+
         self._suppress_selection_sync = False
 
         name = list_view.get_row_value(iterator, "name")
         self._show_list(name)
 
-    def on_lists_view_reordered(self, ordered_names):
-        """The user dragged a row to a new position in the Active section —
-        top of the list is priority 1."""
+    def _active_list_names_by_category(self, is_spotify):
+        return [
+            name for name, download_list in core.download_lists.lists.items()
+            if self._is_active_list(download_list) and self._is_spotify_list(name) == is_spotify
+        ]
 
-        core.download_lists.reorder_lists(ordered_names)
+    def _apply_category_reorder(self, ordered_names, is_spotify):
+        """The user dragged a row to a new position within one category's
+        Active section — top of that category's list is its priority 1.
+        DownloadLists.reorder_lists needs every current Active-section list
+        across both categories at once (or it's a no-op), so the untouched
+        category's existing relative order is appended unchanged — the
+        interleaving between the two categories doesn't matter to it, only
+        each one's own internal order (it regroups pinned-vs-unpinned itself
+        regardless of how the two are interleaved here)."""
+
+        other_names = self._active_list_names_by_category(not is_spotify)
+        core.download_lists.reorder_lists(ordered_names + other_names)
+
+    def on_folders_lists_view_reordered(self, ordered_names):
+        self._apply_category_reorder(ordered_names, is_spotify=False)
+
+    def on_spotify_lists_view_reordered(self, ordered_names):
+        self._apply_category_reorder(ordered_names, is_spotify=True)
 
     def on_start(self):
         self._rebuild_lists_view()
 
     # Row helpers #
+
+    def _is_spotify_list(self, name):
+        """Whether name is currently backed by a watched Spotify playlist --
+        determines which sidebar category (Folders vs. Spotify Playlists) it
+        belongs in. Unwatching a playlist doesn't delete its list, just moves
+        it back to Folders on the next row refresh (see
+        SpotifyWatch.remove_watched_playlist)."""
+
+        watched_names = {playlist["list_name"] for playlist in core.spotify_watch.get_watched_playlists()}
+        return name in watched_names
 
     def _is_active_list(self, download_list):
         """Whether a list belongs in the Active section — everything except a
@@ -1375,15 +1433,41 @@ class Wishlists:
         return download_list.pinned or not download_list.is_complete
 
     def _list_view_for(self, download_list):
-        return self.lists_view if self._is_active_list(download_list) else self.completed_lists_view
 
-    def _update_completed_section_visibility(self):
-        self.completed_section.set_visible(bool(self.completed_lists_view.iterators))
+        is_active = self._is_active_list(download_list)
+
+        if self._is_spotify_list(download_list.name):
+            return self.spotify_lists_view if is_active else self.spotify_completed_lists_view
+
+        return self.folders_lists_view if is_active else self.folders_completed_lists_view
+
+    def _current_view_for_name(self, name):
+
+        for view in self._all_lists_views():
+            if name in view.iterators:
+                return view
+
+        return None
+
+    def _update_category_visibility(self):
+        """The Spotify Playlists category (heading, Active list, and its own
+        Completed sub-section) only shows up once it actually has a list in
+        it -- most users who never touch Spotify Watch see the sidebar
+        exactly as before, with no "Folders" heading either, since a lone
+        category doesn't need a label to distinguish it from anything."""
+
+        has_spotify_lists = bool(self.spotify_lists_view.iterators or self.spotify_completed_lists_view.iterators)
+
+        self.spotify_category_section.set_visible(has_spotify_lists)
+        self.folders_heading.set_visible(has_spotify_lists)
+        self.folders_completed_section.set_visible(bool(self.folders_completed_lists_view.iterators))
+        self.spotify_completed_section.set_visible(bool(self.spotify_completed_lists_view.iterators))
 
     def _rebuild_lists_view(self):
-        """Repopulate both the Active and Completed sections from scratch, in
-        current list priority order. Used at startup, and after a reorder that
-        can't be expressed as a simple row move (e.g. Move Up/Down)."""
+        """Repopulate every Active/Completed x Folders/Spotify section from
+        scratch, in current list priority order. Used at startup, and after a
+        reorder that can't be expressed as a simple row move (e.g. Move Up/
+        Down), or a category change (e.g. a playlist being unwatched)."""
 
         if core.download_lists is None:
             return
@@ -1391,10 +1475,10 @@ class Wishlists:
         selected_name = self.current_list_name
 
         self._suppress_selection_sync = True
-        self.lists_view.freeze()
-        self.completed_lists_view.freeze()
-        self.lists_view.clear()
-        self.completed_lists_view.clear()
+
+        for view in self._all_lists_views():
+            view.freeze()
+            view.clear()
 
         # TreeView.add_row() always inserts at the top (for performance), so for
         # this unsorted, priority-ordered view, lists must be added lowest
@@ -1403,11 +1487,12 @@ class Wishlists:
         for name in reversed(list(core.download_lists.lists)):
             self._add_list_row(name)
 
-        self.lists_view.unfreeze()
-        self.completed_lists_view.unfreeze()
+        for view in self._all_lists_views():
+            view.unfreeze()
+
         self._suppress_selection_sync = False
 
-        self._update_completed_section_visibility()
+        self._update_category_visibility()
 
         download_list = core.download_lists.lists.get(selected_name) if selected_name is not None else None
 
@@ -1450,7 +1535,7 @@ class Wishlists:
         target_view = self._list_view_for(download_list)
         target_view.add_row(
             [pin_glyph, name, self._list_summary_text(download_list)], select_row=select)
-        self._update_completed_section_visibility()
+        self._update_category_visibility()
 
     def _update_list_row(self, name):
 
@@ -1459,8 +1544,7 @@ class Wishlists:
         if download_list is None:
             return
 
-        current_view = self.lists_view if name in self.lists_view.iterators else (
-            self.completed_lists_view if name in self.completed_lists_view.iterators else None)
+        current_view = self._current_view_for_name(name)
 
         if current_view is None:
             return
@@ -1468,9 +1552,10 @@ class Wishlists:
         target_view = self._list_view_for(download_list)
 
         if current_view is not target_view:
-            if target_view is self.lists_view:
-                # Moving back to Active: a plain add would drop it to the bottom
-                # instead of its actual priority position, so rebuild instead
+            if target_view in (self.folders_lists_view, self.spotify_lists_view):
+                # Moving back to Active (or switching category): a plain add
+                # would drop it to the bottom instead of its actual priority
+                # position, so rebuild instead
                 self._rebuild_lists_view()
                 return
 
@@ -1481,7 +1566,7 @@ class Wishlists:
                 [self.PIN_GLYPH if download_list.pinned else "", name, self._list_summary_text(download_list)],
                 select_row=was_selected
             )
-            self._update_completed_section_visibility()
+            self._update_category_visibility()
             return
 
         iterator = current_view.iterators.get(name)
@@ -1621,14 +1706,14 @@ class Wishlists:
 
     def on_remove_download_list_event(self, name):
 
-        for view in (self.lists_view, self.completed_lists_view):
+        for view in self._all_lists_views():
             iterator = view.iterators.get(name)
 
             if iterator is not None:
                 view.remove_row(iterator)
                 break
 
-        self._update_completed_section_visibility()
+        self._update_category_visibility()
 
         if self.current_list_name == name:
             self._show_list(None)
@@ -1741,15 +1826,50 @@ class Wishlists:
         if download_list is not None:
             core.download_lists.set_list_pinned(name, not download_list.pinned)
 
-    def on_move_list_up(self, *_args):
+    def _move_list_priority(self, direction):
+        """Swap the current list with its neighbor within its own category
+        (Folders or Spotify Playlists) -- mirrors DownloadLists.
+        _swap_list_priority's own pinned/unpinned tier restriction, but
+        scoped further to the category, since the two categories are now
+        displayed in fully separate sidebar sections: swapping against a
+        list in the other category wouldn't move anything visibly, even
+        though it would still change the underlying global priority order
+        DownloadLists.move_list_up/down operates on directly."""
 
-        if self.current_list_name is not None:
-            core.download_lists.move_list_up(self.current_list_name)
+        name = self.current_list_name
+
+        if name is None:
+            return
+
+        download_list = core.download_lists.lists.get(name)
+
+        if download_list is None:
+            return
+
+        is_spotify = self._is_spotify_list(name)
+        category_names = self._active_list_names_by_category(is_spotify)
+        same_tier = [
+            list_name for list_name in category_names
+            if core.download_lists.lists[list_name].pinned == download_list.pinned
+        ]
+
+        index = same_tier.index(name)
+        swap_index = index + direction
+
+        if swap_index < 0 or swap_index >= len(same_tier):
+            return
+
+        swap_name = same_tier[swap_index]
+        i, j = category_names.index(name), category_names.index(swap_name)
+        category_names[i], category_names[j] = category_names[j], category_names[i]
+
+        self._apply_category_reorder(category_names, is_spotify)
+
+    def on_move_list_up(self, *_args):
+        self._move_list_priority(-1)
 
     def on_move_list_down(self, *_args):
-
-        if self.current_list_name is not None:
-            core.download_lists.move_list_down(self.current_list_name)
+        self._move_list_priority(1)
 
     def on_pause_resume_list(self, *_args):
 

@@ -49,14 +49,27 @@
               </object>
             </child>
             <child>
-              <object class="GtkScrolledWindow" id="lists_container">
+              <object class="GtkLabel" id="folders_heading">
+                <property name="label" translatable="yes">Folders</property>
+                <property name="xalign">0</property>
+                <property name="margin-start">6</property>
+                <property name="margin-top">3</property>
+                <property name="margin-bottom">3</property>
+                <property name="visible">False</property>
+                <style>
+                  <class name="heading"/>
+                </style>
+              </object>
+            </child>
+            <child>
+              <object class="GtkScrolledWindow" id="folders_lists_container">
                 <property name="hexpand">True</property>
                 <property name="vexpand">True</property>
                 <property name="visible">True</property>
               </object>
             </child>
             <child>
-              <object class="GtkBox" id="completed_section">
+              <object class="GtkBox" id="folders_completed_section">
                 <property name="orientation">vertical</property>
                 <property name="visible">False</property>
                 <child>
@@ -73,11 +86,70 @@
                   </object>
                 </child>
                 <child>
-                  <object class="GtkScrolledWindow" id="completed_lists_container">
+                  <object class="GtkScrolledWindow" id="folders_completed_lists_container">
                     <property name="hexpand">True</property>
                     <property name="max-content-height">200</property>
                     <property name="propagate-natural-height">True</property>
                     <property name="visible">True</property>
+                  </object>
+                </child>
+              </object>
+            </child>
+            <child>
+              <object class="GtkBox" id="spotify_category_section">
+                <property name="orientation">vertical</property>
+                <property name="visible">False</property>
+                <child>
+                  <object class="GtkSeparator">
+                    <property name="margin-top">3</property>
+                    <property name="margin-bottom">3</property>
+                    <property name="visible">True</property>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel">
+                    <property name="label" translatable="yes">Spotify Playlists</property>
+                    <property name="xalign">0</property>
+                    <property name="margin-start">6</property>
+                    <property name="margin-bottom">3</property>
+                    <property name="visible">True</property>
+                    <style>
+                      <class name="heading"/>
+                    </style>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkScrolledWindow" id="spotify_lists_container">
+                    <property name="hexpand">True</property>
+                    <property name="vexpand">True</property>
+                    <property name="visible">True</property>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkBox" id="spotify_completed_section">
+                    <property name="orientation">vertical</property>
+                    <property name="visible">False</property>
+                    <child>
+                      <object class="GtkLabel">
+                        <property name="label" translatable="yes">Completed</property>
+                        <property name="xalign">0</property>
+                        <property name="margin-start">6</property>
+                        <property name="margin-top">6</property>
+                        <property name="margin-bottom">3</property>
+                        <property name="visible">True</property>
+                        <style>
+                          <class name="heading"/>
+                        </style>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkScrolledWindow" id="spotify_completed_lists_container">
+                        <property name="hexpand">True</property>
+                        <property name="max-content-height">200</property>
+                        <property name="propagate-natural-height">True</property>
+                        <property name="visible">True</property>
+                      </object>
+                    </child>
                   </object>
                 </child>
               </object>

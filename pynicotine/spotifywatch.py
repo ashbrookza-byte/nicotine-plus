@@ -177,17 +177,24 @@ class SpotifyWatch:
     def remove_watched_playlist(self, playlist_id):
 
         watched = config.sections["spotify"]["watched_playlists"]
-        new_watched = [entry for entry in watched if entry["playlist_id"] != playlist_id]
+        removed_entry = next((entry for entry in watched if entry["playlist_id"] == playlist_id), None)
 
-        if len(new_watched) == len(watched):
+        if removed_entry is None:
             return
 
+        new_watched = [entry for entry in watched if entry["playlist_id"] != playlist_id]
         config.sections["spotify"]["watched_playlists"] = new_watched
         config.write_configuration()
 
         if not new_watched:
             events.cancel_scheduled(self._poll_timer_id)
             self._poll_timer_id = None
+
+        # The wishlist itself isn't touched -- unwatching just stops it being
+        # auto-imported into. Tell the GUI to re-check this list's row, so a
+        # sidebar that categorizes by watched-playlist status (Folders vs.
+        # Spotify Playlists) moves it back out of the Spotify category.
+        events.emit("update-download-list", removed_entry["list_name"])
 
     def add_watched_playlist(self, playlist_url_or_id, result_callback):
         """Starts watching a playlist -- the user's own, or anyone else's, as
@@ -238,6 +245,13 @@ class SpotifyWatch:
 
         events.invoke_main_thread(self._ensure_polling)
         events.invoke_main_thread(result_callback, True, list_name)
+
+        # In case this list already existed (e.g. re-watching one that was
+        # previously unwatched) -- if it's brand new, add-download-list /
+        # update-download-list-item below (via _poll_single_playlist) covers
+        # it instead, but a re-watch with nothing new to import wouldn't
+        # otherwise tell the GUI its category just changed back to Spotify
+        events.invoke_main_thread(events.emit, "update-download-list", list_name)
 
         # Import whatever's already in the playlist right away, rather than
         # waiting up to POLL_INTERVAL for the first check. We're already on
