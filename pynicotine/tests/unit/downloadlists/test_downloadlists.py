@@ -129,6 +129,76 @@ class DownloadListsTest(TestCase):
         self.assertFalse(result)
         self.assertIn("List One", core.download_lists.lists)
 
+    def test_rename_list_moves_name_subfolder(self):
+        """Renaming a list that saves into a subfolder named after itself must
+        move that folder (and its already-downloaded files) to match, rather
+        than leaving them behind under the old name."""
+
+        base_folder_path = os.path.join(DATA_FOLDER_PATH, "renamed_list_downloads")
+        old_folder_path = os.path.join(base_folder_path, "Old Chart Name")
+        os.makedirs(old_folder_path, exist_ok=True)
+
+        with open(os.path.join(old_folder_path, "Already Downloaded.mp3"), "w", encoding="utf-8") as handle:
+            handle.write("not really audio, just needs to exist")
+
+        core.download_lists.add_list(
+            "Old Chart Name", download_folder_path=base_folder_path, use_name_subfolder=True)
+
+        result = core.download_lists.rename_list("Old Chart Name", "New Chart Name")
+        self.assertTrue(result)
+
+        new_folder_path = os.path.join(base_folder_path, "New Chart Name")
+
+        self.assertFalse(os.path.exists(old_folder_path))
+        self.assertTrue(os.path.isfile(os.path.join(new_folder_path, "Already Downloaded.mp3")))
+
+        download_list = core.download_lists.lists["New Chart Name"]
+        self.assertEqual(download_list.effective_download_folder_path, new_folder_path)
+
+    def test_rename_list_merges_into_existing_destination_folder(self):
+        """If a folder for the new name already exists (e.g. left over from an
+        earlier list), renaming must merge into it rather than failing or
+        overwriting anything, keeping files from both."""
+
+        base_folder_path = os.path.join(DATA_FOLDER_PATH, "renamed_list_merge")
+        old_folder_path = os.path.join(base_folder_path, "Old Merge Name")
+        new_folder_path = os.path.join(base_folder_path, "New Merge Name")
+        os.makedirs(old_folder_path, exist_ok=True)
+        os.makedirs(new_folder_path, exist_ok=True)
+
+        with open(os.path.join(old_folder_path, "From Old.mp3"), "w", encoding="utf-8") as handle:
+            handle.write("old")
+
+        with open(os.path.join(new_folder_path, "Already Here.mp3"), "w", encoding="utf-8") as handle:
+            handle.write("pre-existing")
+
+        core.download_lists.add_list(
+            "Old Merge Name", download_folder_path=base_folder_path, use_name_subfolder=True)
+
+        result = core.download_lists.rename_list("Old Merge Name", "New Merge Name")
+        self.assertTrue(result)
+
+        self.assertFalse(os.path.exists(old_folder_path))
+        self.assertTrue(os.path.isfile(os.path.join(new_folder_path, "From Old.mp3")))
+        self.assertTrue(os.path.isfile(os.path.join(new_folder_path, "Already Here.mp3")))
+
+    def test_rename_list_without_name_subfolder_leaves_folder_untouched(self):
+        """A list using an explicit, fixed download folder (not one named after
+        itself) shouldn't have anything on disk touched by a rename."""
+
+        fixed_folder_path = os.path.join(DATA_FOLDER_PATH, "fixed_folder_untouched")
+        os.makedirs(fixed_folder_path, exist_ok=True)
+
+        core.download_lists.add_list("Old Fixed Name", download_folder_path=fixed_folder_path)
+
+        result = core.download_lists.rename_list("Old Fixed Name", "New Fixed Name")
+
+        self.assertTrue(result)
+        self.assertTrue(os.path.isdir(fixed_folder_path))
+
+        download_list = core.download_lists.lists["New Fixed Name"]
+        self.assertEqual(download_list.effective_download_folder_path, fixed_folder_path)
+
     def test_update_list_settings(self):
 
         download_list = core.download_lists.add_list("Settings List", quality="any", fuzzy_match_threshold=70)

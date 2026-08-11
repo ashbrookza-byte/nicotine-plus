@@ -21,6 +21,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import time
 
 from collections import deque
@@ -643,6 +644,52 @@ class DownloadLists:
         self._watch_snapshots.clear()
         config.write_configuration()
 
+    @staticmethod
+    def _move_list_folder(old_folder_path, new_folder_path):
+        """Move a renamed list's on-disk subfolder to match, merging into an
+        existing destination (e.g. a stale folder from an earlier list of the
+        same name) file by file rather than overwriting it outright."""
+
+        old_encoded = encode_path(old_folder_path)
+
+        if not os.path.isdir(old_encoded):
+            # Nothing downloaded under the old name yet, nothing to move
+            return
+
+        new_encoded = encode_path(new_folder_path)
+
+        try:
+            if not os.path.exists(new_encoded):
+                parent_folder_path = os.path.dirname(new_folder_path)
+
+                if parent_folder_path:
+                    os.makedirs(encode_path(parent_folder_path), exist_ok=True)
+
+                shutil.move(old_encoded, new_encoded)
+                return
+
+            # Destination already exists: merge contents in rather than overwriting it
+            with os.scandir(old_encoded) as entries:
+                basenames = [entry.name.decode("utf-8", "replace") for entry in entries]
+
+            for basename in basenames:
+                source_path = os.path.join(old_folder_path, basename)
+                target_path = os.path.join(new_folder_path, basename)
+                name_root, extension = os.path.splitext(basename)
+                counter = 1
+
+                while os.path.exists(encode_path(target_path)):
+                    target_path = os.path.join(new_folder_path, f"{name_root} ({counter}){extension}")
+                    counter += 1
+
+                shutil.move(encode_path(source_path), encode_path(target_path))
+
+            os.rmdir(old_encoded)
+
+        except OSError as error:
+            log.add(_("Cannot move download list folder from %(old)s to %(new)s: %(error)s"),
+                    {"old": old_folder_path, "new": new_folder_path, "error": error})
+
     def rename_list(self, old_name, new_name):
 
         new_name = new_name.strip()
@@ -651,6 +698,12 @@ class DownloadLists:
             return False
 
         download_list = self.lists.pop(old_name)
+
+        # Only lists saving into a subfolder named after themselves have a folder
+        # tied to the list name; a list with an explicit fixed folder is unaffected
+        old_folder_path = (
+            download_list.effective_download_folder_path if download_list.effective_use_name_subfolder else None)
+
         download_list.name = new_name
 
         for item in download_list.items.values():
@@ -665,9 +718,27 @@ class DownloadLists:
             if list_name == old_name:
                 self._token_map[token] = (new_name, term)
 
+        active_transfer_keys = []
+
         for key, (list_name, term) in list(self._transfer_map.items()):
             if list_name == old_name:
                 self._transfer_map[key] = (new_name, term)
+                active_transfer_keys.append(key)
+
+        if old_folder_path is not None:
+            new_folder_path = download_list.effective_download_folder_path
+
+            if new_folder_path != old_folder_path:
+                self._move_list_folder(old_folder_path, new_folder_path)
+
+                # Any download still in flight for this list was enqueued with the
+                # old folder path baked in; point it at the new one so it lands in
+                # the right place once it finishes, instead of recreating the old folder
+                for transfer_key in active_transfer_keys:
+                    transfer = core.downloads.transfers.get(transfer_key)
+
+                    if transfer is not None and transfer.folder_path == old_folder_path:
+                        transfer.folder_path = new_folder_path
 
         events.emit("rename-download-list", old_name, new_name)
         self._save()
