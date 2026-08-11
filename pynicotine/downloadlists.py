@@ -62,7 +62,8 @@ class DownloadListItem:
     __slots__ = (
         "term", "list_name", "time_added", "status", "searched_term", "token",
         "download_username", "download_virtual_path", "download_size", "download_attributes",
-        "download_candidates", "variant_index", "collect_timer_id", "escalation_timer_id"
+        "download_candidates", "variant_index", "collect_timer_id", "escalation_timer_id",
+        "download_percent"
     )
 
     def __init__(self, term, list_name, time_added=None, status=DownloadListItemStatus.PENDING,
@@ -91,6 +92,7 @@ class DownloadListItem:
         self.variant_index = 0
         self.collect_timer_id = None
         self.escalation_timer_id = None
+        self.download_percent = 100 if status == DownloadListItemStatus.COMPLETED else 0
 
     @property
     def h_quality(self):
@@ -742,6 +744,7 @@ class DownloadLists:
         item.download_virtual_path = None
         item.download_size = 0
         item.download_attributes = None
+        item.download_percent = 0
 
         if download_list.effective_auto_download:
             self._queue.append((name, term))
@@ -1258,6 +1261,7 @@ class DownloadLists:
         item.download_virtual_path = virtual_path
         item.download_size = size
         item.download_attributes = attributes
+        item.download_percent = 0
 
         transfer_key = username + virtual_path
         self._transfer_map[transfer_key] = (list_name, term)
@@ -1270,8 +1274,20 @@ class DownloadLists:
         events.emit("update-download-list-item", list_name, term)
         self._save()
 
+    @staticmethod
+    def _transfer_percent(current_byte_offset, size):
+
+        if not current_byte_offset or size <= 0:
+            return 0
+
+        if current_byte_offset >= size:
+            return 100
+
+        # Multiply first to avoid decimals
+        return (100 * current_byte_offset) // size
+
     def _update_download(self, transfer, _update_parent):
-        """Track completion of an automatic download list transfer."""
+        """Track progress and completion of an automatic download list transfer."""
 
         transfer_key = transfer.username + transfer.virtual_path
         entry = self._transfer_map.get(transfer_key)
@@ -1279,10 +1295,6 @@ class DownloadLists:
         if entry is None:
             return
 
-        if transfer.status != TransferStatus.FINISHED:
-            return
-
-        del self._transfer_map[transfer_key]
         list_name, term = entry
         download_list = self.lists.get(list_name)
         item = download_list.items.get(term) if download_list is not None else None
@@ -1290,7 +1302,20 @@ class DownloadLists:
         if item is None:
             return
 
+        if transfer.status != TransferStatus.FINISHED:
+            percent = self._transfer_percent(transfer.current_byte_offset, transfer.size)
+
+            if percent == item.download_percent:
+                return
+
+            item.download_percent = percent
+            events.emit("update-download-list-item", list_name, term)
+            return
+
+        del self._transfer_map[transfer_key]
+
         item.status = DownloadListItemStatus.COMPLETED
+        item.download_percent = 100
         self._forget_item(item)
 
         events.emit("update-download-list-item", list_name, term)

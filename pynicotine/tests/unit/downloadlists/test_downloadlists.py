@@ -432,13 +432,24 @@ class DownloadListsTest(TestCase):
         transfer = core.downloads.transfers.get("someuser" + item.download_virtual_path)
         self.assertIsNotNone(transfer)
         self.assertEqual(transfer.folder_path, DATA_FOLDER_PATH)
+        self.assertEqual(item.download_percent, 0)
+
+        # Simulate a progress update partway through the transfer
+        from pynicotine.transfers import TransferStatus
+        transfer.status = TransferStatus.TRANSFERRING
+        transfer.current_byte_offset = 4000000
+        transfer.size = 8000000
+        core.download_lists._update_download(transfer, True)
+
+        self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
+        self.assertEqual(item.download_percent, 50)
 
         # Simulate the transfer finishing
-        from pynicotine.transfers import TransferStatus
         transfer.status = TransferStatus.FINISHED
         core.download_lists._update_download(transfer, True)
 
         self.assertEqual(item.status, DownloadListItemStatus.COMPLETED)
+        self.assertEqual(item.download_percent, 100)
         self.assertTrue(download_list.is_complete)
 
         rows = core.download_lists.get_summary_rows("Live List")

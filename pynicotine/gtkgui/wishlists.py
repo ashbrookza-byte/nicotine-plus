@@ -570,6 +570,11 @@ class Wishlists:
                     "title": _("Status"),
                     "width": 90
                 },
+                "progress": {
+                    "column_type": "progress",
+                    "title": _("Progress"),
+                    "width": 90
+                },
                 "downloaded_file": {
                     "column_type": "text",
                     "title": _("Downloaded File"),
@@ -696,6 +701,7 @@ class Wishlists:
             item.term,
             item.searched_term or "",
             self.STATUS_LABELS.get(item.status, item.status),
+            item.download_percent,
             item.download_filename,
             item.h_quality,
             item.h_length
@@ -722,9 +728,9 @@ class Wishlists:
 
         self.items_view.set_row_values(
             iterator,
-            ["searched_term", "status", "downloaded_file", "quality", "length"],
+            ["searched_term", "status", "progress", "downloaded_file", "quality", "length"],
             [item.searched_term or "", self.STATUS_LABELS.get(item.status, item.status),
-             item.download_filename, item.h_quality, item.h_length]
+             item.download_percent, item.download_filename, item.h_quality, item.h_length]
         )
 
     def _pause_resume_label(self, download_list):
