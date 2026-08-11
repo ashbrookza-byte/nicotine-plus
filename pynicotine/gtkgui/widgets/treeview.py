@@ -418,11 +418,12 @@ class TreeView:
             if title_label is not None:
                 # An ellipsized label doesn't request its natural width, so it needs
                 # to be told to actually claim the available header space, otherwise
-                # it collapses down to a tiny minimum size instead of filling the column
+                # it collapses down to a tiny minimum size instead of filling the column.
+                # Header titles are always left-aligned, regardless of how the column's
+                # data cells are aligned (e.g. right-aligned numbers still get a
+                # left-aligned header, for a consistent look across all columns)
                 title_label.set_hexpand(True)
-                title_label.set_halign(
-                    Gtk.Align.END if xalign == 1 else Gtk.Align.CENTER if xalign == 0.5 else Gtk.Align.START
-                )
+                title_label.set_halign(Gtk.Align.START)
                 title_label.set_ellipsize(Pango.EllipsizeMode.END)
 
             if column_data.get("hide_header"):
@@ -445,11 +446,6 @@ class TreeView:
                 column.set_reorderable(True)
 
             column.set_min_width(24)
-
-            if xalign == 1 and GTK_API_VERSION >= 4:
-                # Gtk.TreeViewColumn.set_alignment() only changes the sort arrow position in GTK 4
-                # Actually align the label to the right here instead
-                title_widget.set_halign(Gtk.Align.END)
 
             if sensitive_column:
                 column.add_attribute(renderer, "sensitive", self._column_ids[sensitive_column])
