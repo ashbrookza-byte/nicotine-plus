@@ -42,7 +42,12 @@ from pynicotine.slskmessages import initial_token
 from pynicotine.transfers import TransferStatus
 from pynicotine.utils import encode_path
 from pynicotine.utils import load_file
+from pynicotine.utils import safe_path_join
 from pynicotine.utils import write_file_and_backup
+
+# Sentinel distinguishing "argument not provided, leave setting unchanged" from an
+# explicit None, which means "clear this list's override, follow the overall default"
+_UNSET = object()
 
 
 class DownloadListItemStatus:
@@ -138,20 +143,70 @@ class DownloadListItem:
 class DownloadList:
     __slots__ = (
         "name", "download_folder_path", "quality", "prefer_longer", "fuzzy_match_threshold",
-        "auto_download", "time_added", "items"
+        "auto_download", "use_name_subfolder", "time_added", "items"
     )
 
-    def __init__(self, name, download_folder_path=None, quality="good", prefer_longer=True,
-                 fuzzy_match_threshold=70, auto_download=True, time_added=None, items=None):
+    def __init__(self, name, download_folder_path=None, quality=None, prefer_longer=None,
+                 fuzzy_match_threshold=None, auto_download=None, use_name_subfolder=None,
+                 time_added=None, items=None):
 
         self.name = name
         self.download_folder_path = download_folder_path or None
+
+        # None means "use the overall wishlist default" (set in Wishlist Settings)
+        # rather than a value specific to this list
         self.quality = quality
         self.prefer_longer = prefer_longer
         self.fuzzy_match_threshold = fuzzy_match_threshold
         self.auto_download = auto_download
+        self.use_name_subfolder = use_name_subfolder
+
         self.time_added = time_added if time_added is not None else int(time.time())
         self.items = items if items is not None else {}
+
+    @property
+    def effective_quality(self):
+        return self.quality if self.quality is not None else config.sections["transfers"]["downloadlistdefaultquality"]
+
+    @property
+    def effective_prefer_longer(self):
+        if self.prefer_longer is not None:
+            return self.prefer_longer
+
+        return config.sections["transfers"]["downloadlistdefaultpreferlonger"]
+
+    @property
+    def effective_fuzzy_match_threshold(self):
+        if self.fuzzy_match_threshold is not None:
+            return self.fuzzy_match_threshold
+
+        return config.sections["transfers"]["downloadlistdefaultfuzzy"]
+
+    @property
+    def effective_auto_download(self):
+        if self.auto_download is not None:
+            return self.auto_download
+
+        return config.sections["transfers"]["downloadlistdefaultautodownload"]
+
+    @property
+    def effective_use_name_subfolder(self):
+        if self.use_name_subfolder is not None:
+            return self.use_name_subfolder
+
+        return config.sections["transfers"]["downloadlistdefaultnamesubfolder"]
+
+    @property
+    def effective_download_folder_path(self):
+        """The folder downloads for this list should land in, taking the
+        "subfolder named after the list" preference into account."""
+
+        base_folder_path = self.download_folder_path or core.downloads.get_default_download_folder()
+
+        if not self.effective_use_name_subfolder:
+            return base_folder_path
+
+        return safe_path_join(base_folder_path, self.name)
 
     @property
     def num_completed(self):
@@ -185,6 +240,7 @@ class DownloadList:
             "prefer_longer": self.prefer_longer,
             "fuzzy_match_threshold": self.fuzzy_match_threshold,
             "auto_download": self.auto_download,
+            "use_name_subfolder": self.use_name_subfolder,
             "time_added": self.time_added,
             "items": [item.as_dict() for item in self.items.values()]
         }
@@ -354,17 +410,18 @@ class DownloadLists:
             self.lists[name] = DownloadList(
                 name=name,
                 download_folder_path=list_data.get("download_folder_path"),
-                quality=list_data.get("quality", "good"),
-                prefer_longer=list_data.get("prefer_longer", True),
-                fuzzy_match_threshold=list_data.get("fuzzy_match_threshold", 70),
-                auto_download=list_data.get("auto_download", True),
+                quality=list_data.get("quality"),
+                prefer_longer=list_data.get("prefer_longer"),
+                fuzzy_match_threshold=list_data.get("fuzzy_match_threshold"),
+                auto_download=list_data.get("auto_download"),
+                use_name_subfolder=list_data.get("use_name_subfolder"),
                 time_added=list_data.get("time_added"),
                 items=items
             )
 
         # Re-queue anything left pending from a previous session
         for download_list in self.lists.values():
-            if not download_list.auto_download:
+            if not download_list.effective_auto_download:
                 continue
 
             for item in download_list.items.values():
@@ -401,8 +458,10 @@ class DownloadLists:
 
     # List Management #
 
-    def add_list(self, name, download_folder_path=None, quality="good", prefer_longer=True,
-                 fuzzy_match_threshold=70, auto_download=True):
+    def add_list(self, name, download_folder_path=None, quality=None, prefer_longer=None,
+                 fuzzy_match_threshold=None, auto_download=None, use_name_subfolder=None):
+        """quality/prefer_longer/fuzzy_match_threshold/auto_download/use_name_subfolder default
+        to None, meaning the list follows the overall wishlist defaults until overridden."""
 
         name = name.strip()
 
@@ -412,7 +471,7 @@ class DownloadLists:
         self.lists[name] = download_list = DownloadList(
             name=name, download_folder_path=download_folder_path, quality=quality,
             prefer_longer=prefer_longer, fuzzy_match_threshold=fuzzy_match_threshold,
-            auto_download=auto_download
+            auto_download=auto_download, use_name_subfolder=use_name_subfolder
         )
 
         events.emit("add-download-list", name)
@@ -420,32 +479,38 @@ class DownloadLists:
 
         return download_list
 
-    def update_list_settings(self, name, download_folder_path=None, quality=None, prefer_longer=None,
-                             fuzzy_match_threshold=None, auto_download=None):
+    def update_list_settings(self, name, download_folder_path=_UNSET, quality=_UNSET, prefer_longer=_UNSET,
+                             fuzzy_match_threshold=_UNSET, auto_download=_UNSET, use_name_subfolder=_UNSET):
+        """Each argument left at _UNSET (the default) is untouched. Passing an explicit
+        None for quality/prefer_longer/fuzzy_match_threshold/auto_download/use_name_subfolder
+        clears this list's override, so it follows the overall wishlist default instead."""
 
         download_list = self.lists.get(name)
 
         if download_list is None:
             return
 
-        was_auto_download = download_list.auto_download
+        was_auto_download = download_list.effective_auto_download
 
-        if download_folder_path is not None:
+        if download_folder_path is not _UNSET:
             download_list.download_folder_path = download_folder_path or None
 
-        if quality is not None:
-            download_list.quality = quality
+        if quality is not _UNSET:
+            download_list.quality = quality or None
 
-        if prefer_longer is not None:
+        if prefer_longer is not _UNSET:
             download_list.prefer_longer = prefer_longer
 
-        if fuzzy_match_threshold is not None:
+        if fuzzy_match_threshold is not _UNSET:
             download_list.fuzzy_match_threshold = fuzzy_match_threshold
 
-        if auto_download is not None:
+        if auto_download is not _UNSET:
             download_list.auto_download = auto_download
 
-        if download_list.auto_download and not was_auto_download:
+        if use_name_subfolder is not _UNSET:
+            download_list.use_name_subfolder = use_name_subfolder
+
+        if download_list.effective_auto_download and not was_auto_download:
             # Resuming a paused list: re-queue anything still pending
             for item in download_list.items.values():
                 if item.status == DownloadListItemStatus.PENDING:
@@ -455,6 +520,52 @@ class DownloadLists:
 
         events.emit("update-download-list", name)
         self._save()
+
+    def pause_list(self, name):
+        """Pause a list: stop searching for and downloading its remaining pending items.
+        Items already downloading or completed are left alone."""
+
+        self.update_list_settings(name, auto_download=False)
+
+    def resume_list(self, name):
+        """Resume a paused list, re-queuing anything still pending."""
+
+        self.update_list_settings(name, auto_download=True)
+
+    def update_wishlist_default_settings(self, quality, prefer_longer, fuzzy_match_threshold,
+                                         auto_download, use_name_subfolder):
+        """Set the overall defaults new lists start with, and that any list without its
+        own override follows. Existing lists that override a given setting are unaffected."""
+
+        # Lists inheriting the default (auto_download is None) that are about to go from
+        # paused to active need their pending items re-queued, just like update_list_settings
+        # does for a single list
+        newly_active = [
+            name for name, download_list in self.lists.items()
+            if download_list.auto_download is None and not download_list.effective_auto_download and auto_download
+        ]
+
+        config.sections["transfers"]["downloadlistdefaultquality"] = quality
+        config.sections["transfers"]["downloadlistdefaultpreferlonger"] = bool(prefer_longer)
+        config.sections["transfers"]["downloadlistdefaultfuzzy"] = int(fuzzy_match_threshold)
+        config.sections["transfers"]["downloadlistdefaultautodownload"] = bool(auto_download)
+        config.sections["transfers"]["downloadlistdefaultnamesubfolder"] = bool(use_name_subfolder)
+
+        config.write_configuration()
+
+        for name in newly_active:
+            download_list = self.lists[name]
+
+            for item in download_list.items.values():
+                if item.status == DownloadListItemStatus.PENDING:
+                    self._queue.append((name, item.term))
+
+        if newly_active:
+            self._kick_queue()
+
+        # Lists that don't override these settings are affected, refresh their display
+        for name in self.lists:
+            events.emit("update-download-list", name)
 
     def update_watch_folder_settings(self, enabled, folder_path):
         """Enable/disable and point the watch folder at a new location.
@@ -534,7 +645,7 @@ class DownloadLists:
             download_list.items[term] = DownloadListItem(term=term, list_name=name)
             added_any = True
 
-            if download_list.auto_download:
+            if download_list.effective_auto_download:
                 self._queue.append((name, term))
 
         if not added_any:
@@ -543,7 +654,7 @@ class DownloadLists:
         events.emit("update-download-list", name)
         self._save()
 
-        if download_list.auto_download:
+        if download_list.effective_auto_download:
             self._kick_queue()
 
     def remove_list_item(self, name, term):
@@ -585,7 +696,7 @@ class DownloadLists:
         item.download_size = 0
         item.download_attributes = None
 
-        if download_list.auto_download:
+        if download_list.effective_auto_download:
             self._queue.append((name, term))
             self._kick_queue()
 
@@ -814,7 +925,7 @@ class DownloadLists:
             download_list = self.lists.get(name)
             item = download_list.items.get(term) if download_list is not None else None
 
-            if (download_list is None or item is None or not download_list.auto_download
+            if (download_list is None or item is None or not download_list.effective_auto_download
                     or item.status != DownloadListItemStatus.PENDING):
                 continue
 
@@ -1009,7 +1120,7 @@ class DownloadLists:
             path_lower = virtual_path.lower()
             match_percentage = self._match_percentage(term_words, path_lower)
 
-            if match_percentage < download_list.fuzzy_match_threshold:
+            if match_percentage < download_list.effective_fuzzy_match_threshold:
                 # Doesn't look enough like the original term, e.g. a search that was
                 # broadened to find any results at all matched an unrelated track
                 continue
@@ -1017,7 +1128,7 @@ class DownloadLists:
             _h_quality, bitrate, _h_length, length = FileListMessage.parse_audio_quality_length(size, attributes)
             is_lossless = attributes.bit_depth is not None
 
-            if not self._meets_quality_preference(download_list.quality, is_lossless, bitrate):
+            if not self._meets_quality_preference(download_list.effective_quality, is_lossless, bitrate):
                 continue
 
             score = (
@@ -1025,7 +1136,7 @@ class DownloadLists:
                 bool(msg.freeulslots),
                 is_lossless,
                 bitrate,
-                length if download_list.prefer_longer else 0,
+                length if download_list.effective_prefer_longer else 0,
                 -msg.inqueue
             )
 
@@ -1068,7 +1179,7 @@ class DownloadLists:
         self._forget_search(item)
 
         core.downloads.enqueue_download(
-            username, virtual_path, folder_path=download_list.download_folder_path,
+            username, virtual_path, folder_path=download_list.effective_download_folder_path,
             size=size, file_attributes=attributes)
 
         item.status = DownloadListItemStatus.DOWNLOADING

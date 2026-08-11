@@ -82,6 +82,15 @@
                   </object>
                 </child>
                 <child>
+                  <object class="GtkButton" id="pause_resume_button">
+                    <property name="label" translatable="yes">_Pause</property>
+                    <property name="sensitive">False</property>
+                    <property name="use-underline">True</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_pause_resume_list"/>
+                  </object>
+                </child>
+                <child>
                   <object class="GtkButton" id="add_songs_button">
                     <property name="label" translatable="yes">_Add Songs…</property>
                     <property name="sensitive">False</property>

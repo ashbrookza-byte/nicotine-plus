@@ -143,6 +143,100 @@ class DownloadListsTest(TestCase):
         self.assertEqual(download_list.fuzzy_match_threshold, 90)
         self.assertEqual(download_list.download_folder_path, "/tmp/my-folder")
 
+    def _restore_wishlist_defaults(self):
+        """Undo update_wishlist_default_settings side effects so later tests in
+        this run aren't affected by config.sections being process-global."""
+
+        defaults = config.defaults["transfers"]
+        core.download_lists.update_wishlist_default_settings(
+            quality=defaults["downloadlistdefaultquality"],
+            prefer_longer=defaults["downloadlistdefaultpreferlonger"],
+            fuzzy_match_threshold=defaults["downloadlistdefaultfuzzy"],
+            auto_download=defaults["downloadlistdefaultautodownload"],
+            use_name_subfolder=defaults["downloadlistdefaultnamesubfolder"]
+        )
+
+    def test_list_inherits_overall_defaults(self):
+        """A list with no overrides of its own follows the overall wishlist defaults,
+        and picks up later changes to them."""
+
+        self.addCleanup(self._restore_wishlist_defaults)
+        download_list = core.download_lists.add_list("Inheriting List")
+
+        self.assertEqual(download_list.effective_quality, config.defaults["transfers"]["downloadlistdefaultquality"])
+        self.assertTrue(download_list.effective_auto_download)
+
+        core.download_lists.update_wishlist_default_settings(
+            quality="lossless", prefer_longer=False, fuzzy_match_threshold=55,
+            auto_download=False, use_name_subfolder=True
+        )
+
+        self.assertEqual(download_list.effective_quality, "lossless")
+        self.assertFalse(download_list.effective_prefer_longer)
+        self.assertEqual(download_list.effective_fuzzy_match_threshold, 55)
+        self.assertFalse(download_list.effective_auto_download)
+        self.assertTrue(download_list.effective_use_name_subfolder)
+
+    def test_list_override_survives_default_changes(self):
+        """A list with its own override for a setting keeps it regardless of
+        later changes to the overall default."""
+
+        self.addCleanup(self._restore_wishlist_defaults)
+        download_list = core.download_lists.add_list("Overriding List")
+        core.download_lists.update_list_settings("Overriding List", quality="high")
+
+        core.download_lists.update_wishlist_default_settings(
+            quality="lossless", prefer_longer=True, fuzzy_match_threshold=70,
+            auto_download=True, use_name_subfolder=False
+        )
+
+        self.assertEqual(download_list.effective_quality, "high")
+
+    def test_update_list_settings_explicit_none_clears_override(self):
+        """Passing an explicit None (as opposed to omitting the argument) clears
+        this list's override, reverting it to the overall default."""
+
+        core.download_lists.update_wishlist_default_settings(
+            quality="good", prefer_longer=True, fuzzy_match_threshold=70,
+            auto_download=True, use_name_subfolder=False
+        )
+
+        download_list = core.download_lists.add_list("Clearable List", quality="lossless")
+        self.assertEqual(download_list.quality, "lossless")
+
+        core.download_lists.update_list_settings("Clearable List", quality=None)
+
+        self.assertIsNone(download_list.quality)
+        self.assertEqual(download_list.effective_quality, "good")
+
+    def test_pause_and_resume_list(self):
+        """Pausing marks a list inactive; resuming re-queues anything still pending,
+        even if it was never removed from the queue while paused."""
+
+        download_list = core.download_lists.add_list("Pausable List")
+        core.download_lists.add_list_items("Pausable List", ["Artist - Song"])
+
+        core.download_lists.pause_list("Pausable List")
+        self.assertFalse(download_list.effective_auto_download)
+
+        # Simulate the queue having drained while paused (e.g. _pump_queue skipped
+        # this now-paused item), so resuming has to put it back itself
+        core.download_lists._queue.clear()
+
+        core.download_lists.resume_list("Pausable List")
+
+        self.assertTrue(download_list.effective_auto_download)
+        self.assertIn(("Pausable List", "Artist - Song"), core.download_lists._queue)
+
+    def test_effective_download_folder_path_with_name_subfolder(self):
+        """When "save into a subfolder named after this list" is on, the effective
+        download folder is the base folder plus a subfolder named after the list."""
+
+        download_list = core.download_lists.add_list(
+            "My Chart", download_folder_path="/tmp/downloads", use_name_subfolder=True)
+
+        self.assertEqual(download_list.effective_download_folder_path, "/tmp/downloads/My Chart")
+
     def test_term_variants_strip_bracketed_content(self):
 
         variants = core.download_lists._get_term_variants("Artist - Song Title (Radio Edit)")
