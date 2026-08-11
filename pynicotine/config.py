@@ -455,6 +455,23 @@ class Config:
                 "started_uploads": 0,
                 "completed_uploads": 0,
                 "uploaded_size": 0
+            },
+            "spotify": {
+                # From the user's own Spotify Developer app (developer.spotify.com/dashboard) --
+                # required to watch a playlist at all
+                "client_id": "",
+                "client_secret": "",
+                # Obtained via the one-time OAuth login (SpotifyWatch.begin_authorization);
+                # used afterwards to silently mint fresh access tokens without logging in again
+                "refresh_token": "",
+                "watch_enabled": False,
+                "watch_playlist_id": "",
+                # Prefer the Extended/Original version over a track's Radio Edit -- strips
+                # "(Radio Edit)"-style qualifiers from the search term built for each new track
+                "watch_ignore_radio_edit": True,
+                # Track IDs already imported from the watched playlist, so a track removed from
+                # the wishlist on purpose isn't silently re-added on the next poll
+                "watch_seen_track_ids": []
             }
         }
 

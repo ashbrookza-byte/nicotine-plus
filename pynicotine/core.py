@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from pynicotine.search import Search
     from pynicotine.shares import Shares
     from pynicotine.slskproto import NetworkThread
+    from pynicotine.spotifywatch import SpotifyWatch
     from pynicotine.transfers import Statistics
     from pynicotine.uploads import Uploads
     from pynicotine.userbrowse import UserBrowse
@@ -54,7 +55,7 @@ class Core:
     """
 
     __slots__ = ("shares", "users", "network_filter", "statistics", "search", "downloads",
-                 "download_lists", "uploads", "interests", "userbrowse", "userinfo", "buddies",
+                 "download_lists", "spotify_watch", "uploads", "interests", "userbrowse", "userinfo", "buddies",
                  "privatechat", "chatrooms", "pluginhandler", "now_playing", "portmapper",
                  "notifications", "port_checker", "update_checker", "_network_thread",
                  "cli_interface_address", "cli_listen_port", "cli_rescanning", "enabled_components")
@@ -67,6 +68,7 @@ class Core:
         self.search: Search | None = None
         self.downloads: Downloads | None = None
         self.download_lists: DownloadLists | None = None
+        self.spotify_watch: SpotifyWatch | None = None
         self.uploads: Uploads | None = None
         self.interests: Interests | None = None
         self.userbrowse: UserBrowse | None = None
@@ -96,8 +98,8 @@ class Core:
             enabled_components = {
                 "error_handler", "signal_handler", "cli", "portmapper", "network_thread", "shares", "users",
                 "notifications", "network_filter", "now_playing", "statistics", "port_checker", "update_checker",
-                "search", "downloads", "download_lists", "uploads", "interests", "userbrowse", "userinfo",
-                "buddies", "chatrooms", "privatechat", "pluginhandler"
+                "search", "downloads", "download_lists", "spotify_watch", "uploads", "interests", "userbrowse",
+                "userinfo", "buddies", "chatrooms", "privatechat", "pluginhandler"
             }
 
         self.enabled_components = enabled_components
@@ -175,6 +177,10 @@ class Core:
         if "download_lists" in enabled_components:
             from pynicotine.downloadlists import DownloadLists
             self.download_lists = DownloadLists()
+
+        if "spotify_watch" in enabled_components:
+            from pynicotine.spotifywatch import SpotifyWatch
+            self.spotify_watch = SpotifyWatch()
 
         if "uploads" in enabled_components:
             from pynicotine.uploads import Uploads

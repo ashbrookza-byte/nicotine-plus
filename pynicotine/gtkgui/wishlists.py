@@ -296,6 +296,8 @@ class WishlistSettingsDialog(Dialog):
 
         self._add_watch_folder_option()
         self._append(Gtk.Separator(visible=True))
+        self._add_spotify_watch_option()
+        self._append(Gtk.Separator(visible=True))
         self._add_default_settings_options()
         self._append(Gtk.Separator(visible=True))
         self._add_stall_settings_options()
@@ -526,6 +528,123 @@ class WishlistSettingsDialog(Dialog):
             initial_folder=self.folder_entry.get_text().strip()
         ).present()
 
+    def _add_spotify_watch_option(self):
+        """A second, independent way to auto-populate a wishlist: watch a
+        Spotify playlist instead of a local folder of exported song list
+        files. Requires the user's own Spotify Developer app (client ID/
+        secret) -- there's no way around that, only they can create it."""
+
+        heading = Gtk.Label(label=_("Spotify playlist watcher"), wrap=True, xalign=0, visible=True)
+        add_css_class(heading, "heading")
+        self._append(heading)
+
+        spotify = config.sections["spotify"]
+
+        client_id_label = Gtk.Label(label=_("Spotify Client ID:"), wrap=True, xalign=0, visible=True)
+        self._append(client_id_label)
+
+        self.spotify_client_id_entry = Gtk.Entry(
+            hexpand=True, visible=True, text=spotify["client_id"],
+            placeholder_text=_("From your app at developer.spotify.com/dashboard"))
+        client_id_label.set_mnemonic_widget(self.spotify_client_id_entry)
+        self._append(self.spotify_client_id_entry)
+
+        client_secret_label = Gtk.Label(label=_("Spotify Client Secret:"), wrap=True, xalign=0, visible=True)
+        self._append(client_secret_label)
+
+        self.spotify_client_secret_entry = Gtk.Entry(
+            hexpand=True, visible=True, text=spotify["client_secret"], visibility=False)
+        client_secret_label.set_mnemonic_widget(self.spotify_client_secret_entry)
+        self._append(self.spotify_client_secret_entry)
+
+        redirect_hint = Gtk.Label(
+            label=_("Add this exact Redirect URI in your Spotify app's settings: %s")
+            % core.spotify_watch.REDIRECT_URI,
+            wrap=True, xalign=0, selectable=True, visible=True)
+        add_css_class(redirect_hint, "dim-label")
+        self._append(redirect_hint)
+
+        connect_row = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER, visible=True)
+
+        connect_button = Gtk.Button(label=_("_Connect to Spotify…"), use_underline=True, visible=True)
+        connect_button.connect("clicked", self.on_connect_spotify)
+
+        self.spotify_status_label = Gtk.Label(
+            label=self._spotify_status_text(), hexpand=True, wrap=True, xalign=0, visible=True)
+
+        if GTK_API_VERSION >= 4:
+            connect_row.append(connect_button)              # pylint: disable=no-member
+            connect_row.append(self.spotify_status_label)    # pylint: disable=no-member
+        else:
+            connect_row.add(connect_button)                 # pylint: disable=no-member
+            connect_row.add(self.spotify_status_label)       # pylint: disable=no-member
+
+        self._append(connect_row)
+
+        toggle_row = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER, visible=True)
+        toggle_label = Gtk.Label(
+            label=_("Watch a playlist for new songs"), hexpand=True, wrap=True, xalign=0, visible=True,
+            tooltip_text=_("Periodically check a Spotify playlist and add any newly added tracks as "
+                            "songs to search for — the same way Watch Folder does for exported song "
+                            "list files, just sourced from Spotify instead. New tracks go to a list "
+                            "named after the playlist, created automatically if needed."))
+
+        self.spotify_watch_enabled_switch = Gtk.Switch(
+            active=spotify["watch_enabled"], valign=Gtk.Align.CENTER, visible=True)
+        toggle_label.set_mnemonic_widget(self.spotify_watch_enabled_switch)
+
+        if GTK_API_VERSION >= 4:
+            toggle_row.append(toggle_label)                       # pylint: disable=no-member
+            toggle_row.append(self.spotify_watch_enabled_switch)  # pylint: disable=no-member
+        else:
+            toggle_row.add(toggle_label)                          # pylint: disable=no-member
+            toggle_row.add(self.spotify_watch_enabled_switch)     # pylint: disable=no-member
+
+        self._append(toggle_row)
+
+        playlist_label = Gtk.Label(label=_("Playlist URL or ID:"), wrap=True, xalign=0, visible=True)
+        self._append(playlist_label)
+
+        self.spotify_playlist_entry = Gtk.Entry(
+            hexpand=True, visible=True, text=spotify["watch_playlist_id"],
+            placeholder_text=_("e.g. https://open.spotify.com/playlist/…"))
+        playlist_label.set_mnemonic_widget(self.spotify_playlist_entry)
+        self._append(self.spotify_playlist_entry)
+
+        self.spotify_ignore_radio_edit_switch = Gtk.Switch(
+            active=spotify["watch_ignore_radio_edit"], valign=Gtk.Align.CENTER, visible=True)
+        self._labeled_row(
+            _('Ignore "Radio Edit" — prefer the Extended/Original version'),
+            self.spotify_ignore_radio_edit_switch,
+            tooltip_text=_('Strips a "(Radio Edit)" tag from a track\'s title before searching for it, '
+                            "so the longer Extended/Original version is found instead of specifically "
+                            "requiring the shortened radio one. A version is still downloaded even if "
+                            "no Extended/Original is found — this only affects which one is preferred.")
+        )
+
+    def _spotify_status_text(self):
+
+        if core.spotify_watch.is_authorized():
+            return _("Connected")
+
+        return _("Not connected")
+
+    def on_connect_spotify(self, *_args):
+
+        core.spotify_watch.update_credentials(
+            self.spotify_client_id_entry.get_text(), self.spotify_client_secret_entry.get_text())
+
+        self.spotify_status_label.set_text(_("Waiting for Spotify login in your browser…"))
+        core.spotify_watch.begin_authorization(self.on_spotify_authorization_result)
+
+    def on_spotify_authorization_result(self, success, message):
+
+        if not self.is_visible():
+            # Dialog was closed while the login flow was still in progress
+            return
+
+        self.spotify_status_label.set_text(message if not success else self._spotify_status_text())
+
     def on_cancel(self, *_args):
         self.close()
 
@@ -546,7 +665,12 @@ class WishlistSettingsDialog(Dialog):
             apply_to_existing_lists=self.apply_to_existing_switch.get_active(),
             stall_timeout=self.stall_timeout_spinner.get_value_as_int(),
             min_speed_kib=self.min_speed_spinner.get_value_as_int(),
-            max_concurrent=self.max_concurrent_spinner.get_value_as_int()
+            max_concurrent=self.max_concurrent_spinner.get_value_as_int(),
+            spotify_client_id=self.spotify_client_id_entry.get_text().strip(),
+            spotify_client_secret=self.spotify_client_secret_entry.get_text().strip(),
+            spotify_watch_enabled=self.spotify_watch_enabled_switch.get_active(),
+            spotify_playlist=self.spotify_playlist_entry.get_text().strip(),
+            spotify_ignore_radio_edit=self.spotify_ignore_radio_edit_switch.get_active()
         )
         self.close()
 
@@ -1238,13 +1362,18 @@ class Wishlists:
     def on_wishlist_settings_saved(self, watch_enabled, watch_folder_path, quality, prefer_longer,
                                    prefer_lossless, preferred_keywords, fuzzy_match_threshold,
                                    auto_download, use_name_subfolder, apply_to_existing_lists,
-                                   stall_timeout, min_speed_kib, max_concurrent):
+                                   stall_timeout, min_speed_kib, max_concurrent,
+                                   spotify_client_id, spotify_client_secret, spotify_watch_enabled,
+                                   spotify_playlist, spotify_ignore_radio_edit):
         core.download_lists.update_watch_folder_settings(watch_enabled, watch_folder_path)
         core.download_lists.update_wishlist_default_settings(
             quality, prefer_longer, prefer_lossless, preferred_keywords, fuzzy_match_threshold,
             auto_download, use_name_subfolder, apply_to_existing_lists=apply_to_existing_lists)
         core.download_lists.update_stall_settings(stall_timeout, min_speed_kib)
         core.download_lists.update_max_concurrent_downloads(max_concurrent)
+        core.spotify_watch.update_credentials(spotify_client_id, spotify_client_secret)
+        core.spotify_watch.update_watch_settings(
+            spotify_watch_enabled, spotify_playlist, spotify_ignore_radio_edit)
 
     def on_wishlist_settings(self, *_args):
         WishlistSettingsDialog(self.window.application, self.on_wishlist_settings_saved).present()
