@@ -1141,7 +1141,7 @@ class Wishlists:
         if self.current_list_name is None:
             return
 
-        for iterator in self.items_view.get_selected_rows():
+        for iterator in list(self.items_view.get_selected_rows()):
             term = self.items_view.get_row_value(iterator, "term")
             core.download_lists.reset_list_item(self.current_list_name, term)
 
