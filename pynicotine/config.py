@@ -369,6 +369,7 @@ class Config:
                 "modes_visible": {
                     "search": True,
                     "downloads": True,
+                    "wishlists": True,
                     "uploads": True,
                     "userbrowse": True,
                     "userinfo": True,
@@ -379,6 +380,7 @@ class Config:
                 "modes_order": [
                     "search",
                     "downloads",
+                    "wishlists",
                     "uploads",
                     "userbrowse",
                     "userinfo",
