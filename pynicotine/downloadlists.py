@@ -307,10 +307,11 @@ class DownloadLists:
     # escalation attempt, so it must not give up right there
     SEARCH_TIMEOUT = 45
 
-    # A download whose transfer speed stays below MIN_TRANSFER_SPEED for this long
-    # (whether it's stuck at 0% or just crawling) is abandoned and searched again
-    STALL_TIMEOUT = 15
-    MIN_TRANSFER_SPEED = 5 * 1024  # 5 KiB/s
+    # A download whose transfer speed stays below the configured minimum for the
+    # configured timeout (whether it's stuck at 0% or just crawling) is abandoned
+    # and searched again. Both are user-configurable in Wishlist Settings (see
+    # stall_timeout/min_transfer_speed below), since what counts as "too slow"
+    # depends heavily on the user's own connection
 
     QUALITY_LABELS = {
         "any": _("Any"),
@@ -365,6 +366,15 @@ class DownloadLists:
             ("update-download", self._update_download)
         ):
             events.connect(event_name, callback)
+
+    @property
+    def stall_timeout(self):
+        return config.sections["transfers"]["downloadliststalltimeout"]
+
+    @property
+    def min_transfer_speed(self):
+        """Bytes/sec, converted from the user-facing KiB/s setting."""
+        return config.sections["transfers"]["downloadlistminspeed"] * 1024
 
     def _start(self):
 
@@ -642,6 +652,16 @@ class DownloadLists:
         config.sections["transfers"]["downloadlistwatchfolder"] = folder_path or ""
 
         self._watch_snapshots.clear()
+        config.write_configuration()
+
+    def update_stall_settings(self, stall_timeout, min_speed_kib):
+        """How long a download can stay below min_speed_kib (KiB/s) before it's
+        abandoned and searched again. Applies to every list; what counts as
+        "too slow" depends on the user's own connection, not a given list."""
+
+        config.sections["transfers"]["downloadliststalltimeout"] = max(1, int(stall_timeout))
+        config.sections["transfers"]["downloadlistminspeed"] = max(0, int(min_speed_kib))
+
         config.write_configuration()
 
     @staticmethod
@@ -1404,7 +1424,7 @@ class DownloadLists:
         item.download_attributes = attributes
         item.download_percent = 0
         item.stall_timer_id = events.schedule(
-            delay=self.STALL_TIMEOUT, callback=lambda: self._handle_stalled_download(list_name, term))
+            delay=self.stall_timeout, callback=lambda: self._handle_stalled_download(list_name, term))
 
         transfer_key = username + virtual_path
         self._transfer_map[transfer_key] = (list_name, term)
@@ -1446,13 +1466,27 @@ class DownloadLists:
             return
 
         if transfer.status != TransferStatus.FINISHED:
-            if transfer.speed >= self.MIN_TRANSFER_SPEED:
+            fully_received = (
+                transfer.size and transfer.current_byte_offset
+                and transfer.current_byte_offset >= transfer.size)
+
+            if fully_received:
+                # Every byte is already in hand — what's left is finalizing (moving
+                # out of the incomplete folder, etc.), which can legitimately take a
+                # while for a big file and isn't a stall. Speed often drops to 0 here
+                # since nothing's actually being transferred anymore; disarm the
+                # watchdog so it can't fire and abort an already-finished download
+                # out from under itself before the FINISHED status arrives
+                events.cancel_scheduled(item.stall_timer_id)
+                item.stall_timer_id = None
+
+            elif transfer.speed >= self.min_transfer_speed:
                 # Healthy throughput observed just now: push the stall deadline back out.
                 # Anything below the threshold (including exactly 0, e.g. still queued or
                 # stuck) leaves the existing timer running toward its original deadline
                 events.cancel_scheduled(item.stall_timer_id)
                 item.stall_timer_id = events.schedule(
-                    delay=self.STALL_TIMEOUT, callback=lambda: self._handle_stalled_download(list_name, term))
+                    delay=self.stall_timeout, callback=lambda: self._handle_stalled_download(list_name, term))
 
             percent = self._transfer_percent(transfer.current_byte_offset, transfer.size)
 
@@ -1498,10 +1532,20 @@ class DownloadLists:
         transfer_key = item.download_username + item.download_virtual_path
         transfer = core.downloads.transfers.get(transfer_key)
 
+        if transfer is not None and (
+                transfer.status == TransferStatus.FINISHED
+                or (transfer.size and transfer.current_byte_offset
+                    and transfer.current_byte_offset >= transfer.size)):
+            # Second safety net against the same race the fully_received check in
+            # _update_download guards against: this timer could have already been
+            # in flight when the transfer completed. Do nothing and let the
+            # ordinary completion handling (or an already-delivered one) stand
+            return
+
         log.add_search(
             _('Download stalled for "%(term)s" (no meaningful progress for %(seconds)s seconds), '
               "searching for a different source"),
-            {"term": term, "seconds": self.STALL_TIMEOUT}
+            {"term": term, "seconds": self.stall_timeout}
         )
 
         if transfer is not None:

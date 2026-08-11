@@ -723,7 +723,7 @@ class DownloadListsTest(TestCase):
         # A trickle of progress below the minimum speed shouldn't reset the stall timer
         transfer.status = TransferStatus.TRANSFERRING
         transfer.current_byte_offset = 100
-        transfer.speed = 1024  # 1 KiB/s, below MIN_TRANSFER_SPEED
+        transfer.speed = 100  # well below min_transfer_speed
         core.download_lists._update_download(transfer, True)
 
         self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
@@ -736,6 +736,58 @@ class DownloadListsTest(TestCase):
         self.assertIsNone(item.download_username)
         self.assertIsNone(core.downloads.transfers.get(transfer_key))
         self.assertIn(("Stall List", "Slow Artist - Slow Song"), core.download_lists._queue)
+
+    def test_fully_received_transfer_disarms_stall_watchdog(self):
+        """Once every byte has arrived, the transfer is just finalizing (moving
+        out of the incomplete folder, etc.) — which can legitimately take a
+        while and isn't a stall, even though speed often drops to 0 there. The
+        watchdog must not fire and abort an already-finished download out from
+        under itself before the FINISHED status arrives."""
+
+        from pynicotine.transfers import TransferStatus
+
+        download_list = core.download_lists.add_list(
+            "Finalizing List", download_folder_path=DATA_FOLDER_PATH, quality="any",
+            fuzzy_match_threshold=50, auto_download=True
+        )
+        core.download_lists.add_list_items("Finalizing List", ["Almost Done Song"])
+
+        item = download_list.items["Almost Done Song"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Almost Done Song.mp3", 8000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "finishinguser", files)
+
+        core.download_lists._file_search_response(msg)
+        core.download_lists._finalize_item("Finalizing List", "Almost Done Song")
+
+        transfer_key = "finishinguser" + item.download_virtual_path
+        transfer = core.downloads.transfers.get(transfer_key)
+        self.assertIsNotNone(transfer)
+
+        # All bytes are in, but the transfer hasn't been marked FINISHED yet
+        # (still finalizing) and speed has dropped to 0 now there's nothing left
+        # to send
+        transfer.status = TransferStatus.TRANSFERRING
+        transfer.current_byte_offset = transfer.size = 8000000
+        transfer.speed = 0
+        core.download_lists._update_download(transfer, True)
+
+        self.assertIsNone(item.stall_timer_id)
+
+        # Even if a previously-scheduled stall callback still fires in this window,
+        # it must not abort a transfer that's already fully received
+        core.download_lists._handle_stalled_download("Finalizing List", "Almost Done Song")
+
+        self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
+        self.assertIsNotNone(core.downloads.transfers.get(transfer_key))
+
+        # The completion now arrives (as it would have anyway) and must go through cleanly
+        transfer.status = TransferStatus.FINISHED
+        core.download_lists._update_download(transfer, True)
+
+        self.assertEqual(item.status, DownloadListItemStatus.COMPLETED)
 
     def test_healthy_speed_resets_stall_timer(self):
         """A transfer whose speed reaches the minimum threshold gets its stall
@@ -946,6 +998,24 @@ class DownloadListsTest(TestCase):
         self.assertFalse(config.sections["transfers"]["downloadlistwatchenabled"])
         self.assertEqual(config.sections["transfers"]["downloadlistwatchfolder"], new_folder_path)
         self.assertEqual(core.download_lists._watch_snapshots, {})
+
+    def test_update_stall_settings(self):
+        """The stall timeout/minimum speed are persisted to config and exposed
+        via the stall_timeout/min_transfer_speed properties (the latter
+        converted from the user-facing KiB/s to bytes/sec)."""
+
+        defaults = config.defaults["transfers"]
+        self.addCleanup(
+            core.download_lists.update_stall_settings,
+            defaults["downloadliststalltimeout"], defaults["downloadlistminspeed"]
+        )
+
+        core.download_lists.update_stall_settings(stall_timeout=60, min_speed_kib=0)
+
+        self.assertEqual(config.sections["transfers"]["downloadliststalltimeout"], 60)
+        self.assertEqual(config.sections["transfers"]["downloadlistminspeed"], 0)
+        self.assertEqual(core.download_lists.stall_timeout, 60)
+        self.assertEqual(core.download_lists.min_transfer_speed, 0)
 
     def test_watch_folder_ignores_non_list_files(self):
         """Files that are not song lists are left alone."""

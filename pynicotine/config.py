@@ -189,6 +189,8 @@ class Config:
                 "downloadlistdefaultfuzzy": 70,
                 "downloadlistdefaultautodownload": True,
                 "downloadlistdefaultnamesubfolder": False,
+                "downloadliststalltimeout": 30,
+                "downloadlistminspeed": 1,
                 "shared": [],
                 "buddyshared": [],
                 "trustedshared": [],

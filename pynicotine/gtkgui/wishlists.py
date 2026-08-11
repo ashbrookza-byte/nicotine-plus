@@ -296,6 +296,8 @@ class WishlistSettingsDialog(Dialog):
         self._add_watch_folder_option()
         self._append(Gtk.Separator(visible=True))
         self._add_default_settings_options()
+        self._append(Gtk.Separator(visible=True))
+        self._add_stall_settings_options()
 
     def destroy(self):
         self.__dict__.clear()
@@ -404,6 +406,45 @@ class WishlistSettingsDialog(Dialog):
                             "with their own override normally keep it. Doesn't touch download folders.")
         )
 
+    def _add_stall_settings_options(self):
+
+        heading = Gtk.Label(
+            label=_("Stalled downloads"), wrap=True, xalign=0, visible=True)
+        add_css_class(heading, "heading")
+        self._append(heading)
+
+        transfers = config.sections["transfers"]
+
+        self.stall_timeout_spinner = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=transfers["downloadliststalltimeout"], lower=5, upper=600,
+                step_increment=5, page_increment=30, page_size=0
+            ),
+            climb_rate=1, digits=0, valign=Gtk.Align.CENTER, visible=True
+        )
+        self._labeled_row(
+            _("Give up on a download after this many seconds below the minimum speed:"),
+            self.stall_timeout_spinner,
+            tooltip_text=_("A download stuck at this speed for longer than this is abandoned, and the "
+                            "song is searched for again from a different source.")
+        )
+
+        self.min_speed_spinner = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=transfers["downloadlistminspeed"], lower=0, upper=10000,
+                step_increment=1, page_increment=10, page_size=0
+            ),
+            climb_rate=1, digits=0, valign=Gtk.Align.CENTER, visible=True
+        )
+        self._labeled_row(
+            _("Minimum acceptable speed (KiB/s):"), self.min_speed_spinner,
+            tooltip_text=_("Raise this if your connection is generally fast and you want slow sources "
+                            "dropped sooner; lower it (even to 0) if your own connection is slow, so "
+                            "downloads that are merely as fast as your line allows aren't mistaken for "
+                            "a stalled/bad source and abandoned. A download that's fully received but "
+                            "still finalizing is never treated as stalled, regardless of this setting.")
+        )
+
     def _add_watch_folder_option(self):
 
         enabled = config.sections["transfers"]["downloadlistwatchenabled"]
@@ -481,7 +522,9 @@ class WishlistSettingsDialog(Dialog):
             fuzzy_match_threshold=self.default_fuzzy_spinner.get_value_as_int(),
             auto_download=self.default_auto_download_switch.get_active(),
             use_name_subfolder=self.default_name_subfolder_switch.get_active(),
-            apply_to_existing_lists=self.apply_to_existing_switch.get_active()
+            apply_to_existing_lists=self.apply_to_existing_switch.get_active(),
+            stall_timeout=self.stall_timeout_spinner.get_value_as_int(),
+            min_speed_kib=self.min_speed_spinner.get_value_as_int()
         )
         self.close()
 
@@ -866,11 +909,13 @@ class Wishlists:
 
     def on_wishlist_settings_saved(self, watch_enabled, watch_folder_path, quality, prefer_longer,
                                    prefer_lossless, preferred_keywords, fuzzy_match_threshold,
-                                   auto_download, use_name_subfolder, apply_to_existing_lists):
+                                   auto_download, use_name_subfolder, apply_to_existing_lists,
+                                   stall_timeout, min_speed_kib):
         core.download_lists.update_watch_folder_settings(watch_enabled, watch_folder_path)
         core.download_lists.update_wishlist_default_settings(
             quality, prefer_longer, prefer_lossless, preferred_keywords, fuzzy_match_threshold,
             auto_download, use_name_subfolder, apply_to_existing_lists=apply_to_existing_lists)
+        core.download_lists.update_stall_settings(stall_timeout, min_speed_kib)
 
     def on_wishlist_settings(self, *_args):
         WishlistSettingsDialog(self.window.application, self.on_wishlist_settings_saved).present()
