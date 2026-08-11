@@ -1174,7 +1174,7 @@ class DownloadLists:
             # Out of simplified variants to try, but that doesn't mean give up yet — a
             # term with nothing to broaden (e.g. a plain "Artist - Title") exhausts its
             # single variant on the very first escalation attempt, well before
-            # SEARCH_TIMEOUT, and slower peers can still respond to it after that
+            # SEARCH_TIMEOUT
             elapsed = time.time() - (item.dispatch_time or time.time())
             remaining = self.SEARCH_TIMEOUT - elapsed
 
@@ -1187,8 +1187,16 @@ class DownloadLists:
                 self._check_list_complete(list_name)
                 return
 
+            # A single search request's visibility on the network is time-limited —
+            # peers that come online a bit later, or just take a while to respond,
+            # won't be caught by passively waiting on the original request. Re-issue
+            # the same (broadest) search text periodically instead, same as manually
+            # searching again, until the remaining budget runs out
+            self._send_search_text(item, variants[-1])
+
             item.escalation_timer_id = events.schedule(
-                delay=remaining, callback=lambda: self._escalate_item(list_name, term))
+                delay=min(self.ESCALATION_DELAY, remaining),
+                callback=lambda: self._escalate_item(list_name, term))
             return
 
         next_text = variants[item.variant_index]

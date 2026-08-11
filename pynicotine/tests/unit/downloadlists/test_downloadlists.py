@@ -598,8 +598,27 @@ class DownloadListsTest(TestCase):
         self.assertEqual(variants, ["Tinlicker - Melancholia"])
 
         # First escalation attempt: the single variant is immediately exhausted, but
-        # since we're nowhere near SEARCH_TIMEOUT yet, the item must keep searching
-        core.download_lists._escalate_item("Escalation List", "Tinlicker - Melancholia")
+        # since we're nowhere near SEARCH_TIMEOUT yet, the item must keep searching —
+        # and, crucially, actually re-issue the search rather than just waiting
+        # silently on the original request (whose visibility on the network is
+        # time-limited, so passively waiting longer wouldn't surface new responses)
+        from pynicotine.events import events
+        from pynicotine.slskmessages import FileSearch
+
+        sent_messages = []
+
+        def capture_message(msg):
+            sent_messages.append(msg)
+
+        events.connect("queue-network-message", capture_message)
+        try:
+            core.download_lists._escalate_item("Escalation List", "Tinlicker - Melancholia")
+        finally:
+            events.disconnect("queue-network-message", capture_message)
+
+        resent_searches = [msg for msg in sent_messages if isinstance(msg, FileSearch)]
+        self.assertTrue(resent_searches, "expected the search to be re-issued, not just waited on")
+        self.assertEqual(resent_searches[0].token, item.token)
 
         self.assertEqual(item.status, DownloadListItemStatus.SEARCHING)
         self.assertIsNotNone(item.escalation_timer_id)
