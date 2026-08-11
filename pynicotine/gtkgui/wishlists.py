@@ -204,6 +204,11 @@ class Wishlists:
         else:
             window.wishlists_content.add(self.container)     # pylint: disable=no-member
 
+        # Unlike Downloads/Uploads, this page's content (namely the "Add List" button) should
+        # always be reachable, even with zero lists, so always show it rather than the welcome
+        # placeholder bound to its visibility
+        window.wishlists_content.set_visible(True)
+
         self.lists_view = TreeView(
             window, parent=self.lists_container, select_row_callback=self.on_select_list_row,
             columns={
