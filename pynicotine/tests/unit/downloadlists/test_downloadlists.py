@@ -80,6 +80,40 @@ class DownloadListsTest(TestCase):
         for item in download_list.items.values():
             self.assertEqual(item.status, DownloadListItemStatus.PENDING)
 
+    def test_pump_queue_respects_max_concurrent_downloads(self):
+        """Only up to max_concurrent_downloads items are dispatched (moved out
+        of Pending) at once, even with a much bigger backlog waiting; the rest
+        stay queued until something frees up."""
+
+        from pynicotine.slskmessages import UserStatus
+
+        core.users.login_status = UserStatus.ONLINE
+        self.addCleanup(setattr, core.users, "login_status", UserStatus.OFFLINE)
+
+        core.download_lists.update_max_concurrent_downloads(2)
+        self.addCleanup(core.download_lists.update_max_concurrent_downloads, 3)
+
+        download_list = core.download_lists.add_list("Concurrency List", auto_download=True)
+        core.download_lists.add_list_items(
+            "Concurrency List", ["Song One", "Song Two", "Song Three", "Song Four", "Song Five"])
+
+        # add_list_items() already kicked the queue, but a scheduled retry left over
+        # from _start()'s own (offline, at the time) load-time kick can still be
+        # pending, which _kick_queue()'s already-scheduled guard would otherwise
+        # skip; pump directly for a deterministic result
+        core.download_lists._pump_queue()
+
+        dispatched = sum(
+            1 for item in download_list.items.values()
+            if item.status == DownloadListItemStatus.SEARCHING)
+        pending = sum(
+            1 for item in download_list.items.values()
+            if item.status == DownloadListItemStatus.PENDING)
+
+        self.assertEqual(dispatched, 2)
+        self.assertEqual(pending, 3)
+        self.assertEqual(core.download_lists._count_active_items(), 2)
+
     def test_add_list_duplicate_name(self):
         """Adding a list with a name that's already taken is a no-op."""
 

@@ -381,6 +381,12 @@ class DownloadLists:
         """Bytes/sec, converted from the user-facing KiB/s setting."""
         return config.sections["transfers"]["downloadlistminspeed"] * 1024
 
+    @property
+    def max_concurrent_downloads(self):
+        """How many items (across every list combined, since they share one
+        dispatch queue) can be Searching/Downloading at once."""
+        return config.sections["transfers"]["downloadlistmaxconcurrent"]
+
     def _start(self):
 
         self._load()
@@ -668,6 +674,15 @@ class DownloadLists:
         config.sections["transfers"]["downloadlistminspeed"] = max(0, int(min_speed_kib))
 
         config.write_configuration()
+
+    def update_max_concurrent_downloads(self, max_concurrent):
+        """How many items (across every list) can be Searching/Downloading at once."""
+
+        config.sections["transfers"]["downloadlistmaxconcurrent"] = max(1, int(max_concurrent))
+        config.write_configuration()
+
+        # More headroom may have just opened up; let the queue take advantage of it
+        self._kick_queue()
 
     @staticmethod
     def _move_list_folder(old_folder_path, new_folder_path):
@@ -1133,6 +1148,14 @@ class DownloadLists:
 
         self._pump_queue()
 
+    def _count_active_items(self):
+        return sum(
+            1
+            for download_list in self.lists.values()
+            for item in download_list.items.values()
+            if item.status in (DownloadListItemStatus.SEARCHING, DownloadListItemStatus.DOWNLOADING)
+        )
+
     def _pump_queue(self):
 
         self._dispatch_timer_id = None
@@ -1141,7 +1164,14 @@ class DownloadLists:
             self._dispatch_timer_id = events.schedule(delay=self.DISPATCH_DELAY, callback=self._pump_queue)
             return
 
-        while self._queue:
+        # Fill up to max_concurrent_downloads in one go rather than trickling a
+        # single dispatch out every DISPATCH_DELAY — the pacing below still
+        # applies between refill checks once at capacity, so a big list doesn't
+        # flood the server, but reaching the user's chosen concurrency shouldn't
+        # need waiting several times DISPATCH_DELAY just to get going
+        headroom = self.max_concurrent_downloads - self._count_active_items()
+
+        while headroom > 0 and self._queue:
             name, term = self._queue.popleft()
             download_list = self.lists.get(name)
             item = download_list.items.get(term) if download_list is not None else None
@@ -1151,7 +1181,7 @@ class DownloadLists:
                 continue
 
             self._dispatch_item(download_list, item)
-            break
+            headroom -= 1
 
         if self._queue:
             self._dispatch_timer_id = events.schedule(delay=self.DISPATCH_DELAY, callback=self._pump_queue)

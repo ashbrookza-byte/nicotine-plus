@@ -409,11 +409,31 @@ class WishlistSettingsDialog(Dialog):
     def _add_stall_settings_options(self):
 
         heading = Gtk.Label(
-            label=_("Stalled downloads"), wrap=True, xalign=0, visible=True)
+            label=_("Concurrent downloads"), wrap=True, xalign=0, visible=True)
         add_css_class(heading, "heading")
         self._append(heading)
 
         transfers = config.sections["transfers"]
+
+        self.max_concurrent_spinner = Gtk.SpinButton(
+            adjustment=Gtk.Adjustment(
+                value=transfers["downloadlistmaxconcurrent"], lower=1, upper=50,
+                step_increment=1, page_increment=5, page_size=0
+            ),
+            climb_rate=1, digits=0, valign=Gtk.Align.CENTER, visible=True
+        )
+        self._labeled_row(
+            _("Maximum songs being searched for or downloaded at once (across all lists):"),
+            self.max_concurrent_spinner,
+            tooltip_text=_("Raise this to work through a big list faster. Actual simultaneous "
+                            "transfers may still be lower than this, since a given source can only "
+                            "send you as many files at once as they allow.")
+        )
+
+        heading = Gtk.Label(
+            label=_("Stalled downloads"), wrap=True, xalign=0, visible=True)
+        add_css_class(heading, "heading")
+        self._append(heading)
 
         self.stall_timeout_spinner = Gtk.SpinButton(
             adjustment=Gtk.Adjustment(
@@ -524,7 +544,8 @@ class WishlistSettingsDialog(Dialog):
             use_name_subfolder=self.default_name_subfolder_switch.get_active(),
             apply_to_existing_lists=self.apply_to_existing_switch.get_active(),
             stall_timeout=self.stall_timeout_spinner.get_value_as_int(),
-            min_speed_kib=self.min_speed_spinner.get_value_as_int()
+            min_speed_kib=self.min_speed_spinner.get_value_as_int(),
+            max_concurrent=self.max_concurrent_spinner.get_value_as_int()
         )
         self.close()
 
@@ -910,12 +931,13 @@ class Wishlists:
     def on_wishlist_settings_saved(self, watch_enabled, watch_folder_path, quality, prefer_longer,
                                    prefer_lossless, preferred_keywords, fuzzy_match_threshold,
                                    auto_download, use_name_subfolder, apply_to_existing_lists,
-                                   stall_timeout, min_speed_kib):
+                                   stall_timeout, min_speed_kib, max_concurrent):
         core.download_lists.update_watch_folder_settings(watch_enabled, watch_folder_path)
         core.download_lists.update_wishlist_default_settings(
             quality, prefer_longer, prefer_lossless, preferred_keywords, fuzzy_match_threshold,
             auto_download, use_name_subfolder, apply_to_existing_lists=apply_to_existing_lists)
         core.download_lists.update_stall_settings(stall_timeout, min_speed_kib)
+        core.download_lists.update_max_concurrent_downloads(max_concurrent)
 
     def on_wishlist_settings(self, *_args):
         WishlistSettingsDialog(self.window.application, self.on_wishlist_settings_saved).present()

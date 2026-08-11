@@ -191,6 +191,7 @@ class Config:
                 "downloadlistdefaultnamesubfolder": False,
                 "downloadliststalltimeout": 30,
                 "downloadlistminspeed": 1,
+                "downloadlistmaxconcurrent": 3,
                 "shared": [],
                 "buddyshared": [],
                 "trustedshared": [],
