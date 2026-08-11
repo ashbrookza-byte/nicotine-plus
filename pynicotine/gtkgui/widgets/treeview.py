@@ -142,6 +142,9 @@ class TreeView:
         self._reorder_callback = reorder_callback
         self._rows_reordered_handler = None
         self._reorder_drag_key = None
+        self._reorder_drag_source_index = None
+        self._reorder_drag_indicator_index = None
+        self._reorder_drag_indicator_original = None
 
         if reorder_callback:
             if GTK_API_VERSION >= 4:
@@ -156,9 +159,16 @@ class TreeView:
                 # never fires, reorder or not. Gtk.GestureDrag sidesteps the whole
                 # DND negotiation system (no ghost icon, no OS-level drag) and is
                 # driven entirely by this file's own press/motion/release tracking
-                # instead, which does reliably reach GtkTreeView.
+                # instead, which does reliably reach GtkTreeView. Note that
+                # Gtk.TreeView.set_drag_dest_row() — the native "show the drop
+                # position" call — is NOT safe to use here either, despite not
+                # being part of the broken DND negotiation: it segfaults inside
+                # gtk_tree_view_snapshot() on this GTK version. The drop-position
+                # indicator below is drawn by hand instead, via a plain marker
+                # written into the first column's cell like any other row update.
                 drag_gesture = Gtk.GestureDrag()
                 drag_gesture.connect("drag-begin", self._on_reorder_drag_begin)
+                drag_gesture.connect("drag-update", self._on_reorder_drag_update)
                 drag_gesture.connect("drag-end", self._on_reorder_drag_end)
                 self.widget.add_controller(drag_gesture)                  # pylint: disable=no-member
             else:
@@ -219,6 +229,57 @@ class TreeView:
 
         return self.model.get_value(iterator, self._iterator_key_column)
 
+    _REORDER_DRAG_MARKER = "▸ "  # ▸
+
+    def _clear_reorder_drag_indicator(self):
+        """Restore whatever the marked row's iterator-key cell said before
+        _set_reorder_drag_indicator() overwrote it. Guarded defensively (a
+        stale index whose row was removed mid-drag must never propagate an
+        exception up into GTK's own event dispatch)."""
+
+        if self._reorder_drag_indicator_index is None:
+            return
+
+        try:
+            path = Gtk.TreePath.new_from_indices([self._reorder_drag_indicator_index])
+            iterator = self.model.get_iter(path)
+            self.model.set_value(iterator, self._iterator_key_column, self._reorder_drag_indicator_original)
+        except (GLib.Error, TypeError, ValueError):
+            pass
+
+        self._reorder_drag_indicator_index = None
+        self._reorder_drag_indicator_original = None
+
+    def _set_reorder_drag_indicator(self, path):
+        """Mark the given row as the current drop target by prepending a
+        marker to its iterator-key cell (e.g. the list name) — the widest,
+        most visible column, and always present since reorder_callback
+        requires one. This is hand-drawn, plain model data (the same safe,
+        ordinary operation _update_list_row-style code already does
+        everywhere), specifically to avoid Gtk.TreeView.set_drag_dest_row(),
+        which segfaults inside GTK's own row snapshot/rendering code on this
+        GTK version (see the class-level note on reorder_callback). It's
+        restored before the row order is ever reported back (see
+        _on_reorder_drag_end), so it never leaks into the saved key."""
+
+        index = path.get_indices()[0]
+
+        if index == self._reorder_drag_indicator_index:
+            return
+
+        self._clear_reorder_drag_indicator()
+
+        try:
+            iterator = self.model.get_iter(path)
+            original = self.model.get_value(iterator, self._iterator_key_column)
+            self.model.set_value(
+                iterator, self._iterator_key_column, self._REORDER_DRAG_MARKER + (original or ""))
+        except (GLib.Error, TypeError, ValueError):
+            return
+
+        self._reorder_drag_indicator_index = index
+        self._reorder_drag_indicator_original = original
+
     def _on_reorder_drag_begin(self, _gesture, x, y):
         """GTK 4 only — see reorder_callback. Remember which row the press
         started on, if any — this is the row that may end up moved once
@@ -228,13 +289,47 @@ class TreeView:
         gesture keeps seeing every press/release exactly as before."""
 
         self._reorder_drag_key = None
+        self._reorder_drag_source_index = None
         path_result = self._get_path_at_widget_pos(x, y)
 
         if path_result is None:
             return
 
-        iterator = self.model.get_iter(path_result[0])
+        path = path_result[0]
+        iterator = self.model.get_iter(path)
         self._reorder_drag_key = self._row_key_at_iterator(iterator)
+        self._reorder_drag_source_index = path.get_indices()[0]
+
+    def _on_reorder_drag_update(self, gesture, offset_x, offset_y):
+        """GTK 4 only — see reorder_callback. While the drag is in progress,
+        show where it would land if released now (a marker on the row under
+        the cursor) and that the row is actively being dragged (a "grabbing"
+        cursor), so the drag is visible even though it isn't going through
+        GTK's actual DnD machinery."""
+
+        if self._reorder_drag_key is None or (abs(offset_x) < 4 and abs(offset_y) < 4):
+            return
+
+        has_start_point, start_x, start_y = gesture.get_start_point()
+
+        if not has_start_point:
+            return
+
+        self.widget.set_cursor_from_name("grabbing")
+
+        path_result = self._get_path_at_widget_pos(start_x + offset_x, start_y + offset_y)
+
+        if path_result is None:
+            self._clear_reorder_drag_indicator()
+            return
+
+        target_path = path_result[0]
+
+        if target_path.get_indices()[0] == self._reorder_drag_source_index:
+            self._clear_reorder_drag_indicator()
+            return
+
+        self._set_reorder_drag_indicator(target_path)
 
     def _on_reorder_drag_end(self, gesture, offset_x, offset_y):
         """GTK 4 only — see reorder_callback. If the press-to-release amounted
@@ -243,7 +338,12 @@ class TreeView:
         drag came from further down the list, below it if from further up."""
 
         dragged_key = self._reorder_drag_key
+        source_index = self._reorder_drag_source_index
         self._reorder_drag_key = None
+        self._reorder_drag_source_index = None
+
+        self._clear_reorder_drag_indicator()
+        self.widget.set_cursor_from_name(None)
 
         # A plain click still fires drag-begin/end with ~0 offset -- ignore those
         if dragged_key is None or (abs(offset_x) < 4 and abs(offset_y) < 4):
@@ -265,14 +365,12 @@ class TreeView:
             return
 
         target_path = path_result[0]
-        target_iterator = self.model.get_iter(target_path)
-        target_key = self._row_key_at_iterator(target_iterator)
+        target_index = target_path.get_indices()[0]
 
-        if target_key is None or target_key == dragged_key:
+        if target_index == source_index:
             return
 
-        source_index = self.model.get_path(source_iterator).get_indices()[0]
-        target_index = target_path.get_indices()[0]
+        target_iterator = self.model.get_iter(target_path)
 
         if target_index > source_index:
             self.model.move_after(source_iterator, target_iterator)
