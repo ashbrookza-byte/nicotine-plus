@@ -279,19 +279,23 @@ class WishlistSettingsDialog(Dialog):
         add_css_class(save_button, "suggested-action")
 
         self.primary_container = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, width_request=340, visible=True,
+            orientation=Gtk.Orientation.VERTICAL, width_request=460, visible=True,
             margin_top=14, margin_bottom=14, margin_start=18, margin_end=18, spacing=18
+        )
+        self.scrolled_window = Gtk.ScrolledWindow(
+            child=self.primary_container, hexpand=True, vexpand=True, min_content_height=300,
+            hscrollbar_policy=Gtk.PolicyType.NEVER, vscrollbar_policy=Gtk.PolicyType.AUTOMATIC, visible=True
         )
 
         super().__init__(
             application=application,
-            content_box=self.primary_container,
+            content_box=self.scrolled_window,
             buttons_start=(cancel_button,),
             buttons_end=(save_button,),
             default_button=save_button,
             title=_("Wishlist Settings"),
-            width=420,
-            height=-1
+            width=560,
+            height=700
         )
 
         self._add_watch_folder_option()
