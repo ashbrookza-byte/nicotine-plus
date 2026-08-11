@@ -282,6 +282,43 @@ class DownloadListsTest(TestCase):
         self.assertIsNone(download_list.quality)
         self.assertEqual(download_list.effective_quality, "good")
 
+    def test_reset_mid_download_cancels_the_old_transfer(self):
+        """Resetting an item that's actively downloading must actually cancel
+        that transfer, not just stop tracking it — otherwise it keeps running
+        in the background, finishes on its own, and the file lands on disk
+        while the item has already moved on to a new search."""
+
+        from pynicotine.transfers import TransferStatus
+
+        download_list = core.download_lists.add_list(
+            "Reset Mid Download List", download_folder_path=DATA_FOLDER_PATH, quality="any",
+            fuzzy_match_threshold=50, auto_download=True
+        )
+        core.download_lists.add_list_items("Reset Mid Download List", ["Reset Me Song"])
+
+        item = download_list.items["Reset Me Song"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Reset Me Song.mp3", 8000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "resetuser", files)
+
+        core.download_lists._file_search_response(msg)
+        core.download_lists._finalize_item("Reset Mid Download List", "Reset Me Song")
+
+        self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
+
+        transfer_key = "resetuser" + item.download_virtual_path
+        transfer = core.downloads.transfers.get(transfer_key)
+        self.assertIsNotNone(transfer)
+        transfer.status = TransferStatus.TRANSFERRING
+
+        core.download_lists.reset_list_item("Reset Mid Download List", "Reset Me Song")
+
+        self.assertEqual(item.status, DownloadListItemStatus.PENDING)
+        # The old transfer must be gone, not left running unabandoned in the background
+        self.assertIsNone(core.downloads.transfers.get(transfer_key))
+
     def test_pause_and_resume_list(self):
         """Pausing marks a list inactive; resuming re-queues anything still pending,
         even if it was never removed from the queue while paused."""
@@ -784,6 +821,53 @@ class DownloadListsTest(TestCase):
         self.assertIsNotNone(core.downloads.transfers.get(transfer_key))
 
         # The completion now arrives (as it would have anyway) and must go through cleanly
+        transfer.status = TransferStatus.FINISHED
+        core.download_lists._update_download(transfer, True)
+
+        self.assertEqual(item.status, DownloadListItemStatus.COMPLETED)
+
+    def test_near_complete_transfer_is_exempt_from_stalling(self):
+        """A transfer that's e.g. 95% in (not literally every last byte) but has
+        gone quiet is still just finalizing, not stalled — an exact '100%'
+        check isn't a wide enough margin, since the watchdog's timer fires on
+        its own independent schedule and can land a hair before the last byte
+        is technically accounted for."""
+
+        from pynicotine.transfers import TransferStatus
+
+        download_list = core.download_lists.add_list(
+            "Near Complete List", download_folder_path=DATA_FOLDER_PATH, quality="any",
+            fuzzy_match_threshold=50, auto_download=True
+        )
+        core.download_lists.add_list_items("Near Complete List", ["Nearly There Song"])
+
+        item = download_list.items["Nearly There Song"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Nearly There Song.mp3", 8000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "nearlydoneuser", files)
+
+        core.download_lists._file_search_response(msg)
+        core.download_lists._finalize_item("Near Complete List", "Nearly There Song")
+
+        transfer_key = "nearlydoneuser" + item.download_virtual_path
+        transfer = core.downloads.transfers.get(transfer_key)
+        self.assertIsNotNone(transfer)
+
+        transfer.status = TransferStatus.TRANSFERRING
+        transfer.current_byte_offset = 7600000  # 95% of 8000000
+        transfer.size = 8000000
+        transfer.speed = 0
+        core.download_lists._update_download(transfer, True)
+
+        self.assertIsNone(item.stall_timer_id)
+
+        core.download_lists._handle_stalled_download("Near Complete List", "Nearly There Song")
+
+        self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
+        self.assertIsNotNone(core.downloads.transfers.get(transfer_key))
+
         transfer.status = TransferStatus.FINISHED
         core.download_lists._update_download(transfer, True)
 

@@ -313,6 +313,11 @@ class DownloadLists:
     # stall_timeout/min_transfer_speed below), since what counts as "too slow"
     # depends heavily on the user's own connection
 
+    # A transfer this far along is never treated as stalled, no matter how slow
+    # or stuck-at-0-speed it looks, since it's essentially just finalizing
+    # (moving out of the incomplete folder, hash-checking, etc.) at this point
+    STALL_EXEMPT_PERCENT = 90
+
     QUALITY_LABELS = {
         "any": _("Any"),
         "good": _("Good (192 kbps+)"),
@@ -840,6 +845,19 @@ class DownloadLists:
 
         if item is None:
             return
+
+        if item.status == DownloadListItemStatus.DOWNLOADING and item.download_username:
+            # Actually cancel the in-flight transfer, not just stop tracking it —
+            # otherwise it keeps running in the background, finishes on its own
+            # a moment later, and the file lands in the download folder while
+            # this item has already moved on to a new search, looking like
+            # nothing happened even though the song did in fact download
+            transfer_key = item.download_username + (item.download_virtual_path or "")
+            transfer = core.downloads.transfers.get(transfer_key)
+
+            if transfer is not None and transfer.status != TransferStatus.FINISHED:
+                core.downloads.abort_downloads([transfer], status=TransferStatus.CANCELLED)
+                core.downloads.clear_downloads([transfer])
 
         self._forget_item(item)
 
@@ -1466,17 +1484,18 @@ class DownloadLists:
             return
 
         if transfer.status != TransferStatus.FINISHED:
-            fully_received = (
-                transfer.size and transfer.current_byte_offset
-                and transfer.current_byte_offset >= transfer.size)
+            percent = self._transfer_percent(transfer.current_byte_offset, transfer.size)
 
-            if fully_received:
-                # Every byte is already in hand — what's left is finalizing (moving
-                # out of the incomplete folder, etc.), which can legitimately take a
-                # while for a big file and isn't a stall. Speed often drops to 0 here
-                # since nothing's actually being transferred anymore; disarm the
-                # watchdog so it can't fire and abort an already-finished download
-                # out from under itself before the FINISHED status arrives
+            if percent >= self.STALL_EXEMPT_PERCENT:
+                # Close enough to done that whatever's left is finalization overhead
+                # (moving out of the incomplete folder, hash-checking, etc.), not a
+                # stall — and that can legitimately take a moment, during which speed
+                # commonly reads 0 since nothing's actually being sent anymore. The
+                # watchdog's own timer fires on its own schedule, independent of
+                # progress updates, so an exact "== 100%" check isn't a wide enough
+                # margin: it can still land in this window a hair before the last
+                # byte is technically accounted for. Disarm it so it can't abort an
+                # already-(near-)finished download out from under itself
                 events.cancel_scheduled(item.stall_timer_id)
                 item.stall_timer_id = None
 
@@ -1487,8 +1506,6 @@ class DownloadLists:
                 events.cancel_scheduled(item.stall_timer_id)
                 item.stall_timer_id = events.schedule(
                     delay=self.stall_timeout, callback=lambda: self._handle_stalled_download(list_name, term))
-
-            percent = self._transfer_percent(transfer.current_byte_offset, transfer.size)
 
             if percent == item.download_percent:
                 return
@@ -1534,12 +1551,13 @@ class DownloadLists:
 
         if transfer is not None and (
                 transfer.status == TransferStatus.FINISHED
-                or (transfer.size and transfer.current_byte_offset
-                    and transfer.current_byte_offset >= transfer.size)):
-            # Second safety net against the same race the fully_received check in
-            # _update_download guards against: this timer could have already been
-            # in flight when the transfer completed. Do nothing and let the
-            # ordinary completion handling (or an already-delivered one) stand
+                or self._transfer_percent(transfer.current_byte_offset, transfer.size)
+                >= self.STALL_EXEMPT_PERCENT):
+            # Second safety net against the same race the STALL_EXEMPT_PERCENT check in
+            # _update_download guards against: this timer runs on its own independent
+            # schedule, so it could still fire in the exempt window (or even after
+            # completion) if it was already in flight. Do nothing and let the ordinary
+            # completion handling (or an already-delivered one) stand
             return
 
         log.add_search(
