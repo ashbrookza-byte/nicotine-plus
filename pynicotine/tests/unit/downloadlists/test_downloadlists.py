@@ -485,6 +485,73 @@ class DownloadListsTest(TestCase):
 
         self.assertEqual(item.status, DownloadListItemStatus.COMPLETED)
 
+    def test_periodic_reconciliation_catches_a_finished_transfer_without_reset(self):
+        """The periodic safety net (not Reset, not the stall handler — nothing
+        user- or timer-triggered on this specific item) must, on its own,
+        notice a Downloading item whose transfer actually finished and catch
+        it up to Completed. This is what would have caught the real-world
+        case: a transfer that failed (e.g. the peer went offline), was later
+        retried/resumed to success by the transfer subsystem itself, with
+        that completion never routed back through the normal per-item paths."""
+
+        download_list = core.download_lists.add_list(
+            "Reconcile List", download_folder_path=DATA_FOLDER_PATH, quality="any",
+            fuzzy_match_threshold=50, auto_download=True
+        )
+        core.download_lists.add_list_items("Reconcile List", ["Silently Finished Song"])
+
+        item = download_list.items["Silently Finished Song"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Silently Finished Song.mp3", 8000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "resumeduser", files)
+
+        core.download_lists._file_search_response(msg)
+        core.download_lists._finalize_item("Reconcile List", "Silently Finished Song")
+
+        from pynicotine.transfers import TransferStatus
+
+        transfer_key = "resumeduser" + item.download_virtual_path
+        transfer = core.downloads.transfers.get(transfer_key)
+        self.assertIsNotNone(transfer)
+
+        # Simulate a failure and later out-of-band resume to success, entirely
+        # outside anything download lists itself triggered
+        transfer.status = TransferStatus.CONNECTION_TIMEOUT
+        transfer.status = TransferStatus.FINISHED
+
+        self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
+
+        core.download_lists._reconcile_downloading_items()
+
+        self.assertEqual(item.status, DownloadListItemStatus.COMPLETED)
+        self.assertEqual(item.download_percent, 100)
+
+    def test_periodic_reconciliation_leaves_a_still_in_progress_item_alone(self):
+        """The sweep must not touch a Downloading item whose transfer hasn't
+        actually finished yet."""
+
+        download_list = core.download_lists.add_list(
+            "Reconcile In Progress List", download_folder_path=DATA_FOLDER_PATH, quality="any",
+            fuzzy_match_threshold=50, auto_download=True
+        )
+        core.download_lists.add_list_items("Reconcile In Progress List", ["Still Going Song"])
+
+        item = download_list.items["Still Going Song"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Still Going Song.mp3", 8000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "activeuser", files)
+
+        core.download_lists._file_search_response(msg)
+        core.download_lists._finalize_item("Reconcile In Progress List", "Still Going Song")
+
+        core.download_lists._reconcile_downloading_items()
+
+        self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
+
     def test_pause_and_resume_list(self):
         """Pausing marks a list inactive; resuming re-queues anything still pending,
         even if it was never removed from the queue while paused."""

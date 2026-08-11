@@ -284,13 +284,18 @@ class DownloadList:
 class DownloadLists:
     __slots__ = (
         "lists", "file_path", "_token", "_queue", "_dispatch_timer_id",
-        "_token_map", "_transfer_map", "_allow_saving", "_watch_timer_id", "_watch_snapshots"
+        "_token_map", "_transfer_map", "_allow_saving", "_watch_timer_id", "_watch_snapshots",
+        "_reconcile_timer_id"
     )
 
     FILE_BASENAME = "download_lists.json"
 
     # How often the watch folder is polled for new song list files
     WATCH_INTERVAL = 30
+
+    # How often Downloading items are double-checked against their actual
+    # transfer state, catching any whose completion never got routed back
+    RECONCILE_INTERVAL = 60
 
     # Song list files dropped in the watch folder are moved here once imported
     WATCH_IMPORTED_FOLDER_NAME = "imported"
@@ -371,6 +376,7 @@ class DownloadLists:
 
         self._allow_saving = False
         self._watch_timer_id = None
+        self._reconcile_timer_id = None
 
         # watch folder file path -> (size, modification time) seen on the previous scan
         self._watch_snapshots = {}
@@ -410,6 +416,11 @@ class DownloadLists:
         self._watch_timer_id = events.schedule(
             delay=self.WATCH_INTERVAL, callback=self._scan_watch_folder, repeat=True)
 
+        # Safety net: periodically catch any Downloading item whose transfer actually
+        # finished without that ever reaching the item (see _reconcile_downloading_items)
+        self._reconcile_timer_id = events.schedule(
+            delay=self.RECONCILE_INTERVAL, callback=self._reconcile_downloading_items, repeat=True)
+
     def _quit(self):
 
         for download_list in self.lists.values():
@@ -419,6 +430,7 @@ class DownloadLists:
 
         events.cancel_scheduled(self._dispatch_timer_id)
         events.cancel_scheduled(self._watch_timer_id)
+        events.cancel_scheduled(self._reconcile_timer_id)
 
         self._save()
         self._allow_saving = False
@@ -882,6 +894,51 @@ class DownloadLists:
         events.emit("update-download-list", name)
         self._save()
 
+    def _complete_item_from_transfer(self, name, term, item, transfer):
+        """If the given transfer for a Downloading item has already finished,
+        mark the item Completed directly from it — using only the transfer
+        itself and data already on the item, no _transfer_map lookup required
+        — and return True. This is the one source of truth for 'did this
+        download actually succeed', used any time we need to double check
+        before discarding a Downloading item (resetting it, or the periodic
+        reconciliation sweep below), since _transfer_map is just an index that
+        can end up stale/orphaned relative to it."""
+
+        if transfer is None or transfer.status != TransferStatus.FINISHED:
+            return False
+
+        transfer_key = item.download_username + (item.download_virtual_path or "")
+        self._transfer_map.pop(transfer_key, None)
+
+        item.status = DownloadListItemStatus.COMPLETED
+        item.download_percent = 100
+        self._forget_item(item)
+
+        events.emit("update-download-list-item", name, term)
+        self._save()
+        self._check_list_complete(name)
+        return True
+
+    def _reconcile_downloading_items(self):
+        """Periodic safety net: for every item still marked Downloading, check
+        whether its transfer actually finished without that ever being routed
+        back to the item (e.g. it failed, dropped out of _transfer_map without
+        completing at the time, and was later retried/resumed to success by
+        the transfer subsystem outside of anything download lists initiated).
+        Catches this regardless of exactly how the routing was lost, rather
+        than only the specific paths (Reset, the stall handler) that are
+        otherwise guarded against it directly."""
+
+        for name, download_list in list(self.lists.items()):
+            for term, item in list(download_list.items.items()):
+                if item.status != DownloadListItemStatus.DOWNLOADING or not item.download_username:
+                    continue
+
+                transfer_key = item.download_username + (item.download_virtual_path or "")
+                transfer = core.downloads.transfers.get(transfer_key)
+
+                self._complete_item_from_transfer(name, term, item, transfer)
+
     def reset_list_item(self, name, term):
         """Forget an item's search/download progress so it can be retried."""
 
@@ -895,23 +952,9 @@ class DownloadLists:
             transfer_key = item.download_username + (item.download_virtual_path or "")
             transfer = core.downloads.transfers.get(transfer_key)
 
-            if transfer is not None and transfer.status == TransferStatus.FINISHED:
-                # This download actually already succeeded. Its completion may
-                # never have been routed back to this item — e.g. an orphaned
-                # _transfer_map entry left over from an earlier bug — but the
-                # transfer itself is proof the file landed. Recognize that
-                # directly from the transfer, rather than only through the map
-                # (which may no longer even reference this item), so Reset can
-                # never discard a download that, in fact, already finished
-                self._transfer_map.pop(transfer_key, None)
-
-                item.status = DownloadListItemStatus.COMPLETED
-                item.download_percent = 100
-                self._forget_item(item)
-
-                events.emit("update-download-list-item", name, term)
-                self._save()
-                self._check_list_complete(name)
+            if self._complete_item_from_transfer(name, term, item, transfer):
+                # This download actually already succeeded — Reset must never
+                # discard a download that, in fact, already finished
                 return
 
             if transfer is not None:
