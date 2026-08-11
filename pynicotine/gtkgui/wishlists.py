@@ -781,6 +781,15 @@ class SpotifyPlaylistPickerDialog(Dialog):
         own_label = Gtk.Label(label=_("Or pick one of your own playlists:"), wrap=True, xalign=0, visible=True)
         self._append(own_label)
 
+        self.playlist_search_entry = Gtk.SearchEntry(
+            placeholder_text=_("Search your playlists…"), visible=True)
+        self.playlist_search_entry.connect("search-changed", self.on_playlist_search_changed)
+        own_label.set_mnemonic_widget(self.playlist_search_entry)
+        self._append(self.playlist_search_entry)
+
+        self._own_playlists = []
+        self._own_playlists_loaded = False
+
         self.playlists_container = Gtk.ScrolledWindow(
             hexpand=True, vexpand=True, visible=True,
             hscrollbar_policy=Gtk.PolicyType.NEVER, vscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
@@ -805,7 +814,6 @@ class SpotifyPlaylistPickerDialog(Dialog):
             },
             activate_row_callback=self.on_playlist_row_activated
         )
-        own_label.set_mnemonic_widget(self.playlists_view.widget)
 
         self._load_own_playlists()
 
@@ -842,17 +850,51 @@ class SpotifyPlaylistPickerDialog(Dialog):
             return
 
         self._set_status("")
+        self._own_playlists = playlists
+        self._own_playlists_loaded = True
+        self._apply_playlist_filter()
+
+        if not playlists:
+            self._set_status(_("No playlists found in your Spotify account."))
+
+    def _apply_playlist_filter(self):
+        """Repopulates the treeview with whatever's currently in
+        _own_playlists that matches the search entry (name or owner,
+        case-insensitive substring) -- called after a fresh fetch, and
+        again every time the search text changes."""
+
+        query = self.playlist_search_entry.get_text().strip().lower()
+
+        if query:
+            visible_playlists = [
+                playlist for playlist in self._own_playlists
+                if query in playlist["name"].lower() or query in playlist["owner"].lower()
+            ]
+        else:
+            visible_playlists = self._own_playlists
+
         self.playlists_view.freeze()
         self.playlists_view.clear()
 
-        for playlist in playlists:
+        for playlist in visible_playlists:
             self.playlists_view.add_row(
                 [playlist["id"], playlist["name"], playlist["owner"]], select_row=False)
 
         self.playlists_view.unfreeze()
 
-        if not playlists:
-            self._set_status(_("No playlists found in your Spotify account."))
+        if self._own_playlists and not visible_playlists:
+            self._set_status(_("No playlists match your search."))
+        else:
+            self._set_status("")
+
+    def on_playlist_search_changed(self, *_args):
+
+        if not self._own_playlists_loaded:
+            # Nothing fetched yet (not connected, or still loading) --
+            # leave whatever status message is already showing alone
+            return
+
+        self._apply_playlist_filter()
 
     def _watch_playlist(self, playlist_url_or_id):
 
