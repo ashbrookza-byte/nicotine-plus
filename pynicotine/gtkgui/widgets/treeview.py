@@ -29,6 +29,31 @@ from pynicotine.gtkgui.widgets.theme import USER_STATUS_ICON_LABELS
 from pynicotine.gtkgui.widgets.theme import add_css_class
 
 
+def _find_label_widget(widget):
+    """Recursively find the first Gtk.Label inside a widget hierarchy.
+    Column header title widgets aren't always a Label directly; they can be
+    wrapped in a Box alongside a sort indicator."""
+
+    if isinstance(widget, Gtk.Label):
+        return widget
+
+    if GTK_API_VERSION >= 4:
+        children = list(widget)
+    else:
+        try:
+            children = widget.get_children()
+        except AttributeError:
+            return None
+
+    for child in children:
+        label = _find_label_widget(child)
+
+        if label is not None:
+            return label
+
+    return None
+
+
 class TreeView:
 
     def __init__(self, window, parent, columns, has_tree=False, multi_select=False,
@@ -386,7 +411,10 @@ class TreeView:
 
             title_container = next(iter(column_header))
             title_widget = next(iter(title_container)) if xalign < 1 else list(title_container)[-1]
-            title_widget.set_ellipsize(Pango.EllipsizeMode.END)
+            title_label = _find_label_widget(title_widget)
+
+            if title_label is not None:
+                title_label.set_ellipsize(Pango.EllipsizeMode.END)
 
             if column_data.get("hide_header"):
                 title_widget.set_visible(False)
