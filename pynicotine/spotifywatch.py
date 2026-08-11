@@ -233,7 +233,7 @@ class SpotifyWatch:
             events.invoke_main_thread(result_callback, False, error.message)
             return
 
-        list_name = playlist.get("name") or playlist_id
+        list_name = self._unique_list_name(playlist.get("name") or playlist_id)
 
         entry = {
             "playlist_id": playlist_id,
@@ -281,6 +281,32 @@ class SpotifyWatch:
             return text
 
         return None
+
+    @staticmethod
+    def _unique_list_name(base_name):
+        """Avoid silently merging a newly watched playlist into an unrelated
+        pre-existing list that just happens to share its name -- without
+        this, watching a playlist named e.g. "Chill Vibes" when a manually
+        created (or Watch Folder) list is already called that would dump
+        the playlist's tracks straight into it and make the GUI sidebar
+        miscategorize that whole list as Spotify-sourced, since
+        categorization there is name-based (see Wishlists._is_spotify_list
+        in gtkgui/wishlists.py). Each watched playlist gets its own list
+        instead, disambiguated with a numbered suffix if the plain name is
+        already taken by anything -- another list, or even another watched
+        playlist that happens to share a title."""
+
+        from pynicotine.core import core
+
+        existing_lists = core.download_lists.lists if core.download_lists is not None else {}
+        name = base_name
+        suffix = 2
+
+        while name in existing_lists:
+            name = f"{base_name} ({suffix})"
+            suffix += 1
+
+        return name
 
     # Browsing the user's own playlists #
 

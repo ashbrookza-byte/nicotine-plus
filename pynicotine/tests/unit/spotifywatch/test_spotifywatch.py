@@ -285,6 +285,44 @@ class SpotifyWatchTest(TestCase):
         # An immediate poll must also have (re)started the periodic timer
         self.assertIsNotNone(core.spotify_watch._poll_timer_id)
 
+    def test_add_watched_playlist_thread_disambiguates_name_collision(self):
+        """A pre-existing list (manually created, Watch Folder import, or a
+        different watched playlist) with the same name must not silently
+        absorb the newly watched playlist's tracks -- each watched playlist
+        gets its own list, even if that means appending "(2)"."""
+
+        config.sections["spotify"]["refresh_token"] = "some-refresh-token"
+        core.download_lists.add_list("My Watched Playlist")
+
+        def fake_api_get(path, params=None):  # noqa: ARG001
+            if path == "/playlists/abc123":
+                return {"name": "My Watched Playlist"}
+
+            if path == "/playlists/abc123/items":
+                return {
+                    "items": [{"track": {"id": "new-id", "name": "New Song", "artists": [{"name": "Artist"}]}}],
+                    "next": None
+                }
+
+            raise AssertionError(f"Unexpected path requested: {path}")
+
+        results = []
+
+        with patch.object(SpotifyWatch, "_api_get", side_effect=fake_api_get):
+            core.spotify_watch._add_watched_playlist_thread(
+                "abc123", lambda success, message: results.append((success, message)))
+
+        self._flush_main_thread_callbacks()
+
+        self.assertEqual(results, [(True, "My Watched Playlist (2)")])
+
+        watched = config.sections["spotify"]["watched_playlists"]
+        self.assertEqual(watched[0]["list_name"], "My Watched Playlist (2)")
+
+        # The pre-existing list must be untouched -- nothing merged into it
+        self.assertEqual(core.download_lists.lists["My Watched Playlist"].items, {})
+        self.assertIn("New Song - Artist", core.download_lists.lists["My Watched Playlist (2)"].items)
+
     def test_add_watched_playlist_thread_reports_lookup_failure(self):
 
         config.sections["spotify"]["refresh_token"] = "some-refresh-token"
