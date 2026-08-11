@@ -303,3 +303,144 @@ class DownloadListsTest(TestCase):
         core.download_lists._file_search_response(msg)
 
         self.assertEqual(item.download_candidates, [])
+
+    # Watch Folder #
+
+    def _set_up_watch_folder(self, enabled=True):
+
+        watch_folder_path = os.path.join(DATA_FOLDER_PATH, "watch")
+
+        if os.path.exists(watch_folder_path):
+            shutil.rmtree(watch_folder_path)
+
+        os.makedirs(watch_folder_path)
+
+        config.sections["transfers"]["downloadlistwatchenabled"] = enabled
+        config.sections["transfers"]["downloadlistwatchfolder"] = watch_folder_path
+
+        return watch_folder_path
+
+    @staticmethod
+    def _write_watch_file(folder_path, basename, contents, encoding="utf-8"):
+
+        file_path = os.path.join(folder_path, basename)
+
+        with open(file_path, "w", encoding=encoding, newline="") as handle:
+            handle.write(contents)
+
+        return file_path
+
+    def test_watch_folder_imports_after_file_settles(self):
+        """A file is only imported once its size and mtime are unchanged between
+        two consecutive scans, so partially written files are never read."""
+
+        watch_folder_path = self._set_up_watch_folder()
+        self._write_watch_file(watch_folder_path, "Spotify Missing.txt", "Artist One - Song One\n")
+
+        # First scan only records a snapshot, it must not import yet
+        core.download_lists._scan_watch_folder()
+        self.assertNotIn("Spotify Missing", core.download_lists.lists)
+        self.assertTrue(os.path.isfile(os.path.join(watch_folder_path, "Spotify Missing.txt")))
+
+        # Second scan sees an unchanged file and imports it
+        core.download_lists._scan_watch_folder()
+
+        self.assertIn("Spotify Missing", core.download_lists.lists)
+        self.assertIn("Artist One - Song One", core.download_lists.lists["Spotify Missing"].items)
+
+    def test_watch_folder_moves_imported_file(self):
+        """An imported file is moved into the 'imported' subfolder so it is not read twice."""
+
+        watch_folder_path = self._set_up_watch_folder()
+        self._write_watch_file(watch_folder_path, "Wanted.txt", "Artist - Song\n")
+
+        core.download_lists._scan_watch_folder()
+        core.download_lists._scan_watch_folder()
+
+        self.assertFalse(os.path.isfile(os.path.join(watch_folder_path, "Wanted.txt")))
+        self.assertTrue(os.path.isfile(os.path.join(watch_folder_path, "imported", "Wanted.txt")))
+
+    def test_watch_folder_imported_name_collision(self):
+        """Re-importing a file with the same name must not overwrite the previous one."""
+
+        watch_folder_path = self._set_up_watch_folder()
+
+        for _unused in range(2):
+            self._write_watch_file(watch_folder_path, "Wanted.txt", "Artist - Song\n")
+            core.download_lists._scan_watch_folder()
+            core.download_lists._scan_watch_folder()
+
+        imported_folder_path = os.path.join(watch_folder_path, "imported")
+
+        self.assertTrue(os.path.isfile(os.path.join(imported_folder_path, "Wanted.txt")))
+        self.assertTrue(os.path.isfile(os.path.join(imported_folder_path, "Wanted (1).txt")))
+
+    def test_watch_folder_parses_bom_crlf_blanks_and_comments(self):
+        """A BOM, CRLF line endings, blank lines and comments must not corrupt terms."""
+
+        watch_folder_path = self._set_up_watch_folder()
+        self._write_watch_file(
+            watch_folder_path, "Messy.txt",
+            "# exported by another app\r\nArtist One - Song One\r\n\r\n  Artist Two - Song Two  \r\n",
+            encoding="utf-8-sig"
+        )
+
+        core.download_lists._scan_watch_folder()
+        core.download_lists._scan_watch_folder()
+
+        terms = list(core.download_lists.lists["Messy"].items)
+
+        self.assertEqual(terms, ["Artist One - Song One", "Artist Two - Song Two"])
+
+    def test_watch_folder_appends_to_existing_list(self):
+        """Importing a file whose name matches an existing list adds to that list,
+        and duplicate terms are not added twice."""
+
+        watch_folder_path = self._set_up_watch_folder()
+        core.download_lists.add_list("Wanted", auto_download=False)
+        core.download_lists.add_list_items("Wanted", ["Artist - Existing Song"])
+
+        self._write_watch_file(
+            watch_folder_path, "Wanted.txt", "Artist - Existing Song\nArtist - New Song\n")
+
+        core.download_lists._scan_watch_folder()
+        core.download_lists._scan_watch_folder()
+
+        terms = list(core.download_lists.lists["Wanted"].items)
+
+        self.assertEqual(terms, ["Artist - Existing Song", "Artist - New Song"])
+
+    def test_watch_folder_disabled_is_a_no_op(self):
+        """Nothing is imported while the watch folder is disabled."""
+
+        watch_folder_path = self._set_up_watch_folder(enabled=False)
+        self._write_watch_file(watch_folder_path, "Wanted.txt", "Artist - Song\n")
+
+        core.download_lists._scan_watch_folder()
+        core.download_lists._scan_watch_folder()
+
+        self.assertNotIn("Wanted", core.download_lists.lists)
+        self.assertTrue(os.path.isfile(os.path.join(watch_folder_path, "Wanted.txt")))
+
+    def test_watch_folder_ignores_non_list_files(self):
+        """Files that are not song lists are left alone."""
+
+        watch_folder_path = self._set_up_watch_folder()
+        self._write_watch_file(watch_folder_path, "cover.jpg", "not a song list")
+
+        core.download_lists._scan_watch_folder()
+        core.download_lists._scan_watch_folder()
+
+        self.assertEqual(core.download_lists.lists, {})
+        self.assertTrue(os.path.isfile(os.path.join(watch_folder_path, "cover.jpg")))
+
+    def test_watch_folder_missing_folder_is_handled(self):
+        """A watch folder that does not exist must not raise."""
+
+        config.sections["transfers"]["downloadlistwatchenabled"] = True
+        config.sections["transfers"]["downloadlistwatchfolder"] = os.path.join(
+            DATA_FOLDER_PATH, "does_not_exist")
+
+        core.download_lists._scan_watch_folder()
+
+        self.assertEqual(core.download_lists.lists, {})

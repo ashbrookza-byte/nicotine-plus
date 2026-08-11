@@ -180,6 +180,8 @@ class Config:
                 "downloaddir": os.path.join(data_home_env, "downloads"),
                 "uploaddir": os.path.join(data_home_env, "received"),
                 "usernamesubfolders": False,
+                "downloadlistwatchenabled": False,
+                "downloadlistwatchfolder": "",
                 "shared": [],
                 "buddyshared": [],
                 "trustedshared": [],

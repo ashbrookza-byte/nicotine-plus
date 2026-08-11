@@ -193,10 +193,18 @@ class DownloadList:
 class DownloadLists:
     __slots__ = (
         "lists", "file_path", "_token", "_queue", "_dispatch_timer_id",
-        "_token_map", "_transfer_map", "_allow_saving"
+        "_token_map", "_transfer_map", "_allow_saving", "_watch_timer_id", "_watch_snapshots"
     )
 
     FILE_BASENAME = "download_lists.json"
+
+    # How often the watch folder is polled for new song list files
+    WATCH_INTERVAL = 30
+
+    # Song list files dropped in the watch folder are moved here once imported
+    WATCH_IMPORTED_FOLDER_NAME = "imported"
+
+    WATCH_FILE_EXTENSIONS = (".txt", ".csv")
 
     # Extensions considered when picking a file to automatically download
     AUDIO_EXTENSIONS = {
@@ -253,6 +261,10 @@ class DownloadLists:
         self._transfer_map = {}
 
         self._allow_saving = False
+        self._watch_timer_id = None
+
+        # watch folder file path -> (size, modification time) seen on the previous scan
+        self._watch_snapshots = {}
 
         for event_name, callback in (
             ("file-search-response", self._file_search_response),
@@ -270,6 +282,10 @@ class DownloadLists:
         # Save download lists every 3 minutes
         events.schedule(delay=180, callback=self._save, repeat=True)
 
+        # Poll the watch folder for song list files exported by other applications
+        self._watch_timer_id = events.schedule(
+            delay=self.WATCH_INTERVAL, callback=self._scan_watch_folder, repeat=True)
+
     def _quit(self):
 
         for download_list in self.lists.values():
@@ -278,6 +294,7 @@ class DownloadLists:
                 events.cancel_scheduled(item.escalation_timer_id)
 
         events.cancel_scheduled(self._dispatch_timer_id)
+        events.cancel_scheduled(self._watch_timer_id)
 
         self._save()
         self._allow_saving = False
@@ -598,6 +615,133 @@ class DownloadLists:
                     row["term"], row["searched_term"], row["status"], row["downloaded_file"],
                     row["user"], row["quality"], row["length"]
                 ])
+
+    # Watch Folder #
+
+    def _scan_watch_folder(self):
+        """Poll the watch folder for song list files exported by other applications.
+
+        A file is only imported once its size and modification time are unchanged
+        between two consecutive scans, so that files still being written are not
+        read while incomplete.
+        """
+
+        if not config.sections["transfers"]["downloadlistwatchenabled"]:
+            self._watch_snapshots.clear()
+            return
+
+        folder_path = config.sections["transfers"]["downloadlistwatchfolder"]
+
+        if not folder_path:
+            return
+
+        current_snapshots = {}
+
+        try:
+            with os.scandir(encode_path(folder_path)) as entries:
+                for entry in entries:
+                    basename = entry.name.decode("utf-8", "replace")
+
+                    if not basename.lower().endswith(self.WATCH_FILE_EXTENSIONS):
+                        continue
+
+                    if not entry.is_file():
+                        continue
+
+                    stat_result = entry.stat()
+                    current_snapshots[basename] = (stat_result.st_size, stat_result.st_mtime)
+
+        except OSError as error:
+            log.add(_("Cannot open download list watch folder %(folder)s: %(error)s"),
+                    {"folder": folder_path, "error": error})
+            return
+
+        for basename, snapshot in current_snapshots.items():
+            if self._watch_snapshots.get(basename) == snapshot:
+                self._import_watch_file(folder_path, basename)
+
+        self._watch_snapshots = current_snapshots
+
+    @staticmethod
+    def _read_watch_file(file_path):
+        """Read a song list file, one search term per line.
+
+        utf-8-sig transparently strips a byte order mark, which text files exported
+        by other applications often start with. splitlines() handles both CRLF and
+        LF line endings.
+        """
+
+        try:
+            with open(encode_path(file_path), encoding="utf-8-sig") as handle:
+                contents = handle.read()
+
+        except UnicodeDecodeError:
+            with open(encode_path(file_path), encoding="latin-1") as handle:
+                contents = handle.read()
+
+        terms = []
+
+        for line in contents.splitlines():
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            terms.append(line)
+
+        return terms
+
+    def _move_imported_watch_file(self, folder_path, basename):
+        """Move an imported file into the 'imported' subfolder, so it is not read again."""
+
+        imported_folder_path = os.path.join(folder_path, self.WATCH_IMPORTED_FOLDER_NAME)
+        source_path = os.path.join(folder_path, basename)
+        target_path = os.path.join(imported_folder_path, basename)
+        name_root, extension = os.path.splitext(basename)
+        counter = 1
+
+        os.makedirs(encode_path(imported_folder_path), exist_ok=True)
+
+        while os.path.exists(encode_path(target_path)):
+            target_path = os.path.join(imported_folder_path, f"{name_root} ({counter}){extension}")
+            counter += 1
+
+        os.replace(encode_path(source_path), encode_path(target_path))
+
+    def _import_watch_file(self, folder_path, basename):
+        """Import a single song list file into a list named after the file."""
+
+        file_path = os.path.join(folder_path, basename)
+        list_name = os.path.splitext(basename)[0].strip()
+
+        try:
+            terms = self._read_watch_file(file_path)
+
+        except OSError as error:
+            log.add(_("Cannot read download list file %(path)s: %(error)s"),
+                    {"path": file_path, "error": error})
+            return
+
+        if not list_name:
+            # Nothing usable in the file, but still move it aside so it is not rescanned
+            terms = []
+
+        if terms:
+            if list_name not in self.lists:
+                self.add_list(list_name)
+
+            self.add_list_items(list_name, terms)
+
+        try:
+            self._move_imported_watch_file(folder_path, basename)
+
+        except OSError as error:
+            log.add(_("Cannot move imported download list file %(path)s: %(error)s"),
+                    {"path": file_path, "error": error})
+            return
+
+        log.add(_('Imported %(num)i songs from "%(path)s" into download list "%(list)s"'),
+                {"num": len(terms), "path": basename, "list": list_name})
 
     # Search Dispatch #
 
