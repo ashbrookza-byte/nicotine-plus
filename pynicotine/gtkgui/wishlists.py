@@ -303,6 +303,15 @@ class Wishlists:
     def on_focus(self, *_args):
         self.lists_view.grab_focus()
 
+    def on_select_list_row(self, list_view, iterator):
+
+        if iterator is None:
+            self._show_list(None)
+            return
+
+        name = list_view.get_row_value(iterator, "name")
+        self._show_list(name)
+
     def on_start(self):
 
         if core.download_lists is None:
