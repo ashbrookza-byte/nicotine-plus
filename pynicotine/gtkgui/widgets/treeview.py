@@ -367,7 +367,9 @@ class TreeView:
                 column.set_alignment(xalign)
 
             elif column_type == "progress":
-                xalign = 1
+                # Left-align the header title, since the progress bar itself always
+                # fills the entire column width regardless of alignment
+                xalign = 0
                 renderer = Gtk.CellRendererProgress(mode=mode, ypad=progress_padding)
                 column = Gtk.TreeViewColumn(title=title, cell_renderer=renderer, value=column_index)
                 column.set_alignment(xalign)
