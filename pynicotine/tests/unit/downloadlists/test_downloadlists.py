@@ -567,10 +567,31 @@ class DownloadListsTest(TestCase):
         self.assertIn("Artist1 - Song Title", variants)
 
     def test_term_variants_no_change_for_simple_term(self):
+        """A plain "Artist - Title" term with nothing to strip still gets the
+        artist-only fallback appended (see test_term_variants_artist_only_fallback)."""
 
         variants = core.download_lists._get_term_variants("Solo Artist - Just A Title")
 
-        self.assertEqual(variants, ["Solo Artist - Just A Title"])
+        self.assertEqual(variants, ["Solo Artist - Just A Title", "Solo Artist"])
+
+    def test_term_variants_artist_only_fallback(self):
+        """A combined "artist title" search can come back with fewer/no results
+        the same way it sometimes does manually, while just the artist name
+        often finds plenty from peers whose tags don't line up neatly with a
+        multi-word query. Candidates are still filtered against every word of
+        the original full term regardless (see _file_search_response), so
+        this can only narrow results further, never accept a wrong one."""
+
+        variants = core.download_lists._get_term_variants("Tinlicker - Melancholia")
+
+        self.assertEqual(variants, ["Tinlicker - Melancholia", "Tinlicker"])
+
+    def test_term_variants_no_artist_only_fallback_without_separator(self):
+        """A term with no "Artist - Title" separator has nothing to fall back to."""
+
+        variants = core.download_lists._get_term_variants("JustOneWordTitle")
+
+        self.assertEqual(variants, ["JustOneWordTitle"])
 
     def test_quality_preference(self):
 
@@ -679,21 +700,22 @@ class DownloadListsTest(TestCase):
         self.assertEqual(len(rows), 1)
 
     def test_single_variant_term_is_not_marked_not_found_prematurely(self):
-        """A term with no bracket/feat/extra-artist clause to strip (e.g. a plain
-        "Artist - Title") has only one variant, so it exhausts it on the very first
-        escalation attempt. That must not immediately mark the item Not Found —
-        only reaching the full SEARCH_TIMEOUT with zero candidates should."""
+        """A term with no "Artist - Title" separator (so no bracket/feat/extra-artist
+        clause to strip, and no artist-only fallback to fall back to) has only one
+        variant, so it exhausts it on the very first escalation attempt. That must
+        not immediately mark the item Not Found — only reaching the full
+        SEARCH_TIMEOUT with zero candidates should."""
 
         import time
 
         download_list = core.download_lists.add_list("Escalation List", auto_download=True)
-        core.download_lists.add_list_items("Escalation List", ["Tinlicker - Melancholia"])
+        core.download_lists.add_list_items("Escalation List", ["Melancholia"])
 
-        item = download_list.items["Tinlicker - Melancholia"]
+        item = download_list.items["Melancholia"]
         core.download_lists._dispatch_item(download_list, item)
 
         variants = core.download_lists._get_term_variants(item.term)
-        self.assertEqual(variants, ["Tinlicker - Melancholia"])
+        self.assertEqual(variants, ["Melancholia"])
 
         # First escalation attempt: the single variant is immediately exhausted, but
         # since we're nowhere near SEARCH_TIMEOUT yet, the item must keep searching —
@@ -710,7 +732,7 @@ class DownloadListsTest(TestCase):
 
         events.connect("queue-network-message", capture_message)
         try:
-            core.download_lists._escalate_item("Escalation List", "Tinlicker - Melancholia")
+            core.download_lists._escalate_item("Escalation List", "Melancholia")
         finally:
             events.disconnect("queue-network-message", capture_message)
 
@@ -723,7 +745,44 @@ class DownloadListsTest(TestCase):
 
         # Simulate SEARCH_TIMEOUT having actually elapsed since dispatch
         item.dispatch_time = time.time() - core.download_lists.SEARCH_TIMEOUT - 1
-        core.download_lists._escalate_item("Escalation List", "Tinlicker - Melancholia")
+        core.download_lists._escalate_item("Escalation List", "Melancholia")
+
+        self.assertEqual(item.status, DownloadListItemStatus.NOT_FOUND)
+
+    def test_artist_only_fallback_is_used_during_escalation(self):
+        """A term with an "Artist - Title" separator escalates through the
+        artist-only fallback before finally being marked Not Found, and
+        candidates are still checked against every word of the full original
+        term — not just whatever text was actually sent to the network."""
+
+        import time
+
+        download_list = core.download_lists.add_list("Artist Fallback List", auto_download=True)
+        core.download_lists.add_list_items("Artist Fallback List", ["Tinlicker - Melancholia"])
+
+        item = download_list.items["Tinlicker - Melancholia"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        # First escalation: falls back to searching "Tinlicker" alone
+        core.download_lists._escalate_item("Artist Fallback List", "Tinlicker - Melancholia")
+
+        self.assertEqual(item.status, DownloadListItemStatus.SEARCHING)
+        self.assertEqual(item.searched_term, "Tinlicker")
+
+        # A result matching only the artist, not the title, must still be rejected
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Tinlicker\\Some Other Song.mp3", 8000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "someuser", files)
+        core.download_lists._file_search_response(msg)
+
+        self.assertEqual(item.download_candidates, [])
+
+        # Second escalation: variants exhausted, waits out the remaining SEARCH_TIMEOUT
+        core.download_lists._escalate_item("Artist Fallback List", "Tinlicker - Melancholia")
+        self.assertEqual(item.status, DownloadListItemStatus.SEARCHING)
+
+        item.dispatch_time = time.time() - core.download_lists.SEARCH_TIMEOUT - 1
+        core.download_lists._escalate_item("Artist Fallback List", "Tinlicker - Melancholia")
 
         self.assertEqual(item.status, DownloadListItemStatus.NOT_FOUND)
 
