@@ -26,6 +26,7 @@ from pynicotine.slskmessages import ServerReconnect
 if TYPE_CHECKING:
     from pynicotine.buddies import Buddies
     from pynicotine.chatrooms import ChatRooms
+    from pynicotine.downloadlists import DownloadLists
     from pynicotine.downloads import Downloads
     from pynicotine.interests import Interests
     from pynicotine.networkfilter import NetworkFilter
@@ -53,10 +54,10 @@ class Core:
     """
 
     __slots__ = ("shares", "users", "network_filter", "statistics", "search", "downloads",
-                 "uploads", "interests", "userbrowse", "userinfo", "buddies", "privatechat",
-                 "chatrooms", "pluginhandler", "now_playing", "portmapper", "notifications",
-                 "port_checker", "update_checker", "_network_thread", "cli_interface_address",
-                 "cli_listen_port", "cli_rescanning", "enabled_components")
+                 "download_lists", "uploads", "interests", "userbrowse", "userinfo", "buddies",
+                 "privatechat", "chatrooms", "pluginhandler", "now_playing", "portmapper",
+                 "notifications", "port_checker", "update_checker", "_network_thread",
+                 "cli_interface_address", "cli_listen_port", "cli_rescanning", "enabled_components")
 
     def __init__(self):
         self.shares: Shares | None = None
@@ -65,6 +66,7 @@ class Core:
         self.statistics: Statistics | None = None
         self.search: Search | None = None
         self.downloads: Downloads | None = None
+        self.download_lists: DownloadLists | None = None
         self.uploads: Uploads | None = None
         self.interests: Interests | None = None
         self.userbrowse: UserBrowse | None = None
@@ -94,8 +96,8 @@ class Core:
             enabled_components = {
                 "error_handler", "signal_handler", "cli", "portmapper", "network_thread", "shares", "users",
                 "notifications", "network_filter", "now_playing", "statistics", "port_checker", "update_checker",
-                "search", "downloads", "uploads", "interests", "userbrowse", "userinfo", "buddies",
-                "chatrooms", "privatechat", "pluginhandler"
+                "search", "downloads", "download_lists", "uploads", "interests", "userbrowse", "userinfo",
+                "buddies", "chatrooms", "privatechat", "pluginhandler"
             }
 
         self.enabled_components = enabled_components
@@ -169,6 +171,10 @@ class Core:
         if "downloads" in enabled_components:
             from pynicotine.downloads import Downloads
             self.downloads = Downloads()
+
+        if "download_lists" in enabled_components:
+            from pynicotine.downloadlists import DownloadLists
+            self.download_lists = DownloadLists()
 
         if "uploads" in enabled_components:
             from pynicotine.uploads import Uploads

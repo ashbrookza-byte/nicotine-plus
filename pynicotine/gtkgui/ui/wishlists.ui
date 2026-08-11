@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SPDX-FileCopyrightText: 2026 Nicotine+ Contributors
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
+<interface>
+  <requires lib="gtk+" version="3.0"/>
+  <object class="GtkBox" id="container">
+    <property name="hexpand">True</property>
+    <property name="vexpand">True</property>
+    <property name="visible">True</property>
+    <child>
+      <object class="GtkPaned" id="wishlists_paned">
+        <property name="hexpand">True</property>
+        <property name="orientation">horizontal</property>
+        <property name="position">220</property>
+        <property name="vexpand">True</property>
+        <property name="visible">True</property>
+        <child>
+          <object class="GtkBox" id="lists_pane">
+            <property name="orientation">vertical</property>
+            <property name="visible">True</property>
+            <property name="width-request">200</property>
+            <child>
+              <object class="GtkBox">
+                <property name="margin-bottom">6</property>
+                <property name="margin-end">6</property>
+                <property name="margin-start">6</property>
+                <property name="margin-top">6</property>
+                <property name="spacing">6</property>
+                <property name="visible">True</property>
+                <child>
+                  <object class="GtkButton" id="add_list_button">
+                    <property name="hexpand">True</property>
+                    <property name="label" translatable="yes">_Add List…</property>
+                    <property name="use-underline">True</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_add_list"/>
+                  </object>
+                </child>
+              </object>
+            </child>
+            <child>
+              <object class="GtkScrolledWindow" id="lists_container">
+                <property name="hexpand">True</property>
+                <property name="vexpand">True</property>
+                <property name="visible">True</property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkBox" id="items_pane">
+            <property name="orientation">vertical</property>
+            <property name="visible">True</property>
+            <child>
+              <object class="GtkBox">
+                <property name="margin-bottom">6</property>
+                <property name="margin-end">6</property>
+                <property name="margin-start">6</property>
+                <property name="margin-top">6</property>
+                <property name="spacing">6</property>
+                <property name="visible">True</property>
+                <child>
+                  <object class="GtkLabel" id="current_list_label">
+                    <property name="ellipsize">end</property>
+                    <property name="hexpand">True</property>
+                    <property name="label" translatable="yes">No list selected</property>
+                    <property name="xalign">0</property>
+                    <property name="visible">True</property>
+                    <style>
+                      <class name="heading"/>
+                    </style>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="add_songs_button">
+                    <property name="label" translatable="yes">_Add Songs…</property>
+                    <property name="sensitive">False</property>
+                    <property name="use-underline">True</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_add_songs"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="list_settings_button">
+                    <property name="label" translatable="yes">_Settings…</property>
+                    <property name="sensitive">False</property>
+                    <property name="use-underline">True</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_list_settings"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="export_summary_button">
+                    <property name="label" translatable="yes">_Export Summary…</property>
+                    <property name="sensitive">False</property>
+                    <property name="use-underline">True</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_export_summary"/>
+                  </object>
+                </child>
+              </object>
+            </child>
+            <child>
+              <object class="GtkScrolledWindow" id="items_container">
+                <property name="hexpand">True</property>
+                <property name="vexpand">True</property>
+                <property name="visible">True</property>
+              </object>
+            </child>
+          </object>
+        </child>
+      </object>
+    </child>
+  </object>
+</interface>

@@ -133,6 +133,14 @@ EVENT_NAMES = {
     "show-search",
     "update-wish-filters",
 
+    # Download lists
+    "add-download-list",
+    "download-list-completed",
+    "remove-download-list",
+    "rename-download-list",
+    "update-download-list",
+    "update-download-list-item",
+
     # Statistics
     "update-stat",
 

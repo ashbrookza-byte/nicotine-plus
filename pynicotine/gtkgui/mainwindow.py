@@ -43,6 +43,7 @@ from pynicotine.gtkgui.widgets.theme import remove_css_class
 from pynicotine.gtkgui.widgets.theme import set_global_style
 from pynicotine.gtkgui.widgets.theme import set_use_header_bar
 from pynicotine.gtkgui.widgets.window import Window
+from pynicotine.gtkgui.wishlists import Wishlists
 from pynicotine.logfacility import log
 from pynicotine.slskmessages import UserStatus
 from pynicotine.utils import humanize
@@ -258,6 +259,7 @@ class MainWindow(Window):
         self.chatrooms = ChatRooms(self)
         self.search = Searches(self)
         self.downloads = Downloads(self)
+        self.wishlists = Wishlists(self)
         self.uploads = Uploads(self)
         self.buddies = Buddies(self)
         self.privatechat = PrivateChats(self)
@@ -273,7 +275,8 @@ class MainWindow(Window):
             "uploads": self.uploads,
             "userbrowse": self.userbrowse,
             "userinfo": self.userinfo,
-            "userlist": self.buddies
+            "userlist": self.buddies,
+            "wishlists": self.wishlists
         }
 
         # Actions and menu
@@ -775,6 +778,7 @@ class MainWindow(Window):
         for tab_id, tab_text, tab_icon_name in (
             ("search", _("Search Files"), "system-search-symbolic"),
             ("downloads", _("Downloads"), "folder-download-symbolic"),
+            ("wishlists", _("Wishlists"), "starred-symbolic"),
             ("uploads", _("Uploads"), "emblem-shared-symbolic"),
             ("userbrowse", _("Browse Shares"), "folder-symbolic"),
             ("userinfo", _("User Profiles"), "avatar-default-symbolic"),
