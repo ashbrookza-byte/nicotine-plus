@@ -301,6 +301,67 @@ class DownloadListsTest(TestCase):
         self.assertTrue(download_list.effective_auto_download)
         self.assertIn(("Pausable List", "Artist - Song"), core.download_lists._queue)
 
+    def test_start_item_next_moves_pending_item_to_front_of_queue(self):
+        """A pending item is moved to the front of the dispatch queue, ahead of
+        items that were already queued before it."""
+
+        download_list = core.download_lists.add_list("Priority List", auto_download=True)
+        core.download_lists.add_list_items("Priority List", ["First Song", "Second Song", "Third Song"])
+
+        core.download_lists.start_item_next("Priority List", "Third Song")
+
+        self.assertEqual(core.download_lists._queue[0], ("Priority List", "Third Song"))
+        # Not duplicated: still only one entry for it in the queue
+        self.assertEqual(
+            list(core.download_lists._queue).count(("Priority List", "Third Song")), 1)
+
+    def test_start_item_next_resets_a_not_found_item_first(self):
+        """An item that isn't pending (e.g. Not Found) is reset before being
+        placed at the front of the queue."""
+
+        download_list = core.download_lists.add_list("Priority List", auto_download=True)
+        core.download_lists.add_list_items("Priority List", ["Missing Song"])
+
+        item = download_list.items["Missing Song"]
+        item.status = DownloadListItemStatus.NOT_FOUND
+        core.download_lists._queue.clear()
+
+        core.download_lists.start_item_next("Priority List", "Missing Song")
+
+        self.assertEqual(item.status, DownloadListItemStatus.PENDING)
+        self.assertEqual(core.download_lists._queue[0], ("Priority List", "Missing Song"))
+
+    def test_start_item_next_is_a_no_op_for_active_item(self):
+        """An item that's already searching or downloading isn't touched."""
+
+        download_list = core.download_lists.add_list("Priority List", auto_download=True)
+        core.download_lists.add_list_items("Priority List", ["Active Song"])
+
+        item = download_list.items["Active Song"]
+        core.download_lists._dispatch_item(download_list, item)
+        self.assertEqual(item.status, DownloadListItemStatus.SEARCHING)
+
+        # _dispatch_item() doesn't remove the queue entry itself (only _pump_queue()
+        # does, when it pops and dispatches); clear it so the assertion below only
+        # reflects what start_item_next() itself did, or rather didn't do
+        core.download_lists._queue.clear()
+
+        core.download_lists.start_item_next("Priority List", "Active Song")
+
+        self.assertEqual(item.status, DownloadListItemStatus.SEARCHING)
+        self.assertNotIn(("Priority List", "Active Song"), core.download_lists._queue)
+
+    def test_start_item_next_is_a_no_op_for_paused_list(self):
+        """Nothing is queued for a list that isn't currently auto-downloading."""
+
+        download_list = core.download_lists.add_list("Paused Priority List", auto_download=False)
+        core.download_lists.add_list_items("Paused Priority List", ["Some Song"])
+        core.download_lists._queue.clear()
+
+        core.download_lists.start_item_next("Paused Priority List", "Some Song")
+
+        self.assertNotIn(("Paused Priority List", "Some Song"), core.download_lists._queue)
+
     def test_effective_download_folder_path_with_name_subfolder(self):
         """When "save into a subfolder named after this list" is on, the effective
         download folder is the base folder plus a subfolder named after the list."""

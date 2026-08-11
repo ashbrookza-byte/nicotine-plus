@@ -838,6 +838,32 @@ class DownloadLists:
         events.emit("update-download-list-item", name, term)
         self._save()
 
+    def start_item_next(self, name, term):
+        """Move an item to the front of the dispatch queue, so it's searched
+        next instead of waiting its turn — resetting it first if it isn't
+        already pending. No-op for an item that's already active, or a
+        list that isn't currently auto-downloading."""
+
+        download_list = self.lists.get(name)
+        item = download_list.items.get(term) if download_list is not None else None
+
+        if item is None or item.status in (
+                DownloadListItemStatus.SEARCHING, DownloadListItemStatus.DOWNLOADING):
+            return
+
+        if download_list is None or not download_list.effective_auto_download:
+            return
+
+        if item.status != DownloadListItemStatus.PENDING:
+            self.reset_list_item(name, term)
+
+        # Drop any existing queue entry for this item before placing it at the
+        # front, so it doesn't end up queued twice
+        self._queue = deque((n, t) for n, t in self._queue if not (n == name and t == term))
+        self._queue.appendleft((name, term))
+
+        self._kick_queue()
+
     def get_summary_rows(self, name):
 
         download_list = self.lists.get(name)

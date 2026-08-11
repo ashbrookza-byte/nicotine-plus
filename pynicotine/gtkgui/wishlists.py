@@ -606,6 +606,7 @@ class Wishlists:
 
         self.items_popup_menu = PopupMenu(window.application, self.items_view.widget)
         self.items_popup_menu.add_items(
+            ("#" + _("Start _Next"), self.on_start_next_item),
             ("#" + _("_Reset"), self.on_reset_item),
             ("", None),
             ("#" + _("_Remove"), self.on_remove_item)
@@ -961,6 +962,18 @@ class Wishlists:
                 callback_data=name
             ).present()
             return
+
+    def on_start_next_item(self, *_args):
+
+        if self.current_list_name is None:
+            return
+
+        # Selected rows are given in view (visual/sort) order, so working through
+        # them in reverse and always inserting at the front leaves the first
+        # selected row as the very next one dispatched
+        for iterator in reversed(list(self.items_view.get_selected_rows())):
+            term = self.items_view.get_row_value(iterator, "term")
+            core.download_lists.start_item_next(self.current_list_name, term)
 
     def on_reset_item(self, *_args):
 
