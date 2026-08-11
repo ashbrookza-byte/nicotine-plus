@@ -568,23 +568,26 @@ class DownloadListsTest(TestCase):
 
     def test_term_variants_no_change_for_simple_term(self):
         """A plain "Artist - Title" term with nothing to strip still gets the
-        artist-only fallback appended (see test_term_variants_artist_only_fallback)."""
+        artist-only and title-only fallbacks appended (see
+        test_term_variants_artist_and_title_only_fallback)."""
 
         variants = core.download_lists._get_term_variants("Solo Artist - Just A Title")
 
-        self.assertEqual(variants, ["Solo Artist - Just A Title", "Solo Artist"])
+        self.assertEqual(
+            variants, ["Solo Artist - Just A Title", "Solo Artist", "Just A Title"])
 
-    def test_term_variants_artist_only_fallback(self):
+    def test_term_variants_artist_and_title_only_fallback(self):
         """A combined "artist title" search can come back with fewer/no results
-        the same way it sometimes does manually, while just the artist name
-        often finds plenty from peers whose tags don't line up neatly with a
-        multi-word query. Candidates are still filtered against every word of
-        the original full term regardless (see _file_search_response), so
-        this can only narrow results further, never accept a wrong one."""
+        the same way it sometimes does manually, while just the artist name —
+        or just the title — often finds plenty from peers whose tags don't line
+        up neatly with a multi-word query. Which one actually works varies by
+        track, so both are tried. Candidates are still filtered against every
+        word of the original full term regardless (see _file_search_response),
+        so this can only narrow results further, never accept a wrong one."""
 
         variants = core.download_lists._get_term_variants("Tinlicker - Melancholia")
 
-        self.assertEqual(variants, ["Tinlicker - Melancholia", "Tinlicker"])
+        self.assertEqual(variants, ["Tinlicker - Melancholia", "Tinlicker", "Melancholia"])
 
     def test_term_variants_no_artist_only_fallback_without_separator(self):
         """A term with no "Artist - Title" separator has nothing to fall back to."""
@@ -749,11 +752,12 @@ class DownloadListsTest(TestCase):
 
         self.assertEqual(item.status, DownloadListItemStatus.NOT_FOUND)
 
-    def test_artist_only_fallback_is_used_during_escalation(self):
+    def test_artist_and_title_only_fallbacks_are_used_during_escalation(self):
         """A term with an "Artist - Title" separator escalates through the
-        artist-only fallback before finally being marked Not Found, and
-        candidates are still checked against every word of the full original
-        term — not just whatever text was actually sent to the network."""
+        artist-only, then title-only, fallback before finally being marked
+        Not Found, and candidates are still checked against every word of the
+        full original term — not just whatever text was actually sent to the
+        network — regardless of which fallback found them."""
 
         import time
 
@@ -777,7 +781,20 @@ class DownloadListsTest(TestCase):
 
         self.assertEqual(item.download_candidates, [])
 
-        # Second escalation: variants exhausted, waits out the remaining SEARCH_TIMEOUT
+        # Second escalation: falls back to searching "Melancholia" alone
+        core.download_lists._escalate_item("Artist Fallback List", "Tinlicker - Melancholia")
+
+        self.assertEqual(item.status, DownloadListItemStatus.SEARCHING)
+        self.assertEqual(item.searched_term, "Melancholia")
+
+        # A result matching only the title, not the artist, must still be rejected too
+        files = [(1, "@@abc\\Someone Else\\Melancholia.mp3", 8000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "otheruser", files)
+        core.download_lists._file_search_response(msg)
+
+        self.assertEqual(item.download_candidates, [])
+
+        # Third escalation: variants exhausted, waits out the remaining SEARCH_TIMEOUT
         core.download_lists._escalate_item("Artist Fallback List", "Tinlicker - Melancholia")
         self.assertEqual(item.status, DownloadListItemStatus.SEARCHING)
 

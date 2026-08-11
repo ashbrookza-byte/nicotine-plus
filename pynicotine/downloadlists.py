@@ -1213,17 +1213,25 @@ class DownloadLists:
             if no_extra_artists and no_extra_artists.lower() != variants[-1].lower():
                 variants.append(no_extra_artists)
 
-            # Last resort: search on the artist name alone. A combined "artist title"
-            # query can come back with fewer/no results, the same way it sometimes
-            # does when searching manually — while a broader artist-only search often
-            # turns up plenty from peers whose tags/filenames just don't line up
-            # neatly with a multi-word query. This is safe to try because matching
-            # still checks candidates against every word of the *original* full term
-            # (see _file_search_response), same as manually filtering broader results
-            # down with "Include text" afterwards — it can only narrow things further,
+            # Last resort: search on just the artist name, then just the title. A
+            # combined "artist title" query can come back with fewer/no results the
+            # same way it sometimes does when searching manually — while a broader
+            # single-part search often turns up plenty from peers whose tags/filenames
+            # just don't line up neatly with a multi-word query. Which one actually
+            # works varies by track (sometimes it's the artist alone, sometimes only
+            # the title alone finds anything — there's no way to know in advance), so
+            # both are tried. This is safe because matching still checks candidates
+            # against every word of the *original* full term (see
+            # _file_search_response), same as manually filtering broader results down
+            # with "Include text" afterwards — it can only narrow things further,
             # never accept a result that doesn't actually belong to the original term.
             if artist_part and artist_part.lower() != variants[-1].lower():
                 variants.append(artist_part)
+
+            title_part = title_part.strip()
+
+            if title_part and title_part.lower() not in (variant.lower() for variant in variants):
+                variants.append(title_part)
 
         return variants
 
