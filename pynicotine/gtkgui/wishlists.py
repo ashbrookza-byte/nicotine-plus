@@ -653,7 +653,7 @@ class Wishlists:
                 "progress": {
                     "column_type": "progress",
                     "title": _("Progress"),
-                    "width": 90
+                    "width": 110
                 },
                 "downloaded_file": {
                     "column_type": "text",
@@ -663,7 +663,7 @@ class Wishlists:
                 "match": {
                     "column_type": "number",
                     "title": _("Match %"),
-                    "width": 90
+                    "width": 100
                 },
                 "quality": {
                     "column_type": "text",
