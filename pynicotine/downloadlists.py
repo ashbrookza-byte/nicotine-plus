@@ -456,6 +456,19 @@ class DownloadLists:
         events.emit("update-download-list", name)
         self._save()
 
+    def update_watch_folder_settings(self, enabled, folder_path):
+        """Enable/disable and point the watch folder at a new location.
+
+        Takes effect on the next poll; snapshots are cleared so a folder
+        switch doesn't carry over stale state from the previous location.
+        """
+
+        config.sections["transfers"]["downloadlistwatchenabled"] = bool(enabled)
+        config.sections["transfers"]["downloadlistwatchfolder"] = folder_path or ""
+
+        self._watch_snapshots.clear()
+        config.write_configuration()
+
     def rename_list(self, old_name, new_name):
 
         new_name = new_name.strip()

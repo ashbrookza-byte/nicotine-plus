@@ -422,6 +422,25 @@ class DownloadListsTest(TestCase):
         self.assertNotIn("Wanted", core.download_lists.lists)
         self.assertTrue(os.path.isfile(os.path.join(watch_folder_path, "Wanted.txt")))
 
+    def test_update_watch_folder_settings(self):
+        """The UI-facing settings updater persists both config values and
+        clears stale snapshots so a folder switch takes effect immediately."""
+
+        watch_folder_path = self._set_up_watch_folder()
+        self._write_watch_file(watch_folder_path, "Wanted.txt", "Artist - Song\n")
+
+        core.download_lists._scan_watch_folder()
+        self.assertTrue(core.download_lists._watch_snapshots)
+
+        new_folder_path = os.path.join(DATA_FOLDER_PATH, "watch2")
+        os.makedirs(new_folder_path, exist_ok=True)
+
+        core.download_lists.update_watch_folder_settings(False, new_folder_path)
+
+        self.assertFalse(config.sections["transfers"]["downloadlistwatchenabled"])
+        self.assertEqual(config.sections["transfers"]["downloadlistwatchfolder"], new_folder_path)
+        self.assertEqual(core.download_lists._watch_snapshots, {})
+
     def test_watch_folder_ignores_non_list_files(self):
         """Files that are not song lists are left alone."""
 

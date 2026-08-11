@@ -38,6 +38,14 @@
                     <signal name="clicked" handler="on_add_list"/>
                   </object>
                 </child>
+                <child>
+                  <object class="GtkButton" id="wishlist_settings_button">
+                    <property name="label" translatable="yes">_Settings…</property>
+                    <property name="use-underline">True</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_wishlist_settings"/>
+                  </object>
+                </child>
               </object>
             </child>
             <child>

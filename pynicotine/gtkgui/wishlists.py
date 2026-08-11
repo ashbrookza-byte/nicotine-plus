@@ -169,6 +169,91 @@ class ListSettingsDialog(Dialog):
         self.close()
 
 
+class WishlistSettingsDialog(Dialog):
+    """Global wishlist settings: the watch folder that's polled for song
+    list files exported by other applications."""
+
+    def __init__(self, application, callback):
+
+        self.callback = callback
+
+        cancel_button = Gtk.Button(label=_("_Cancel"), use_underline=True, visible=True)
+        cancel_button.connect("clicked", self.on_cancel)
+
+        save_button = Gtk.Button(label=_("_Save"), use_underline=True, visible=True)
+        save_button.connect("clicked", self.on_save)
+        add_css_class(save_button, "suggested-action")
+
+        self.primary_container = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, width_request=340, visible=True,
+            margin_top=14, margin_bottom=14, margin_start=18, margin_end=18, spacing=18
+        )
+
+        super().__init__(
+            application=application,
+            content_box=self.primary_container,
+            buttons_start=(cancel_button,),
+            buttons_end=(save_button,),
+            default_button=save_button,
+            title=_("Wishlist Settings"),
+            width=420,
+            height=-1
+        )
+
+        self._add_watch_folder_option()
+
+    def destroy(self):
+        self.__dict__.clear()
+
+    def _append(self, widget):
+        if GTK_API_VERSION >= 4:
+            self.primary_container.append(widget)  # pylint: disable=no-member
+        else:
+            self.primary_container.add(widget)      # pylint: disable=no-member
+
+    def _add_watch_folder_option(self):
+
+        enabled = config.sections["transfers"]["downloadlistwatchenabled"]
+        folder_path = config.sections["transfers"]["downloadlistwatchfolder"]
+
+        toggle_row = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER, visible=True)
+        toggle_label = Gtk.Label(
+            label=_("Watch folder for song list files"), hexpand=True, wrap=True, xalign=0, visible=True,
+            tooltip_text=_("Periodically scan a folder for .txt/.csv song list files exported by other "
+                            "applications, and import them as songs to search for."))
+
+        self.watch_enabled_switch = Gtk.Switch(active=enabled, valign=Gtk.Align.CENTER, visible=True)
+        toggle_label.set_mnemonic_widget(self.watch_enabled_switch)
+
+        if GTK_API_VERSION >= 4:
+            toggle_row.append(toggle_label)          # pylint: disable=no-member
+            toggle_row.append(self.watch_enabled_switch)  # pylint: disable=no-member
+        else:
+            toggle_row.add(toggle_label)             # pylint: disable=no-member
+            toggle_row.add(self.watch_enabled_switch)  # pylint: disable=no-member
+
+        self._append(toggle_row)
+
+        folder_label = Gtk.Label(label=_("Folder to watch:"), wrap=True, xalign=0, visible=True)
+        self._append(folder_label)
+
+        folder_row = Gtk.Box(visible=True)
+        self._append(folder_row)
+
+        self.folder_chooser = FileChooserButton(folder_row, self.application, chooser_type="folder")
+
+        if folder_path:
+            self.folder_chooser.set_path(folder_path)
+
+    def on_cancel(self, *_args):
+        self.close()
+
+    def on_save(self, *_args):
+
+        self.callback(self.watch_enabled_switch.get_active(), self.folder_chooser.get_path())
+        self.close()
+
+
 class Wishlists:
 
     STATUS_LABELS = DownloadLists.STATUS_LABELS
@@ -186,6 +271,7 @@ class Wishlists:
             self.list_settings_button,
             self.lists_container,
             self.lists_pane,
+            self.wishlist_settings_button,
             self.wishlists_paned
         ) = self.widgets = ui.load(scope=self, path="wishlists.ui")
 
@@ -521,6 +607,12 @@ class Wishlists:
 
     def on_list_settings_saved(self, name, settings):
         core.download_lists.update_list_settings(name, **settings)
+
+    def on_wishlist_settings_saved(self, enabled, folder_path):
+        core.download_lists.update_watch_folder_settings(enabled, folder_path)
+
+    def on_wishlist_settings(self, *_args):
+        WishlistSettingsDialog(self.window.application, self.on_wishlist_settings_saved).present()
 
     def on_list_settings(self, *_args):
 
