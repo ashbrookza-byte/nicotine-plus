@@ -345,20 +345,24 @@ class SpotifyWatchTest(TestCase):
         self.assertIn("reconnecting", message)
         self.assertEqual(config.sections["spotify"]["watched_playlists"], [])
 
-    def test_add_watched_playlist_thread_403_diagnoses_playlist_specific_problem(self):
-        """When the token itself is fine (GET /me succeeds) but one
-        particular playlist still 403s, the diagnostic must say so instead
-        of suggesting to reconnect -- reconnecting wouldn't fix anything in
-        that case."""
+    def test_add_watched_playlist_thread_403_diagnoses_ownership_mismatch(self):
+        """The most likely real-world cause of a playlist-specific 403 (per
+        Spotify's Feb 2026 Development Mode changes): the playlist belongs
+        to someone other than the connected account. Once /me confirms the
+        connection itself is fine, an owner mismatch must be called out by
+        name instead of the generic "no further detail" fallback."""
 
         config.sections["spotify"]["refresh_token"] = "some-refresh-token"
 
-        def fake_api_get(path, params=None):  # noqa: ARG001
-            if path == "/playlists/abc123":
+        def fake_api_get(path, params=None):
+            if path == "/playlists/abc123" and params and params.get("fields") == "name":
                 raise SpotifyAPIError("nope", status=403)
 
+            if path == "/playlists/abc123":
+                return {"owner": {"id": "someone-else", "display_name": "Someone Else"}, "collaborative": False}
+
             if path == "/me":
-                return {"display_name": "Someone", "id": "someone", "product": "premium"}
+                return {"display_name": "Me", "id": "me-id", "product": "premium"}
 
             raise AssertionError(f"Unexpected path requested: {path}")
 
@@ -374,7 +378,29 @@ class SpotifyWatchTest(TestCase):
         success, message = results[0]
         self.assertFalse(success)
         self.assertIn("nope", message)
-        self.assertIn("specific to this particular playlist", message)
+        self.assertIn("Someone Else", message)
+
+    def test_diagnose_403_only_runs_once_per_playlist_per_session(self):
+        """The extra GET /me + ownership-check requests shouldn't repeat
+        every single time the same playlist keeps failing -- e.g. once per
+        POLL_INTERVAL, indefinitely, for a playlist that stays broken."""
+
+        call_count = 0
+
+        def fake_api_get(path, params=None):  # noqa: ARG001
+            nonlocal call_count
+            call_count += 1
+            return {"id": "me-id"}
+
+        with patch.object(SpotifyWatch, "_api_get", side_effect=fake_api_get):
+            first = core.spotify_watch._diagnose_403("abc123")
+            calls_after_first = call_count
+            second = core.spotify_watch._diagnose_403("abc123")
+
+        self.assertGreater(calls_after_first, 0)
+        self.assertEqual(call_count, calls_after_first, "second call must not make any more requests")
+        self.assertNotEqual(first, second)
+        self.assertIn("Already diagnosed", second)
 
     # Polling #
 

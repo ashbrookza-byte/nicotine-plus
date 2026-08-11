@@ -87,6 +87,15 @@ class SpotifyWatch:
     AUTH_CALLBACK_TIMEOUT = 120  # seconds to wait for the user to finish logging in
     POLL_INTERVAL = 120  # seconds between playlist checks
 
+    # Hard backstop on paginated fetches (playlist items, own-playlists list)
+    # -- at 50 per page this is 12,500 items, comfortably above Spotify's own
+    # 10,000-track playlist limit, so it only ever kicks in for a genuinely
+    # malformed/non-terminating "next" pointer, not a real large playlist.
+    # Runs on a background thread already, so this isn't about keeping the
+    # GUI responsive -- it's about not hammering Spotify's API forever on a
+    # response that never actually finishes
+    MAX_FETCH_PAGES = 250
+
     # Qualifiers meaning "shortened for radio play", e.g. "Song (Radio Edit)" or
     # "Song - Radio Edit" -- stripped from the search term when watch_ignore_radio_edit
     # is enabled, so normal matching (and the "prefer longer" download setting) finds
@@ -96,7 +105,10 @@ class SpotifyWatch:
         re.IGNORECASE
     )
 
-    __slots__ = ("_poll_timer_id", "_access_token", "_access_token_expires_at", "_pending_server")
+    __slots__ = (
+        "_poll_timer_id", "_access_token", "_access_token_expires_at", "_pending_server",
+        "_diagnosed_403_playlist_ids"
+    )
 
     def __init__(self):
 
@@ -104,6 +116,13 @@ class SpotifyWatch:
         self._access_token = None
         self._access_token_expires_at = 0
         self._pending_server = None
+
+        # Playlist IDs the 403 diagnostic (_diagnose_403) has already run the
+        # extra GET /me + owner-check requests for this session -- a
+        # playlist that keeps failing every POLL_INTERVAL shouldn't repeat
+        # those extra requests every single time; the answer isn't going to
+        # change until something is actually done about it
+        self._diagnosed_403_playlist_ids = set()
 
         for event_name, callback in (
             ("quit", self._quit),
@@ -233,7 +252,7 @@ class SpotifyWatch:
             message = error.message
 
             if error.status == 403:
-                message += self._diagnose_403()
+                message += self._diagnose_403(playlist_id)
 
             events.invoke_main_thread(result_callback, False, message)
             return
@@ -335,10 +354,18 @@ class SpotifyWatch:
         playlists = []
         path = "/me/playlists"
         params = {"limit": 50}
+        pages_fetched = 0
 
         try:
-            while path is not None:
+            # A hard cap, not just a performance nicety -- this loop runs on
+            # a background thread so it can't freeze the GUI directly, but
+            # an account with an unusually large library (or a malformed
+            # response whose "next" never actually advances) would otherwise
+            # keep it making blocking network requests indefinitely with no
+            # way for the user to know it's still working or cancel it
+            while path is not None and pages_fetched < self.MAX_FETCH_PAGES:
                 page = self._api_get(path, params=params)
+                pages_fetched += 1
 
                 for item in page.get("items", []):
                     if not item or not item.get("id"):
@@ -517,19 +544,45 @@ class SpotifyWatch:
         })
         return _("Connected as %s.") % display_name
 
-    def _diagnose_403(self):
-        """Appended to a playlist-specific 403's own message, to tell apart
-        two very differently-fixed problems that otherwise look identical:
-        the whole connection being broken (a bad/under-scoped token --
-        reconnecting fixes it) versus this one playlist specifically being
-        off-limits (a Spotify-side restriction this app can't work around
-        -- e.g. certain algorithmic/editorial playlists, or one belonging
-        to an account that hasn't granted access). A quick GET /me settles
-        which one it is: it uses the exact same token, so if /me works, the
-        token itself is fine and the problem is specific to this playlist."""
+    def _diagnose_403(self, playlist_id=None):
+        """Appended to a playlist-specific 403's own message. Spotify's own
+        error body for this one is maximally unhelpful -- literally just
+        {"error": {"status": 403, "message": "Forbidden"}}, confirmed live,
+        no WWW-Authenticate detail either -- so there's nothing more to
+        extract from the failed request itself. Two follow-up checks fill
+        that gap instead:
+
+        1. GET /me, to tell apart the whole connection being broken (a bad/
+           under-scoped token -- reconnecting fixes it) from this one
+           playlist specifically being off-limits. It uses the exact same
+           token, so if /me works, the token itself is fine.
+
+        2. If /me works and a playlist_id was given, GET that playlist's
+           owner and compare it against the connected account's own ID --
+           Spotify's Feb 2026 Development Mode changes restrict
+           /playlists/{id}/items to playlists the connected account owns
+           or collaborates on (https://developer.spotify.com/documentation/
+           web-api/tutorials/february-2026-migration-guide), so an owner
+           mismatch is the single most likely explanation once the token
+           itself checks out -- including for a playlist that looks like
+           "yours" in the Spotify app (e.g. one you followed/duplicated
+           rather than created).
+
+        Only runs its extra requests once per playlist per session -- the
+        periodic poll retries every playlist that's still failing on its
+        own regular schedule (POLL_INTERVAL), and there's no point re-asking
+        the same two questions every single time; the answer won't change
+        until something about the playlist, account, or app actually does."""
+
+        if playlist_id is not None and playlist_id in self._diagnosed_403_playlist_ids:
+            return _(" (Already diagnosed earlier this session -- see the log window above for the "
+                     "GET /me and ownership check results from the first time this playlist failed.)")
+
+        if playlist_id is not None:
+            self._diagnosed_403_playlist_ids.add(playlist_id)
 
         try:
-            self._api_get("/me")
+            me = self._api_get("/me")
 
         except SpotifyAPIError as error:
             log.add(_("Spotify: GET /me also failed after a playlist 403 -- connection-wide problem: %s"),
@@ -537,11 +590,51 @@ class SpotifyWatch:
             return _(" Your Spotify connection itself is also failing (GET /me: %s) -- "
                      "try reconnecting in Wishlist Settings.") % error.message
 
-        log.add(_("Spotify: GET /me succeeded after a playlist 403 -- problem is specific to that playlist"))
-        return _(" Your Spotify connection itself works fine (GET /me succeeded) -- this looks specific "
-                 "to this particular playlist, which Spotify's API is refusing to hand over to this app "
-                 "(this isn't something Nicotine+ can work around; check the log window for the exact "
-                 "response Spotify gave, including any WWW-Authenticate detail).")
+        log.add(_("Spotify: GET /me succeeded after a playlist 403 (connected as %s) -- "
+                   "checking playlist ownership next"), me.get("id", "?"))
+
+        if playlist_id is not None:
+            try:
+                playlist = self._api_get(
+                    f"/playlists/{playlist_id}", params={"fields": "owner.id,owner.display_name,collaborative"})
+
+            except SpotifyAPIError as error:
+                log.add(_("Spotify: couldn't fetch playlist owner for the 403 diagnostic: %s"), error.message)
+                playlist = None
+
+            if playlist is not None:
+                owner = playlist.get("owner") or {}
+                owner_id = owner.get("id")
+                is_own_or_collab = (owner_id == me.get("id")) or playlist.get("collaborative")
+
+                log.add(
+                    _("Spotify: playlist owner is %(owner)s (id: %(owner_id)s), connected account is "
+                      "%(me)s -- %(verdict)s"), {
+                        "owner": owner.get("display_name") or "?", "owner_id": owner_id or "?",
+                        "me": me.get("id", "?"),
+                        "verdict": "owned/collaborative, matches" if is_own_or_collab else "MISMATCH"
+                    }
+                )
+
+                if not is_own_or_collab:
+                    return _(
+                        " This playlist is owned by %(owner)s, not the connected Spotify account "
+                        "(%(me)s) -- as of Spotify's February 2026 Web API changes, Development Mode "
+                        "apps can only read the contents of a playlist the connected account owns or "
+                        "collaborates on, even if the playlist is public or shows up as one of \"your\" "
+                        "playlists in the Spotify app (e.g. one you followed or duplicated, rather than "
+                        "created). Reconnecting won't fix this -- it's specific to this playlist."
+                    ) % {
+                        "owner": owner.get("display_name") or owner_id or "?",
+                        "me": me.get("display_name") or me.get("id", "?")
+                    }
+
+        return _(" Your Spotify connection itself works fine (GET /me succeeded), and this playlist "
+                 "appears to belong to the connected account -- Spotify is still refusing to hand over "
+                 "its contents to this app for some other reason, with no further detail in its own "
+                 "response (see the log window for the exact request/response). This isn't something "
+                 "Nicotine+ can work around from here -- it likely needs Extended Quota Mode approval "
+                 "for this app via the Spotify Developer Dashboard.")
 
     def _token_request(self, data):
         """Raises SpotifyAPIError on any failure -- never returns None, so
@@ -716,10 +809,14 @@ class SpotifyWatch:
         # apps -- see https://developer.spotify.com/documentation/web-api/reference/get-playlists-items)
         path = f"/playlists/{playlist_id}/items"
         params = {"fields": "items(track(id,name,artists(name))),next", "limit": 50}
+        pages_fetched = 0
 
         try:
-            while path is not None:
+            # See MAX_FETCH_PAGES -- a backstop against a non-terminating
+            # "next" pointer, not a real limit on playlist size
+            while path is not None and pages_fetched < self.MAX_FETCH_PAGES:
                 page = self._api_get(path, params=params)
+                pages_fetched += 1
 
                 for item in page.get("items", []):
                     track = item.get("track")
@@ -742,8 +839,9 @@ class SpotifyWatch:
                 params = None
 
         except SpotifyAPIError as error:
-            log.add(_('Spotify: checking playlist "%(playlist)s" failed: %(error)s'), {
-                "playlist": list_name, "error": error.message
+            diagnostic = self._diagnose_403(playlist_id) if error.status == 403 else ""
+            log.add(_('Spotify: checking playlist "%(playlist)s" failed: %(error)s%(diagnostic)s'), {
+                "playlist": list_name, "error": error.message, "diagnostic": diagnostic
             })
             return
 
