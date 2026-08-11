@@ -455,6 +455,36 @@ class DownloadListsTest(TestCase):
         rows = core.download_lists.get_summary_rows("Live List")
         self.assertEqual(len(rows), 1)
 
+    def test_single_variant_term_is_not_marked_not_found_prematurely(self):
+        """A term with no bracket/feat/extra-artist clause to strip (e.g. a plain
+        "Artist - Title") has only one variant, so it exhausts it on the very first
+        escalation attempt. That must not immediately mark the item Not Found —
+        only reaching the full SEARCH_TIMEOUT with zero candidates should."""
+
+        import time
+
+        download_list = core.download_lists.add_list("Escalation List", auto_download=True)
+        core.download_lists.add_list_items("Escalation List", ["Tinlicker - Melancholia"])
+
+        item = download_list.items["Tinlicker - Melancholia"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        variants = core.download_lists._get_term_variants(item.term)
+        self.assertEqual(variants, ["Tinlicker - Melancholia"])
+
+        # First escalation attempt: the single variant is immediately exhausted, but
+        # since we're nowhere near SEARCH_TIMEOUT yet, the item must keep searching
+        core.download_lists._escalate_item("Escalation List", "Tinlicker - Melancholia")
+
+        self.assertEqual(item.status, DownloadListItemStatus.SEARCHING)
+        self.assertIsNotNone(item.escalation_timer_id)
+
+        # Simulate SEARCH_TIMEOUT having actually elapsed since dispatch
+        item.dispatch_time = time.time() - core.download_lists.SEARCH_TIMEOUT - 1
+        core.download_lists._escalate_item("Escalation List", "Tinlicker - Melancholia")
+
+        self.assertEqual(item.status, DownloadListItemStatus.NOT_FOUND)
+
     def test_stalled_download_is_abandoned_and_requeued(self):
         """A download whose transfer speed never reaches the minimum threshold is
         abandoned once its stall timer fires, and the item is re-queued to search

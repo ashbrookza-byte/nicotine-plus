@@ -63,7 +63,7 @@ class DownloadListItem:
         "term", "list_name", "time_added", "status", "searched_term", "token",
         "download_username", "download_virtual_path", "download_size", "download_attributes",
         "download_candidates", "variant_index", "collect_timer_id", "escalation_timer_id",
-        "download_percent", "stall_timer_id"
+        "download_percent", "stall_timer_id", "dispatch_time"
     )
 
     def __init__(self, term, list_name, time_added=None, status=DownloadListItemStatus.PENDING,
@@ -94,6 +94,7 @@ class DownloadListItem:
         self.escalation_timer_id = None
         self.download_percent = 100 if status == DownloadListItemStatus.COMPLETED else 0
         self.stall_timer_id = None
+        self.dispatch_time = None
 
     @property
     def h_quality(self):
@@ -297,6 +298,13 @@ class DownloadLists:
 
     # How long to wait for results before broadening an item's search term
     ESCALATION_DELAY = 10
+
+    # Total time to keep waiting for at least one result before giving up as
+    # Not Found. Search responses can keep trickling in well past ESCALATION_DELAY,
+    # and a term with no bracket/feat/extra-artist clause to strip (e.g. a plain
+    # "Artist - Title") has nothing left to broaden to after the very first
+    # escalation attempt, so it must not give up right there
+    SEARCH_TIMEOUT = 45
 
     # A download whose transfer speed stays below MIN_TRANSFER_SPEED for this long
     # (whether it's stuck at 0% or just crawling) is abandoned and searched again
@@ -1019,6 +1027,7 @@ class DownloadLists:
         item.searched_term = item.term
         item.variant_index = 0
         item.download_candidates = []
+        item.dispatch_time = time.time()
 
         item.token = self._next_token()
         self._token_map[item.token] = (download_list.name, item.term)
@@ -1091,13 +1100,24 @@ class DownloadLists:
         item.variant_index += 1
 
         if item.variant_index >= len(variants):
-            # Exhausted all simplified variants without any acceptable matches
-            item.status = DownloadListItemStatus.NOT_FOUND
-            self._forget_search(item)
+            # Out of simplified variants to try, but that doesn't mean give up yet — a
+            # term with nothing to broaden (e.g. a plain "Artist - Title") exhausts its
+            # single variant on the very first escalation attempt, well before
+            # SEARCH_TIMEOUT, and slower peers can still respond to it after that
+            elapsed = time.time() - (item.dispatch_time or time.time())
+            remaining = self.SEARCH_TIMEOUT - elapsed
 
-            events.emit("update-download-list-item", list_name, term)
-            self._save()
-            self._check_list_complete(list_name)
+            if remaining <= 0:
+                item.status = DownloadListItemStatus.NOT_FOUND
+                self._forget_search(item)
+
+                events.emit("update-download-list-item", list_name, term)
+                self._save()
+                self._check_list_complete(list_name)
+                return
+
+            item.escalation_timer_id = events.schedule(
+                delay=remaining, callback=lambda: self._escalate_item(list_name, term))
             return
 
         next_text = variants[item.variant_index]
