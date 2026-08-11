@@ -658,12 +658,12 @@ class Wishlists:
                 "downloaded_file": {
                     "column_type": "text",
                     "title": _("Downloaded File"),
-                    "width": 160
+                    "width": 200
                 },
                 "match": {
                     "column_type": "number",
                     "title": _("Match %"),
-                    "width": 80
+                    "width": 90
                 },
                 "quality": {
                     "column_type": "text",

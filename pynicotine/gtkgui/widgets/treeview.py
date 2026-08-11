@@ -321,7 +321,7 @@ class TreeView:
             if column_type == "text":
                 renderer = Gtk.CellRendererText(
                     mode=mode, single_paragraph_mode=True, attributes=attributes, xpad=width_padding,
-                    ypad=height_padding
+                    ypad=height_padding, ellipsize=Pango.EllipsizeMode.END
                 )
                 column = Gtk.TreeViewColumn(title=title, cell_renderer=renderer, text=column_index)
                 text_underline_column = column_data.get("text_underline_column")
@@ -386,6 +386,7 @@ class TreeView:
 
             title_container = next(iter(column_header))
             title_widget = next(iter(title_container)) if xalign < 1 else list(title_container)[-1]
+            title_widget.set_ellipsize(Pango.EllipsizeMode.END)
 
             if column_data.get("hide_header"):
                 title_widget.set_visible(False)
