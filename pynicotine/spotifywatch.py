@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Nicotine+ Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Watches a Spotify playlist and adds newly added tracks to a wishlist,
-the same way Watch Folder adds songs from exported .txt files -- just
-sourced from a Spotify playlist instead.
+"""Watches one or more Spotify playlists and adds newly added tracks to a
+wishlist each, the same way Watch Folder adds songs from exported .txt
+files -- just sourced from Spotify playlists instead.
 
 Requires the user's own Spotify Developer app (client ID/secret from
 https://developer.spotify.com/dashboard) -- there's no way around that,
@@ -13,7 +13,8 @@ a one-time OAuth login (see begin_authorization): the user's browser opens
 Spotify's own login/consent page (Nicotine+ never sees their Spotify
 password), and a short-lived local HTTP server catches the resulting
 redirect so the login flow can complete without a browser extension or
-manual copy-pasting."""
+manual copy-pasting. Once connected, any playlist can be watched -- the
+user's own (browsable via fetch_own_playlists) or someone else's, by URL."""
 
 import base64
 import json
@@ -60,6 +61,17 @@ class _AuthorizationCallbackHandler(BaseHTTPRequestHandler):
         """Silence BaseHTTPRequestHandler's default per-request console log."""
 
 
+class SpotifyAPIError(Exception):
+    """A Spotify API request failed. message is already formatted for
+    display; status is the HTTP status code, or None for a connection-level
+    failure (DNS, timeout, offline, ...) that never got a response at all."""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
 class SpotifyWatch:
 
     AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
@@ -103,18 +115,29 @@ class SpotifyWatch:
 
     def _start(self):
 
-        if self.is_watch_enabled():
+        if self.has_watched_playlists():
             self._poll_timer_id = events.schedule(
-                delay=self.POLL_INTERVAL, callback=self._poll_playlist, repeat=True)
+                delay=self.POLL_INTERVAL, callback=self._poll_playlists, repeat=True)
 
             # Also check shortly after startup, rather than waiting a full POLL_INTERVAL
-            events.schedule(delay=5, callback=self._poll_playlist)
+            events.schedule(delay=5, callback=self._poll_playlists)
 
     def _quit(self):
         events.cancel_scheduled(self._poll_timer_id)
         self._shutdown_pending_server()
 
-    # Credentials / settings #
+    def _ensure_polling(self):
+        """(Re)start the periodic poll timer if there's now at least one
+        watched playlist and it isn't already running; called after any
+        change that could take the watched list from empty to non-empty."""
+
+        if self._poll_timer_id is not None or not self.has_watched_playlists():
+            return
+
+        self._poll_timer_id = events.schedule(
+            delay=self.POLL_INTERVAL, callback=self._poll_playlists, repeat=True)
+
+    # Credentials #
 
     @staticmethod
     def has_credentials():
@@ -125,45 +148,107 @@ class SpotifyWatch:
     def is_authorized():
         return bool(config.sections["spotify"]["refresh_token"])
 
-    @staticmethod
-    def is_watch_enabled():
-        section = config.sections["spotify"]
-        return bool(section["watch_enabled"] and section["watch_playlist_id"])
-
     def update_credentials(self, client_id, client_secret):
         config.sections["spotify"]["client_id"] = client_id.strip()
         config.sections["spotify"]["client_secret"] = client_secret.strip()
         config.write_configuration()
 
-    def update_watch_settings(self, enabled, playlist_url_or_id, ignore_radio_edit):
-        """enabled/ignore_radio_edit are plain booleans; playlist_url_or_id
-        accepts a bare playlist ID, a spotify:playlist:<id> URI, or an
-        open.spotify.com/playlist/<id> URL."""
+    # Watched playlists #
 
-        previous_playlist_id = config.sections["spotify"]["watch_playlist_id"]
-        playlist_id = self._extract_playlist_id(playlist_url_or_id) or ""
+    @staticmethod
+    def has_watched_playlists():
+        return bool(config.sections["spotify"]["watched_playlists"])
 
-        config.sections["spotify"]["watch_enabled"] = bool(enabled)
-        config.sections["spotify"]["watch_playlist_id"] = playlist_id
+    @staticmethod
+    def get_watched_playlists():
+        """A read-only-in-spirit snapshot -- [{"playlist_id", "list_name"}, ...],
+        in the order they were added. Callers should treat this as a copy;
+        use add_watched_playlist/remove_watched_playlist to make changes."""
+
+        return [
+            {"playlist_id": entry["playlist_id"], "list_name": entry["list_name"]}
+            for entry in config.sections["spotify"]["watched_playlists"]
+        ]
+
+    def update_ignore_radio_edit(self, ignore_radio_edit):
         config.sections["spotify"]["watch_ignore_radio_edit"] = bool(ignore_radio_edit)
-
-        if playlist_id != previous_playlist_id:
-            # Watching a different playlist now -- forget what we'd already imported
-            # from whatever was watched before, so the new one starts from scratch
-            config.sections["spotify"]["watch_seen_track_ids"] = []
-
         config.write_configuration()
 
-        events.cancel_scheduled(self._poll_timer_id)
-        self._poll_timer_id = None
+    def remove_watched_playlist(self, playlist_id):
 
-        if self.is_watch_enabled():
-            self._poll_timer_id = events.schedule(
-                delay=self.POLL_INTERVAL, callback=self._poll_playlist, repeat=True)
-            events.schedule(delay=1, callback=self._poll_playlist)
+        watched = config.sections["spotify"]["watched_playlists"]
+        new_watched = [entry for entry in watched if entry["playlist_id"] != playlist_id]
+
+        if len(new_watched) == len(watched):
+            return
+
+        config.sections["spotify"]["watched_playlists"] = new_watched
+        config.write_configuration()
+
+        if not new_watched:
+            events.cancel_scheduled(self._poll_timer_id)
+            self._poll_timer_id = None
+
+    def add_watched_playlist(self, playlist_url_or_id, result_callback):
+        """Starts watching a playlist -- the user's own, or anyone else's, as
+        long as it's readable with the scopes this app requested. Creates a
+        wishlist named after the playlist (if one by that name doesn't
+        already exist) and does an immediate poll to import its current
+        contents. result_callback(success, message_or_list_name) is invoked
+        on the main thread once the playlist's name has been looked up (or
+        the attempt has failed) -- safe to update GTK widgets from directly."""
+
+        if not self.is_authorized():
+            result_callback(False, _("Connect to Spotify first."))
+            return
+
+        playlist_id = self._extract_playlist_id(playlist_url_or_id)
+
+        if not playlist_id:
+            result_callback(False, _("That doesn't look like a Spotify playlist URL or ID."))
+            return
+
+        if any(entry["playlist_id"] == playlist_id
+               for entry in config.sections["spotify"]["watched_playlists"]):
+            result_callback(False, _("Already watching this playlist."))
+            return
+
+        thread = threading.Thread(
+            target=self._add_watched_playlist_thread, args=(playlist_id, result_callback), daemon=True)
+        thread.start()
+
+    def _add_watched_playlist_thread(self, playlist_id, result_callback):
+
+        try:
+            playlist = self._api_get(f"/playlists/{playlist_id}", params={"fields": "name"})
+
+        except SpotifyAPIError as error:
+            events.invoke_main_thread(result_callback, False, error.message)
+            return
+
+        list_name = playlist.get("name") or playlist_id
+
+        entry = {
+            "playlist_id": playlist_id,
+            "list_name": list_name,
+            "seen_track_ids": []
+        }
+        config.sections["spotify"]["watched_playlists"].append(entry)
+        config.write_configuration()
+
+        events.invoke_main_thread(self._ensure_polling)
+        events.invoke_main_thread(result_callback, True, list_name)
+
+        # Import whatever's already in the playlist right away, rather than
+        # waiting up to POLL_INTERVAL for the first check. We're already on
+        # a background thread here, so call the network-bound method
+        # directly instead of _poll_playlists (which would spawn another one)
+        self._poll_single_playlist(entry)
 
     @staticmethod
     def _extract_playlist_id(playlist_url_or_id):
+        """Accepts a bare playlist ID, a spotify:playlist:<id> URI, or an
+        open.spotify.com/playlist/<id> URL, and returns just the ID."""
 
         text = (playlist_url_or_id or "").strip()
 
@@ -182,6 +267,50 @@ class SpotifyWatch:
             return text
 
         return None
+
+    # Browsing the user's own playlists #
+
+    def fetch_own_playlists(self, result_callback):
+        """Fetches every playlist in the connected account's own library
+        (owned or followed), for a picker UI to choose from -- a lower-
+        friction alternative to pasting a URL for the common case of
+        watching one of the user's own playlists. result_callback(playlists,
+        error_message) is invoked on the main thread; exactly one of the two
+        arguments is None. playlists is [{"id", "name", "owner"}, ...]."""
+
+        if not self.is_authorized():
+            result_callback(None, _("Connect to Spotify first."))
+            return
+
+        thread = threading.Thread(target=self._fetch_own_playlists_thread, args=(result_callback,), daemon=True)
+        thread.start()
+
+    def _fetch_own_playlists_thread(self, result_callback):
+
+        playlists = []
+        path = "/me/playlists"
+        params = {"limit": 50}
+
+        try:
+            while path is not None:
+                page = self._api_get(path, params=params)
+
+                for item in page.get("items", []):
+                    if not item or not item.get("id"):
+                        continue
+
+                    owner = (item.get("owner") or {}).get("display_name") or ""
+                    playlists.append({"id": item["id"], "name": item.get("name") or item["id"], "owner": owner})
+
+                path = page.get("next")
+                params = None
+
+        except SpotifyAPIError as error:
+            events.invoke_main_thread(result_callback, None, error.message)
+            return
+
+        playlists.sort(key=lambda playlist: playlist["name"].lower())
+        events.invoke_main_thread(result_callback, playlists, None)
 
     # OAuth #
 
@@ -285,9 +414,9 @@ class SpotifyWatch:
         try:
             response = self._token_request(data)
 
-        except (urllib.error.URLError, OSError, ValueError) as error:
+        except SpotifyAPIError as error:
             events.invoke_main_thread(
-                result_callback, False, _("Couldn't complete Spotify login: %s") % error)
+                result_callback, False, _("Couldn't complete Spotify login: %s") % error.message)
             return
 
         refresh_token = response.get("refresh_token")
@@ -303,8 +432,11 @@ class SpotifyWatch:
         self._access_token_expires_at = time.time() + response.get("expires_in", 3600) - 30
 
         events.invoke_main_thread(result_callback, True, _("Connected to Spotify."))
+        events.invoke_main_thread(self._ensure_polling)
 
     def _token_request(self, data):
+        """Raises SpotifyAPIError on any failure -- never returns None, so
+        callers don't need a None-check on top of the except clause."""
 
         client_id = config.sections["spotify"]["client_id"]
         client_secret = config.sections["spotify"]["client_secret"]
@@ -318,8 +450,7 @@ class SpotifyWatch:
             }
         )
 
-        with urllib.request.urlopen(request, timeout=15) as handle:  # noqa: S310 (fixed https:// URL above)
-            return json.loads(handle.read().decode("utf-8"))
+        return self._send_request(request)
 
     def _ensure_access_token(self):
 
@@ -339,8 +470,8 @@ class SpotifyWatch:
         try:
             response = self._token_request(data)
 
-        except (urllib.error.URLError, OSError, ValueError) as error:
-            log.add(_("Spotify: couldn't refresh access token: %s"), error)
+        except SpotifyAPIError as error:
+            log.add(_("Spotify: couldn't refresh access token: %s"), error.message)
             return None
 
         self._access_token = response.get("access_token")
@@ -353,12 +484,54 @@ class SpotifyWatch:
 
         return self._access_token
 
+    @staticmethod
+    def _send_request(request):
+        """Performs an HTTP request and returns the parsed JSON body, or
+        raises SpotifyAPIError with a message that includes Spotify's own
+        explanation (its error responses are JSON: {"error": {"status",
+        "message"}}), not just the bare HTTP status -- needed to tell apart
+        e.g. a bad/expired token from a playlist Spotify's API restricts
+        third-party apps from reading at all, which are both plain 403s
+        otherwise."""
+
+        try:
+            with urllib.request.urlopen(request, timeout=15) as handle:  # noqa: S310 (fixed https:// URLs only)
+                return json.loads(handle.read().decode("utf-8"))
+
+        except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", "replace")
+            detail = body
+
+            try:
+                parsed = json.loads(body)
+                detail = (
+                    parsed.get("error", {}).get("message")
+                    or parsed.get("error_description")
+                    or parsed.get("error")
+                    or body
+                )
+            except (ValueError, AttributeError):
+                pass
+
+            log.add(_("Spotify: request failed (%(status)s): %(detail)s"), {"status": error.code, "detail": body})
+            raise SpotifyAPIError(
+                _("Spotify error %(status)s: %(detail)s") % {"status": error.code, "detail": detail},
+                status=error.code
+            ) from error
+
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            raise SpotifyAPIError(_("Couldn't reach Spotify: %s") % error) from error
+
     def _api_get(self, path, params=None):
+        """Raises SpotifyAPIError on any failure, including "not logged in"
+        (no access token available) -- callers that loop over multiple
+        playlists catch this per-playlist so one failure doesn't abort the
+        rest; callers doing a single lookup let it propagate."""
 
         access_token = self._ensure_access_token()
 
         if access_token is None:
-            return None
+            raise SpotifyAPIError(_("Not connected to Spotify."))
 
         url = path if path.startswith("http") else self.API_BASE_URL + path
 
@@ -366,67 +539,86 @@ class SpotifyWatch:
             url += "?" + urllib.parse.urlencode(params)
 
         request = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
-
-        try:
-            with urllib.request.urlopen(request, timeout=15) as handle:  # noqa: S310 (fixed https:// URL above)
-                return json.loads(handle.read().decode("utf-8"))
-
-        except (urllib.error.URLError, OSError, ValueError) as error:
-            log.add(_("Spotify: request to %(path)s failed: %(error)s"), {"path": path, "error": error})
-            return None
+        return self._send_request(request)
 
     # Playlist polling #
 
-    def _poll_playlist(self):
+    def _poll_playlists(self):
+        """Scheduled (see _start/_ensure_polling) callbacks always run on the
+        main thread (events.schedule -> invoke_main_thread), but the actual
+        polling below makes blocking network calls -- doing that here would
+        freeze the whole UI for however long Spotify takes to respond, once
+        per playlist, every POLL_INTERVAL. Hand the real work off to a
+        background thread instead; _poll_single_playlist marshals back to
+        the main thread only for the one part that actually needs it
+        (updating a wishlist, which touches GTK via events)."""
 
-        if not self.is_watch_enabled() or not self.is_authorized():
+        if not self.is_authorized():
             return
 
-        playlist_id = config.sections["spotify"]["watch_playlist_id"]
-        playlist = self._api_get(f"/playlists/{playlist_id}", params={"fields": "name"})
+        thread = threading.Thread(target=self._poll_playlists_thread, daemon=True)
+        thread.start()
 
-        if playlist is None:
-            return
+    def _poll_playlists_thread(self):
+        for entry in list(config.sections["spotify"]["watched_playlists"]):
+            self._poll_single_playlist(entry)
 
-        list_name = playlist.get("name") or playlist_id
-        seen_track_ids = set(config.sections["spotify"]["watch_seen_track_ids"])
+    def _poll_single_playlist(self, entry):
+        """Runs on a background thread (see _poll_playlists/
+        _add_watched_playlist_thread) -- must not touch GTK directly."""
+
+        playlist_id = entry["playlist_id"]
+        list_name = entry["list_name"]
+        seen_track_ids = set(entry.get("seen_track_ids", []))
         new_terms = []
         current_track_ids = []
 
         path = f"/playlists/{playlist_id}/tracks"
         params = {"fields": "items(track(id,name,artists(name))),next", "limit": 100}
 
-        while path is not None:
-            page = self._api_get(path, params=params)
+        try:
+            while path is not None:
+                page = self._api_get(path, params=params)
 
-            if page is None:
-                break
+                for item in page.get("items", []):
+                    track = item.get("track")
 
-            for entry in page.get("items", []):
-                track = entry.get("track")
+                    if not track or not track.get("id"):
+                        continue
 
-                if not track or not track.get("id"):
-                    continue
+                    current_track_ids.append(track["id"])
 
-                current_track_ids.append(track["id"])
+                    if track["id"] in seen_track_ids:
+                        continue
 
-                if track["id"] in seen_track_ids:
-                    continue
+                    term = self._build_search_term(track)
 
-                term = self._build_search_term(track)
+                    if term:
+                        new_terms.append(term)
 
-                if term:
-                    new_terms.append(term)
+                # "next" is already a complete URL for the following page, or None if done
+                path = page.get("next")
+                params = None
 
-            # "next" is already a complete URL for the following page, or None if done
-            path = page.get("next")
-            params = None
+        except SpotifyAPIError as error:
+            log.add(_('Spotify: checking playlist "%(playlist)s" failed: %(error)s'), {
+                "playlist": list_name, "error": error.message
+            })
+            return
 
-        config.sections["spotify"]["watch_seen_track_ids"] = current_track_ids
+        entry["seen_track_ids"] = current_track_ids
         config.write_configuration()
 
         if not new_terms:
             return
+
+        events.invoke_main_thread(self._apply_new_tracks, list_name, new_terms)
+
+    @staticmethod
+    def _apply_new_tracks(list_name, new_terms):
+        """The one part of polling that must run on the main thread: adding
+        to (and possibly creating) a wishlist goes through core.download_lists,
+        which emits events the GUI listens to and updates widgets from."""
 
         from pynicotine.core import core
 

@@ -464,14 +464,15 @@ class Config:
                 # Obtained via the one-time OAuth login (SpotifyWatch.begin_authorization);
                 # used afterwards to silently mint fresh access tokens without logging in again
                 "refresh_token": "",
-                "watch_enabled": False,
-                "watch_playlist_id": "",
                 # Prefer the Extended/Original version over a track's Radio Edit -- strips
                 # "(Radio Edit)"-style qualifiers from the search term built for each new track
                 "watch_ignore_radio_edit": True,
-                # Track IDs already imported from the watched playlist, so a track removed from
-                # the wishlist on purpose isn't silently re-added on the next poll
-                "watch_seen_track_ids": []
+                # One or more playlists being watched: [{"playlist_id", "list_name",
+                # "seen_track_ids"}, ...]. seen_track_ids is per playlist (not just
+                # in-memory like Watch Folder's snapshot) since tracks stay in a
+                # playlist forever instead of being moved out after import, so
+                # restart-safety requires remembering what's already been handled
+                "watched_playlists": []
             }
         }
 

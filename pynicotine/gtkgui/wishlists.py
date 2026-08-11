@@ -307,6 +307,7 @@ class WishlistSettingsDialog(Dialog):
         self._add_stall_settings_options()
 
     def destroy(self):
+        self.spotify_playlists_view.destroy()
         self.__dict__.clear()
 
     def _append(self, widget):
@@ -585,36 +586,6 @@ class WishlistSettingsDialog(Dialog):
 
         self._append(connect_row)
 
-        toggle_row = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER, visible=True)
-        toggle_label = Gtk.Label(
-            label=_("Watch a playlist for new songs"), hexpand=True, wrap=True, xalign=0, visible=True,
-            tooltip_text=_("Periodically check a Spotify playlist and add any newly added tracks as "
-                            "songs to search for — the same way Watch Folder does for exported song "
-                            "list files, just sourced from Spotify instead. New tracks go to a list "
-                            "named after the playlist, created automatically if needed."))
-
-        self.spotify_watch_enabled_switch = Gtk.Switch(
-            active=spotify["watch_enabled"], valign=Gtk.Align.CENTER, visible=True)
-        toggle_label.set_mnemonic_widget(self.spotify_watch_enabled_switch)
-
-        if GTK_API_VERSION >= 4:
-            toggle_row.append(toggle_label)                       # pylint: disable=no-member
-            toggle_row.append(self.spotify_watch_enabled_switch)  # pylint: disable=no-member
-        else:
-            toggle_row.add(toggle_label)                          # pylint: disable=no-member
-            toggle_row.add(self.spotify_watch_enabled_switch)     # pylint: disable=no-member
-
-        self._append(toggle_row)
-
-        playlist_label = Gtk.Label(label=_("Playlist URL or ID:"), wrap=True, xalign=0, visible=True)
-        self._append(playlist_label)
-
-        self.spotify_playlist_entry = Gtk.Entry(
-            hexpand=True, visible=True, text=spotify["watch_playlist_id"],
-            placeholder_text=_("e.g. https://open.spotify.com/playlist/…"))
-        playlist_label.set_mnemonic_widget(self.spotify_playlist_entry)
-        self._append(self.spotify_playlist_entry)
-
         self.spotify_ignore_radio_edit_switch = Gtk.Switch(
             active=spotify["watch_ignore_radio_edit"], valign=Gtk.Align.CENTER, visible=True)
         self._labeled_row(
@@ -625,6 +596,78 @@ class WishlistSettingsDialog(Dialog):
                             "requiring the shortened radio one. A version is still downloaded even if "
                             "no Extended/Original is found — this only affects which one is preferred.")
         )
+
+        playlists_label = Gtk.Label(
+            label=_("Watched playlists:"), wrap=True, xalign=0, visible=True,
+            tooltip_text=_("Any track added to one of these playlists is added as a song to search "
+                            "for, in a wishlist named after the playlist. You can watch as many "
+                            "playlists as you like, your own or someone else's."))
+        self._append(playlists_label)
+
+        self.spotify_playlists_container = Gtk.ScrolledWindow(
+            hexpand=True, min_content_height=120, max_content_height=160,
+            hscrollbar_policy=Gtk.PolicyType.NEVER, vscrollbar_policy=Gtk.PolicyType.AUTOMATIC, visible=True)
+        self._append(self.spotify_playlists_container)
+
+        self.spotify_playlists_view = TreeView(
+            self.application.window, parent=self.spotify_playlists_container,
+            columns={
+                "playlist_id": {
+                    "iterator_key": True
+                },
+                "name": {
+                    "column_type": "text",
+                    "title": _("Playlist"),
+                    "expand_column": True
+                }
+            }
+        )
+        playlists_label.set_mnemonic_widget(self.spotify_playlists_view.widget)
+        self._populate_spotify_playlists()
+
+        watched_buttons_row = Gtk.Box(spacing=6, visible=True)
+        self._append(watched_buttons_row)
+
+        add_playlist_button = Gtk.Button(label=_("_Add Playlist to Watch…"), use_underline=True, visible=True)
+        add_playlist_button.connect("clicked", self.on_add_spotify_playlist)
+
+        remove_playlist_button = Gtk.Button(label=_("_Remove"), use_underline=True, visible=True)
+        remove_playlist_button.connect("clicked", self.on_remove_spotify_playlist)
+
+        if GTK_API_VERSION >= 4:
+            watched_buttons_row.append(add_playlist_button)     # pylint: disable=no-member
+            watched_buttons_row.append(remove_playlist_button)  # pylint: disable=no-member
+        else:
+            watched_buttons_row.add(add_playlist_button)        # pylint: disable=no-member
+            watched_buttons_row.add(remove_playlist_button)     # pylint: disable=no-member
+
+    def _populate_spotify_playlists(self):
+
+        self.spotify_playlists_view.freeze()
+        self.spotify_playlists_view.clear()
+
+        for playlist in core.spotify_watch.get_watched_playlists():
+            self.spotify_playlists_view.add_row(
+                [playlist["playlist_id"], playlist["list_name"]], select_row=False)
+
+        self.spotify_playlists_view.unfreeze()
+
+    def on_spotify_playlist_added(self, _list_name):
+        self._populate_spotify_playlists()
+
+    def on_add_spotify_playlist(self, *_args):
+        SpotifyPlaylistPickerDialog(self.application, self.on_spotify_playlist_added).present()
+
+    def on_remove_spotify_playlist(self, *_args):
+
+        iterator = next(self.spotify_playlists_view.get_selected_rows(), None)
+
+        if iterator is None:
+            return
+
+        playlist_id = self.spotify_playlists_view.get_row_value(iterator, "playlist_id")
+        core.spotify_watch.remove_watched_playlist(playlist_id)
+        self._populate_spotify_playlists()
 
     def _spotify_status_text(self):
 
@@ -672,11 +715,273 @@ class WishlistSettingsDialog(Dialog):
             max_concurrent=self.max_concurrent_spinner.get_value_as_int(),
             spotify_client_id=self.spotify_client_id_entry.get_text().strip(),
             spotify_client_secret=self.spotify_client_secret_entry.get_text().strip(),
-            spotify_watch_enabled=self.spotify_watch_enabled_switch.get_active(),
-            spotify_playlist=self.spotify_playlist_entry.get_text().strip(),
             spotify_ignore_radio_edit=self.spotify_ignore_radio_edit_switch.get_active()
         )
         self.close()
+
+
+class SpotifyPlaylistPickerDialog(Dialog):
+    """Pick a Spotify playlist to watch -- either by browsing the connected
+    account's own playlists (fetched live), or by pasting the URL/ID of any
+    playlist, including one that isn't the user's own. Used both from
+    Wishlist Settings ("Add Playlist to Watch…") and from Add List ("Add
+    from Spotify Playlist…") -- in both places, picking a playlist starts
+    watching it and creates a wishlist named after it, identically."""
+
+    def __init__(self, application, on_playlist_added):
+
+        self.on_playlist_added = on_playlist_added
+
+        close_button = Gtk.Button(label=_("_Close"), use_underline=True, visible=True)
+        close_button.connect("clicked", self.on_close)
+
+        self.primary_container = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, width_request=420, visible=True,
+            margin_top=14, margin_bottom=14, margin_start=18, margin_end=18, spacing=12
+        )
+
+        super().__init__(
+            application=application,
+            content_box=self.primary_container,
+            buttons_end=(close_button,),
+            default_button=close_button,
+            title=_("Watch a Spotify Playlist"),
+            width=460,
+            height=480
+        )
+
+        url_label = Gtk.Label(
+            label=_("Playlist URL or ID (any playlist, not just your own):"),
+            wrap=True, xalign=0, visible=True)
+        self._append(url_label)
+
+        url_row = Gtk.Box(spacing=6, visible=True)
+        self._append(url_row)
+
+        self.url_entry = Gtk.Entry(
+            hexpand=True, visible=True, placeholder_text=_("e.g. https://open.spotify.com/playlist/…"))
+        self.url_entry.connect("activate", self.on_watch_url)
+        url_label.set_mnemonic_widget(self.url_entry)
+
+        watch_button = Gtk.Button(label=_("_Watch"), use_underline=True, visible=True)
+        watch_button.connect("clicked", self.on_watch_url)
+
+        if GTK_API_VERSION >= 4:
+            url_row.append(self.url_entry)    # pylint: disable=no-member
+            url_row.append(watch_button)      # pylint: disable=no-member
+        else:
+            url_row.add(self.url_entry)       # pylint: disable=no-member
+            url_row.add(watch_button)         # pylint: disable=no-member
+
+        self.status_label = Gtk.Label(wrap=True, xalign=0, visible=False)
+        self._append(self.status_label)
+
+        self._append(Gtk.Separator(visible=True))
+
+        own_label = Gtk.Label(label=_("Or pick one of your own playlists:"), wrap=True, xalign=0, visible=True)
+        self._append(own_label)
+
+        self.playlists_container = Gtk.ScrolledWindow(
+            hexpand=True, vexpand=True, visible=True,
+            hscrollbar_policy=Gtk.PolicyType.NEVER, vscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
+        self._append(self.playlists_container)
+
+        self.playlists_view = TreeView(
+            application.window, parent=self.playlists_container,
+            columns={
+                "id": {
+                    "iterator_key": True
+                },
+                "name": {
+                    "column_type": "text",
+                    "title": _("Playlist"),
+                    "expand_column": True
+                },
+                "owner": {
+                    "column_type": "text",
+                    "title": _("Owner"),
+                    "width": 120
+                }
+            },
+            activate_row_callback=self.on_playlist_row_activated
+        )
+        own_label.set_mnemonic_widget(self.playlists_view.widget)
+
+        self._load_own_playlists()
+
+    def destroy(self):
+        self.playlists_view.destroy()
+        self.__dict__.clear()
+
+    def _append(self, widget):
+        if GTK_API_VERSION >= 4:
+            self.primary_container.append(widget)  # pylint: disable=no-member
+        else:
+            self.primary_container.add(widget)      # pylint: disable=no-member
+
+    def _set_status(self, text):
+        self.status_label.set_text(text)
+        self.status_label.set_visible(bool(text))
+
+    def _load_own_playlists(self):
+
+        if not core.spotify_watch.is_authorized():
+            self._set_status(_("Connect to Spotify in Wishlist Settings first to browse your own playlists."))
+            return
+
+        self._set_status(_("Loading your playlists…"))
+        core.spotify_watch.fetch_own_playlists(self.on_own_playlists_fetched)
+
+    def on_own_playlists_fetched(self, playlists, error):
+
+        if not self.is_visible():
+            return
+
+        if error is not None:
+            self._set_status(error)
+            return
+
+        self._set_status("")
+        self.playlists_view.freeze()
+        self.playlists_view.clear()
+
+        for playlist in playlists:
+            self.playlists_view.add_row(
+                [playlist["id"], playlist["name"], playlist["owner"]], select_row=False)
+
+        self.playlists_view.unfreeze()
+
+        if not playlists:
+            self._set_status(_("No playlists found in your Spotify account."))
+
+    def _watch_playlist(self, playlist_url_or_id):
+
+        self._set_status(_("Adding playlist…"))
+        core.spotify_watch.add_watched_playlist(playlist_url_or_id, self.on_watch_result)
+
+    def on_watch_result(self, success, message_or_list_name):
+
+        if not self.is_visible():
+            return
+
+        if not success:
+            self._set_status(message_or_list_name)
+            return
+
+        self._set_status("")
+        self.url_entry.set_text("")
+        self.on_playlist_added(message_or_list_name)
+
+    def on_watch_url(self, *_args):
+
+        playlist_url_or_id = self.url_entry.get_text().strip()
+
+        if not playlist_url_or_id:
+            return
+
+        self._watch_playlist(playlist_url_or_id)
+
+    def on_playlist_row_activated(self, list_view, iterator, _column_id):
+        playlist_id = list_view.get_row_value(iterator, "id")
+        self._watch_playlist(playlist_id)
+
+    def on_close(self, *_args):
+        self.close()
+
+
+class AddListDialog(Dialog):
+    """Create a new wishlist, either by typing a plain name (as before), or
+    by picking a Spotify playlist to watch -- which creates and names the
+    list automatically, the same way as adding a watched playlist from
+    Wishlist Settings does."""
+
+    def __init__(self, application, on_list_added):
+
+        self.on_list_added = on_list_added
+
+        cancel_button = Gtk.Button(label=_("_Cancel"), use_underline=True, visible=True)
+        cancel_button.connect("clicked", self.on_cancel)
+
+        self.add_button = Gtk.Button(label=_("_Add"), use_underline=True, visible=True)
+        self.add_button.connect("clicked", self.on_add)
+        add_css_class(self.add_button, "suggested-action")
+
+        self.primary_container = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, width_request=400, visible=True,
+            margin_top=14, margin_bottom=14, margin_start=18, margin_end=18, spacing=12
+        )
+
+        super().__init__(
+            application=application,
+            content_box=self.primary_container,
+            buttons_start=(cancel_button,),
+            buttons_end=(self.add_button,),
+            default_button=self.add_button,
+            title=_("Add List"),
+            width=440,
+            height=-1
+        )
+
+        name_label = Gtk.Label(
+            label=_("Enter a name for the new download list:"), wrap=True, xalign=0, visible=True)
+        self._append(name_label)
+
+        self.name_entry = Gtk.Entry(visible=True)
+        self.name_entry.connect("activate", self.on_add)
+        name_label.set_mnemonic_widget(self.name_entry)
+        self._append(self.name_entry)
+
+        self._append(Gtk.Separator(visible=True))
+
+        spotify_row = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER, visible=True)
+        spotify_label = Gtk.Label(
+            label=_("Or create it from a Spotify playlist you watch:"), hexpand=True, wrap=True, xalign=0,
+            visible=True)
+
+        spotify_button = Gtk.Button(
+            label=_("Add from Spotify _Playlist…"), use_underline=True, valign=Gtk.Align.CENTER, visible=True)
+        spotify_button.connect("clicked", self.on_add_from_spotify)
+
+        if GTK_API_VERSION >= 4:
+            spotify_row.append(spotify_label)   # pylint: disable=no-member
+            spotify_row.append(spotify_button)  # pylint: disable=no-member
+        else:
+            spotify_row.add(spotify_label)      # pylint: disable=no-member
+            spotify_row.add(spotify_button)     # pylint: disable=no-member
+
+        self._append(spotify_row)
+
+    def destroy(self):
+        self.__dict__.clear()
+
+    def _append(self, widget):
+        if GTK_API_VERSION >= 4:
+            self.primary_container.append(widget)  # pylint: disable=no-member
+        else:
+            self.primary_container.add(widget)      # pylint: disable=no-member
+
+    def on_cancel(self, *_args):
+        self.close()
+
+    def on_add(self, *_args):
+
+        name = self.name_entry.get_text().strip()
+
+        if not name:
+            return
+
+        self.on_list_added(name)
+        self.close()
+
+    def on_spotify_playlist_added(self, list_name):
+        # The playlist has already created/registered its own wishlist by
+        # this point (SpotifyWatch.add_watched_playlist does that itself) --
+        # just let the caller know a list now exists, and close up
+        self.on_list_added(list_name, already_created=True)
+        self.close()
+
+    def on_add_from_spotify(self, *_args):
+        SpotifyPlaylistPickerDialog(self.application, self.on_spotify_playlist_added).present()
 
 
 class VerifyMatchesDialog(Dialog):
@@ -1316,11 +1621,11 @@ class Wishlists:
 
     # Callbacks #
 
-    def on_add_list_response(self, dialog, _response_id, _data):
+    def on_add_list_response(self, name, already_created=False):
 
-        name = dialog.get_entry_value().strip()
-
-        if not name:
+        if already_created:
+            # A Spotify-playlist-backed list creates and populates itself
+            # (SpotifyWatch.add_watched_playlist) -- nothing left to do here
             return
 
         download_list = core.download_lists.add_list(name)
@@ -1331,14 +1636,7 @@ class Wishlists:
         ListSettingsDialog(self.window.application, download_list, self.on_list_settings_saved).present()
 
     def on_add_list(self, *_args):
-
-        EntryDialog(
-            application=self.window.application,
-            title=_("Add List"),
-            message=_("Enter a name for the new download list:"),
-            action_button_label=_("_Add"),
-            callback=self.on_add_list_response
-        ).present()
+        AddListDialog(self.window.application, self.on_add_list_response).present()
 
     def on_add_songs_response(self, dialog, _response_id, list_name):
 
@@ -1367,8 +1665,7 @@ class Wishlists:
                                    prefer_lossless, preferred_keywords, fuzzy_match_threshold,
                                    auto_download, use_name_subfolder, apply_to_existing_lists,
                                    stall_timeout, min_speed_kib, max_concurrent,
-                                   spotify_client_id, spotify_client_secret, spotify_watch_enabled,
-                                   spotify_playlist, spotify_ignore_radio_edit):
+                                   spotify_client_id, spotify_client_secret, spotify_ignore_radio_edit):
         core.download_lists.update_watch_folder_settings(watch_enabled, watch_folder_path)
         core.download_lists.update_wishlist_default_settings(
             quality, prefer_longer, prefer_lossless, preferred_keywords, fuzzy_match_threshold,
@@ -1376,8 +1673,7 @@ class Wishlists:
         core.download_lists.update_stall_settings(stall_timeout, min_speed_kib)
         core.download_lists.update_max_concurrent_downloads(max_concurrent)
         core.spotify_watch.update_credentials(spotify_client_id, spotify_client_secret)
-        core.spotify_watch.update_watch_settings(
-            spotify_watch_enabled, spotify_playlist, spotify_ignore_radio_edit)
+        core.spotify_watch.update_ignore_radio_edit(spotify_ignore_radio_edit)
 
     def on_wishlist_settings(self, *_args):
         WishlistSettingsDialog(self.window.application, self.on_wishlist_settings_saved).present()
