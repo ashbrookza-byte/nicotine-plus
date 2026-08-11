@@ -253,7 +253,7 @@ class SpotifyWatchTest(TestCase):
             if path == "/playlists/abc123":
                 return {"name": "My Watched Playlist"}
 
-            if path == "/playlists/abc123/tracks":
+            if path == "/playlists/abc123/items":
                 return {
                     "items": [
                         {"track": {"id": "new-id", "name": "New Song (Radio Edit)", "artists": [{"name": "Artist"}]}}
@@ -318,7 +318,7 @@ class SpotifyWatchTest(TestCase):
         entry = {"playlist_id": "abc123", "list_name": "My Watched Playlist", "seen_track_ids": ["already-seen-id"]}
 
         def fake_api_get(path, params=None):  # noqa: ARG001
-            if path == "/playlists/abc123/tracks":
+            if path == "/playlists/abc123/items":
                 return {
                     "items": [
                         {"track": {"id": "already-seen-id", "name": "Old Song", "artists": [{"name": "Old Artist"}]}},
@@ -348,10 +348,10 @@ class SpotifyWatchTest(TestCase):
     def test_poll_single_playlist_paginates_through_all_pages(self):
 
         entry = {"playlist_id": "abc123", "list_name": "Big Playlist", "seen_track_ids": []}
-        page_two_url = "https://api.spotify.com/v1/playlists/abc123/tracks?offset=100"
+        page_two_url = "https://api.spotify.com/v1/playlists/abc123/items?offset=100"
 
         def fake_api_get(path, params=None):  # noqa: ARG001
-            if path == "/playlists/abc123/tracks":
+            if path == "/playlists/abc123/items":
                 return {
                     "items": [{"track": {"id": "id1", "name": "Song One", "artists": [{"name": "Artist One"}]}}],
                     "next": page_two_url
@@ -396,13 +396,13 @@ class SpotifyWatchTest(TestCase):
         ]
 
         def fake_api_get(path, params=None):  # noqa: ARG001
-            if path == "/playlists/abc123/tracks":
+            if path == "/playlists/abc123/items":
                 return {
                     "items": [{"track": {"id": "id1", "name": "Song One", "artists": [{"name": "Artist One"}]}}],
                     "next": None
                 }
 
-            if path == "/playlists/def456/tracks":
+            if path == "/playlists/def456/items":
                 return {
                     "items": [{"track": {"id": "id2", "name": "Song Two", "artists": [{"name": "Artist Two"}]}}],
                     "next": None

@@ -573,8 +573,13 @@ class SpotifyWatch:
         new_terms = []
         current_track_ids = []
 
-        path = f"/playlists/{playlist_id}/tracks"
-        params = {"fields": "items(track(id,name,artists(name))),next", "limit": 100}
+        # "/playlists/{id}/tracks" was Spotify's endpoint for this until their
+        # March 2026 Web API migration, which retired it in favor of
+        # "/playlists/{id}/items" (same shape, but /tracks now returns a flat
+        # 403 for every playlist, including your own, on Development Mode
+        # apps -- see https://developer.spotify.com/documentation/web-api/reference/get-playlists-items)
+        path = f"/playlists/{playlist_id}/items"
+        params = {"fields": "items(track(id,name,artists(name))),next", "limit": 50}
 
         try:
             while path is not None:
