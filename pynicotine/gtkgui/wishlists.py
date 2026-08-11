@@ -70,6 +70,7 @@ class ListSettingsDialog(Dialog):
         self._add_quality_option()
         self._add_prefer_longer_option()
         self._add_prefer_lossless_option()
+        self._add_keywords_option()
         self._add_fuzzy_option()
         self._add_auto_download_option()
         self._add_name_subfolder_option()
@@ -128,8 +129,9 @@ class ListSettingsDialog(Dialog):
         has_override = any(
             value is not None for value in (
                 self.download_list.quality, self.download_list.prefer_longer,
-                self.download_list.prefer_lossless, self.download_list.fuzzy_match_threshold,
-                self.download_list.auto_download, self.download_list.use_name_subfolder
+                self.download_list.prefer_lossless, self.download_list.preferred_keywords,
+                self.download_list.fuzzy_match_threshold, self.download_list.auto_download,
+                self.download_list.use_name_subfolder
             )
         )
 
@@ -176,6 +178,24 @@ class ListSettingsDialog(Dialog):
             tooltip_text=_("Doesn't exclude lossy files by itself — pair with a minimum file quality "
                             "of \"Lossless only\" above to require lossless.")
         )
+
+    def _add_keywords_option(self):
+
+        label = Gtk.Label(
+            label=_("Preferred source keywords (comma-separated):"), wrap=True, xalign=0, visible=True)
+        self._append(label)
+
+        self.keywords_entry = Gtk.Entry(
+            placeholder_text=_("e.g. beatport, bp"), visible=True,
+            text=self.download_list.effective_preferred_keywords or "",
+            tooltip_text=_('Breaks ties in favor of results whose folder path contains one of these '
+                            'words, e.g. "beatport, bp" prefers a result from a "BP Sep 2025" folder '
+                            'over an otherwise-equal one that isn\'t. Leave blank to not prefer any source.')
+        )
+        label.set_mnemonic_widget(self.keywords_entry)
+        self._append(self.keywords_entry)
+
+        self._override_widgets.append(self.keywords_entry)
 
     def _add_fuzzy_option(self):
 
@@ -230,6 +250,7 @@ class ListSettingsDialog(Dialog):
             "quality": self.quality_combobox.get_selected_id() if is_overridden else None,
             "prefer_longer": self.prefer_longer_switch.get_active() if is_overridden else None,
             "prefer_lossless": self.prefer_lossless_switch.get_active() if is_overridden else None,
+            "preferred_keywords": self.keywords_entry.get_text().strip() if is_overridden else None,
             "fuzzy_match_threshold": self.fuzzy_spinner.get_value_as_int() if is_overridden else None,
             "auto_download": self.auto_download_switch.get_active() if is_overridden else None,
             "use_name_subfolder": self.name_subfolder_switch.get_active() if is_overridden else None
@@ -339,6 +360,20 @@ class WishlistSettingsDialog(Dialog):
             tooltip_text=_("Doesn't exclude lossy files by itself — pair with a minimum file quality "
                             "of \"Lossless only\" above to require lossless."))
 
+        keywords_label = Gtk.Label(
+            label=_("Preferred source keywords (comma-separated):"), wrap=True, xalign=0, visible=True)
+        self._append(keywords_label)
+
+        self.default_keywords_entry = Gtk.Entry(
+            placeholder_text=_("e.g. beatport, bp"), visible=True,
+            text=transfers["downloadlistdefaultkeywords"],
+            tooltip_text=_('Breaks ties in favor of results whose folder path contains one of these '
+                            'words, e.g. "beatport, bp" prefers a result from a "BP Sep 2025" folder '
+                            'over an otherwise-equal one that isn\'t. Leave blank to not prefer any source.')
+        )
+        keywords_label.set_mnemonic_widget(self.default_keywords_entry)
+        self._append(self.default_keywords_entry)
+
         self.default_fuzzy_spinner = Gtk.SpinButton(
             adjustment=Gtk.Adjustment(
                 value=transfers["downloadlistdefaultfuzzy"], lower=0, upper=100,
@@ -440,6 +475,7 @@ class WishlistSettingsDialog(Dialog):
             quality=self.default_quality_combobox.get_selected_id(),
             prefer_longer=self.default_prefer_longer_switch.get_active(),
             prefer_lossless=self.default_prefer_lossless_switch.get_active(),
+            preferred_keywords=self.default_keywords_entry.get_text().strip(),
             fuzzy_match_threshold=self.default_fuzzy_spinner.get_value_as_int(),
             auto_download=self.default_auto_download_switch.get_active(),
             use_name_subfolder=self.default_name_subfolder_switch.get_active(),
@@ -820,12 +856,12 @@ class Wishlists:
         core.download_lists.update_list_settings(name, **settings)
 
     def on_wishlist_settings_saved(self, watch_enabled, watch_folder_path, quality, prefer_longer,
-                                   prefer_lossless, fuzzy_match_threshold, auto_download,
-                                   use_name_subfolder, apply_to_existing_lists):
+                                   prefer_lossless, preferred_keywords, fuzzy_match_threshold,
+                                   auto_download, use_name_subfolder, apply_to_existing_lists):
         core.download_lists.update_watch_folder_settings(watch_enabled, watch_folder_path)
         core.download_lists.update_wishlist_default_settings(
-            quality, prefer_longer, prefer_lossless, fuzzy_match_threshold, auto_download,
-            use_name_subfolder, apply_to_existing_lists=apply_to_existing_lists)
+            quality, prefer_longer, prefer_lossless, preferred_keywords, fuzzy_match_threshold,
+            auto_download, use_name_subfolder, apply_to_existing_lists=apply_to_existing_lists)
 
     def on_wishlist_settings(self, *_args):
         WishlistSettingsDialog(self.window.application, self.on_wishlist_settings_saved).present()

@@ -185,6 +185,7 @@ class Config:
                 "downloadlistdefaultquality": "good",
                 "downloadlistdefaultpreferlonger": True,
                 "downloadlistdefaultpreferlossless": True,
+                "downloadlistdefaultkeywords": "",
                 "downloadlistdefaultfuzzy": 70,
                 "downloadlistdefaultautodownload": True,
                 "downloadlistdefaultnamesubfolder": False,

@@ -152,6 +152,7 @@ class DownloadListsTest(TestCase):
             quality=defaults["downloadlistdefaultquality"],
             prefer_longer=defaults["downloadlistdefaultpreferlonger"],
             prefer_lossless=defaults["downloadlistdefaultpreferlossless"],
+            preferred_keywords=defaults["downloadlistdefaultkeywords"],
             fuzzy_match_threshold=defaults["downloadlistdefaultfuzzy"],
             auto_download=defaults["downloadlistdefaultautodownload"],
             use_name_subfolder=defaults["downloadlistdefaultnamesubfolder"]
@@ -168,12 +169,13 @@ class DownloadListsTest(TestCase):
         self.assertTrue(download_list.effective_auto_download)
 
         core.download_lists.update_wishlist_default_settings(
-            quality="lossless", prefer_longer=False, prefer_lossless=False, fuzzy_match_threshold=55,
-            auto_download=False, use_name_subfolder=True
+            quality="lossless", prefer_longer=False, prefer_lossless=False, preferred_keywords="beatport",
+            fuzzy_match_threshold=55, auto_download=False, use_name_subfolder=True
         )
 
         self.assertEqual(download_list.effective_quality, "lossless")
         self.assertFalse(download_list.effective_prefer_longer)
+        self.assertEqual(download_list.effective_preferred_keywords, "beatport")
         self.assertEqual(download_list.effective_fuzzy_match_threshold, 55)
         self.assertFalse(download_list.effective_auto_download)
         self.assertTrue(download_list.effective_use_name_subfolder)
@@ -187,8 +189,8 @@ class DownloadListsTest(TestCase):
         core.download_lists.update_list_settings("Overriding List", quality="high")
 
         core.download_lists.update_wishlist_default_settings(
-            quality="lossless", prefer_longer=True, prefer_lossless=True, fuzzy_match_threshold=70,
-            auto_download=True, use_name_subfolder=False
+            quality="lossless", prefer_longer=True, prefer_lossless=True, preferred_keywords="",
+            fuzzy_match_threshold=70, auto_download=True, use_name_subfolder=False
         )
 
         self.assertEqual(download_list.effective_quality, "high")
@@ -198,8 +200,8 @@ class DownloadListsTest(TestCase):
         this list's override, reverting it to the overall default."""
 
         core.download_lists.update_wishlist_default_settings(
-            quality="good", prefer_longer=True, prefer_lossless=True, fuzzy_match_threshold=70,
-            auto_download=True, use_name_subfolder=False
+            quality="good", prefer_longer=True, prefer_lossless=True, preferred_keywords="",
+            fuzzy_match_threshold=70, auto_download=True, use_name_subfolder=False
         )
 
         download_list = core.download_lists.add_list("Clearable List", quality="lossless")
@@ -266,6 +268,43 @@ class DownloadListsTest(TestCase):
         _score, _username, virtual_path, _size, _attributes = item.download_candidates[0]
         self.assertIn("lossless", virtual_path)
 
+    def test_matches_preferred_keywords_uses_word_boundaries(self):
+        """"bp" should match a whole "BP" folder/word, not an unrelated substring
+        like "bpm128" where "bp" isn't a standalone word."""
+
+        matches = core.download_lists._matches_preferred_keywords
+
+        self.assertTrue(matches("beatport, bp", r"beatport\2025\artist - song.mp3".lower()))
+        self.assertTrue(matches("beatport, bp", r"bp sep 2025\artist - song.mp3".lower()))
+        self.assertFalse(matches("beatport, bp", r"random pool\artist - song (bpm128).mp3".lower()))
+        self.assertFalse(matches("", r"beatport\2025\artist - song.mp3".lower()))
+        self.assertFalse(matches(None, r"beatport\2025\artist - song.mp3".lower()))
+
+    def test_preferred_keywords_affects_score_but_not_eligibility(self):
+        """A candidate from a non-matching folder is still eligible, just outscored
+        by an otherwise-equal candidate from a folder matching a preferred keyword."""
+
+        download_list = core.download_lists.add_list(
+            "Beatport Preferring List", quality="any", fuzzy_match_threshold=50,
+            auto_download=True, preferred_keywords="beatport, bp")
+        core.download_lists.add_list_items("Beatport Preferring List", ["Some Song"])
+
+        item = download_list.items["Some Song"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [
+            (1, "@@abc\\Random Pool\\Some Song.mp3", 8000000, "mp3", attributes),
+            (1, "@@abc\\BEATPORT 2025\\Some Song.mp3", 8000000, "mp3", attributes),
+        ]
+        msg = self._make_response(item.token, "someuser", files)
+
+        core.download_lists._file_search_response(msg)
+
+        self.assertEqual(len(item.download_candidates), 1)
+        _score, _username, virtual_path, _size, _attributes = item.download_candidates[0]
+        self.assertIn("BEATPORT", virtual_path)
+
     def test_apply_to_existing_lists_clears_overrides(self):
         """apply_to_existing_lists=True clears every list's own override for the
         matching/download settings, switching them all to the new defaults."""
@@ -276,8 +315,8 @@ class DownloadListsTest(TestCase):
         self.assertEqual(download_list.quality, "lossless")
 
         core.download_lists.update_wishlist_default_settings(
-            quality="good", prefer_longer=True, prefer_lossless=True, fuzzy_match_threshold=70,
-            auto_download=True, use_name_subfolder=False, apply_to_existing_lists=True
+            quality="good", prefer_longer=True, prefer_lossless=True, preferred_keywords="",
+            fuzzy_match_threshold=70, auto_download=True, use_name_subfolder=False, apply_to_existing_lists=True
         )
 
         self.assertIsNone(download_list.quality)
