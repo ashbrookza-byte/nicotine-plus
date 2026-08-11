@@ -62,7 +62,16 @@ class Dialog(Window):
             else:
                 container.add(content_box)     # pylint: disable=no-member
 
-        if config.sections["ui"]["header_bar"]:
+        # Header bars (client-side decorations) get clipped by the system menu bar
+        # reveal area while the main window is in native fullscreen on macOS (and
+        # potentially other platforms). Fall back to a plain in-window button row
+        # in that case, matching the main window's own fullscreen behavior.
+        use_header_bar = (
+            config.sections["ui"]["header_bar"]
+            and not (application.window is not None and application.window.is_fullscreen)
+        )
+
+        if use_header_bar:
             self._init_header_bar(buttons_start, buttons_end, show_title, show_title_buttons)
         else:
             self._init_action_area(container, buttons_start, buttons_end)
