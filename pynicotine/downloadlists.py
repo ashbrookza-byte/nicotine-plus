@@ -503,6 +503,14 @@ class DownloadLists:
                 items=items
             )
 
+        # Guarantee the pinned-ahead-of-unpinned invariant _pop_next_queued_entry and
+        # the GUI sidebar rely on, in case saved data predates it or was hand-edited.
+        # sorted() is stable, so relative order within each group is preserved
+        self.lists = {
+            name: self.lists[name]
+            for name in sorted(self.lists, key=lambda list_name: not self.lists[list_name].pinned)
+        }
+
         # Re-queue anything left pending from a previous session
         for download_list in self.lists.values():
             if not download_list.effective_auto_download:
@@ -757,7 +765,9 @@ class DownloadLists:
 
     def set_list_pinned(self, name, pinned):
         """A pinned list's queued items are dispatched ahead of every other
-        list's, so it keeps making progress even behind a long queue elsewhere."""
+        list's, so it keeps making progress even behind a long queue elsewhere.
+        Pinned lists are also kept grouped ahead of unpinned ones in priority
+        order, and never move to the Completed section in the GUI."""
 
         download_list = self.lists.get(name)
 
@@ -765,12 +775,71 @@ class DownloadLists:
             return
 
         download_list.pinned = bool(pinned)
+        self._regroup_pinned_lists(name)
 
         events.emit("update-download-list", name)
+        events.emit("reorder-download-lists")
         self._save()
 
         if download_list.pinned:
             self._kick_queue()
+
+    def _regroup_pinned_lists(self, name):
+        """Move name to the back of the pinned block if it was just pinned, or to
+        the front of the unpinned block if it was just unpinned, keeping pinned
+        lists always grouped ahead of unpinned ones in priority order."""
+
+        names = list(self.lists.keys())
+        names.remove(name)
+
+        insert_at = sum(1 for other in names if self.lists[other].pinned)
+        names.insert(insert_at, name)
+
+        self.lists = {list_name: self.lists[list_name] for list_name in names}
+
+    def move_list_up(self, name):
+        """Raise a list's priority relative to its neighbors — earlier in this
+        order means its queued items are dispatched first (see
+        _pop_next_queued_entry) and it's shown higher in the GUI sidebar."""
+
+        self._swap_list_priority(name, -1)
+
+    def move_list_down(self, name):
+        self._swap_list_priority(name, 1)
+
+    def _swap_list_priority(self, name, direction):
+        """Swap name with its neighbor (direction -1 for up, +1 for down) among
+        lists in the same priority group — pinned lists only reorder among other
+        pinned lists, and likewise for unpinned/active ones — so a swap can't
+        cross the pinned/unpinned boundary or touch a completed, unpinned list
+        (which has no meaningful priority anymore)."""
+
+        download_list = self.lists.get(name)
+
+        if download_list is None:
+            return
+
+        group = [
+            list_name for list_name, other in self.lists.items()
+            if other.pinned == download_list.pinned and (other.pinned or not other.is_complete)
+        ]
+
+        index = group.index(name)
+        swap_index = index + direction
+
+        if swap_index < 0 or swap_index >= len(group):
+            return
+
+        swap_name = group[swap_index]
+
+        names = list(self.lists.keys())
+        i, j = names.index(name), names.index(swap_name)
+        names[i], names[j] = names[j], names[i]
+
+        self.lists = {list_name: self.lists[list_name] for list_name in names}
+
+        events.emit("reorder-download-lists")
+        self._save()
 
     def rename_list(self, old_name, new_name):
 
@@ -779,6 +848,9 @@ class DownloadLists:
         if not new_name or old_name not in self.lists or new_name in self.lists:
             return False
 
+        # Preserve the list's priority position — a plain pop+reinsert would
+        # silently drop it to the back, behind every other list
+        original_order = list(self.lists.keys())
         download_list = self.lists.pop(old_name)
 
         # Only lists saving into a subfolder named after themselves have a folder
@@ -792,6 +864,8 @@ class DownloadLists:
             item.list_name = new_name
 
         self.lists[new_name] = download_list
+        ordered_names = [new_name if list_name == old_name else list_name for list_name in original_order]
+        self.lists = {list_name: self.lists[list_name] for list_name in ordered_names}
 
         self._queue = deque(
             (new_name if list_name == old_name else list_name, term) for list_name, term in self._queue)
@@ -1231,18 +1305,29 @@ class DownloadLists:
         )
 
     def _pop_next_queued_entry(self):
-        """Pop the next (list_name, term) to dispatch, preferring the first
-        queued entry belonging to a pinned list over plain queue order."""
+        """Pop the next (list_name, term) to dispatch, in list priority order.
+        self.lists is always kept with pinned lists grouped ahead of unpinned
+        ones (see _regroup_pinned_lists), and Move Up/Down lets the user adjust
+        relative priority within each group — so its key order alone fully
+        determines dispatch priority. Entries from the same list (equal
+        priority) keep plain queue (FIFO) order relative to each other."""
 
-        for index, (name, _term) in enumerate(self._queue):
-            download_list = self.lists.get(name)
+        list_order = {name: index for index, name in enumerate(self.lists)}
 
-            if download_list is not None and download_list.pinned:
-                entry = self._queue[index]
-                del self._queue[index]
-                return entry
+        best_index = 0
+        best_priority = list_order.get(self._queue[0][0], len(list_order))
 
-        return self._queue.popleft()
+        for index in range(1, len(self._queue)):
+            priority = list_order.get(self._queue[index][0], len(list_order))
+
+            if priority < best_priority:
+                best_priority = priority
+                best_index = index
+
+        entry = self._queue[best_index]
+        del self._queue[best_index]
+
+        return entry
 
     def _pump_queue(self):
 

@@ -563,6 +563,8 @@ class Wishlists:
         (
             self.add_list_button,
             self.add_songs_button,
+            self.completed_lists_container,
+            self.completed_section,
             self.container,
             self.current_list_label,
             self.export_summary_button,
@@ -587,6 +589,7 @@ class Wishlists:
 
         self.current_list_name = None
         self.items_search_query = ""
+        self._suppress_selection_sync = False
 
         if GTK_API_VERSION >= 4:
             window.wishlists_content.append(self.container)  # pylint: disable=no-member
@@ -598,8 +601,37 @@ class Wishlists:
         # placeholder bound to its visibility
         window.wishlists_content.set_visible(True)
 
+        # Active lists are shown in priority order (pinned lists first, then by their
+        # relative position — see DownloadLists.move_list_up/down), so they're
+        # intentionally left unsorted here rather than alphabetically
         self.lists_view = TreeView(
             window, parent=self.lists_container, select_row_callback=self.on_select_list_row,
+            columns={
+                "pin": {
+                    "column_type": "text",
+                    "title": "",
+                    "width": 20
+                },
+                "name": {
+                    "column_type": "text",
+                    "title": _("List"),
+                    "width": 120,
+                    "expand_column": True,
+                    "iterator_key": True
+                },
+                "summary": {
+                    "column_type": "text",
+                    "title": _("Progress"),
+                    "width": 0,
+                    "tabular": True
+                }
+            }
+        )
+
+        # Completed lists (every item downloaded or not found) move here automatically;
+        # priority order doesn't matter for them anymore, so alphabetical is more useful
+        self.completed_lists_view = TreeView(
+            window, parent=self.completed_lists_container, select_row_callback=self.on_select_list_row,
             columns={
                 "pin": {
                     "column_type": "text",
@@ -682,6 +714,21 @@ class Wishlists:
         self.lists_popup_menu.add_items(
             ("#" + self.PIN_LABEL, self.on_pin_unpin_list),
             ("#" + self.PAUSE_LABEL, self.on_pause_resume_list),
+            ("#" + _("Move _Up"), self.on_move_list_up),
+            ("#" + _("Move _Down"), self.on_move_list_down),
+            ("#" + _("_Settings…"), self.on_list_settings),
+            ("#" + _("Re_name…"), self.on_rename_list),
+            ("", None),
+            ("#" + _("_Remove"), self.on_remove_list)
+        )
+
+        # Completed lists have no priority order to reorder, but everything else
+        # (pin to bring back to Active, settings, rename, remove) still applies
+        self.completed_lists_popup_menu = PopupMenu(
+            window.application, self.completed_lists_view.widget, self.on_popup_lists_menu)
+        self.completed_lists_popup_menu.add_items(
+            ("#" + self.PIN_LABEL, self.on_pin_unpin_list),
+            ("#" + self.PAUSE_LABEL, self.on_pause_resume_list),
             ("#" + _("_Settings…"), self.on_list_settings),
             ("#" + _("Re_name…"), self.on_rename_list),
             ("", None),
@@ -703,6 +750,7 @@ class Wishlists:
             ("download-list-completed", self.on_download_list_completed),
             ("remove-download-list", self.on_remove_download_list_event),
             ("rename-download-list", self.on_rename_download_list_event),
+            ("reorder-download-lists", self.on_reorder_download_lists_event),
             ("start", self.on_start),
             ("update-download-list", self.on_update_download_list_event),
             ("update-download-list-item", self.on_update_download_list_item_event)
@@ -712,8 +760,10 @@ class Wishlists:
     def destroy(self):
 
         self.lists_popup_menu.destroy()
+        self.completed_lists_popup_menu.destroy()
         self.items_popup_menu.destroy()
         self.lists_view.destroy()
+        self.completed_lists_view.destroy()
         self.items_view.destroy()
         self.__dict__.clear()
 
@@ -732,26 +782,83 @@ class Wishlists:
 
     def on_select_list_row(self, list_view, iterator):
 
+        if self._suppress_selection_sync:
+            return
+
         if iterator is None:
             self._show_list(None)
             return
+
+        # Only one of the Active/Completed lists can be selected at a time; clear
+        # whichever view didn't just receive this selection. Suppress selection
+        # events while doing so, since unselecting fires "changed" too, and would
+        # otherwise wipe out the selection we're in the middle of setting
+        other_view = self.completed_lists_view if list_view is self.lists_view else self.lists_view
+        self._suppress_selection_sync = True
+        other_view.unselect_all_rows()
+        self._suppress_selection_sync = False
 
         name = list_view.get_row_value(iterator, "name")
         self._show_list(name)
 
     def on_start(self):
+        self._rebuild_lists_view()
+
+    # Row helpers #
+
+    def _is_active_list(self, download_list):
+        """Whether a list belongs in the Active section — everything except a
+        completed, unpinned list. Pinned lists never move to Completed, even
+        once every item is downloaded or not found."""
+
+        return download_list.pinned or not download_list.is_complete
+
+    def _list_view_for(self, download_list):
+        return self.lists_view if self._is_active_list(download_list) else self.completed_lists_view
+
+    def _update_completed_section_visibility(self):
+        self.completed_section.set_visible(bool(self.completed_lists_view.iterators))
+
+    def _rebuild_lists_view(self):
+        """Repopulate both the Active and Completed sections from scratch, in
+        current list priority order. Used at startup, and after a reorder that
+        can't be expressed as a simple row move (e.g. Move Up/Down)."""
 
         if core.download_lists is None:
             return
 
-        self.lists_view.freeze()
+        selected_name = self.current_list_name
 
-        for name in core.download_lists.lists:
+        self._suppress_selection_sync = True
+        self.lists_view.freeze()
+        self.completed_lists_view.freeze()
+        self.lists_view.clear()
+        self.completed_lists_view.clear()
+
+        # TreeView.add_row() always inserts at the top (for performance), so for
+        # this unsorted, priority-ordered view, lists must be added lowest
+        # priority first — each subsequent add then pushes it further down,
+        # leaving the highest-priority list on top once every row is in
+        for name in reversed(list(core.download_lists.lists)):
             self._add_list_row(name)
 
         self.lists_view.unfreeze()
+        self.completed_lists_view.unfreeze()
+        self._suppress_selection_sync = False
 
-    # Row helpers #
+        self._update_completed_section_visibility()
+
+        download_list = core.download_lists.lists.get(selected_name) if selected_name is not None else None
+
+        if download_list is None:
+            self._show_list(None)
+            return
+
+        target_view = self._list_view_for(download_list)
+        iterator = target_view.iterators.get(selected_name)
+
+        if iterator is not None:
+            target_view.select_row(iterator)
 
     def _list_summary_text(self, download_list):
 
@@ -779,22 +886,49 @@ class Wishlists:
             return
 
         pin_glyph = self.PIN_GLYPH if download_list.pinned else ""
-        self.lists_view.add_row(
+        target_view = self._list_view_for(download_list)
+        target_view.add_row(
             [pin_glyph, name, self._list_summary_text(download_list)], select_row=select)
+        self._update_completed_section_visibility()
 
     def _update_list_row(self, name):
-
-        iterator = self.lists_view.iterators.get(name)
-
-        if iterator is None:
-            return
 
         download_list = core.download_lists.lists.get(name)
 
         if download_list is None:
             return
 
-        self.lists_view.set_row_values(
+        current_view = self.lists_view if name in self.lists_view.iterators else (
+            self.completed_lists_view if name in self.completed_lists_view.iterators else None)
+
+        if current_view is None:
+            return
+
+        target_view = self._list_view_for(download_list)
+
+        if current_view is not target_view:
+            if target_view is self.lists_view:
+                # Moving back to Active: a plain add would drop it to the bottom
+                # instead of its actual priority position, so rebuild instead
+                self._rebuild_lists_view()
+                return
+
+            # Moving to Completed: alphabetically sorted, so appending is fine
+            was_selected = (self.current_list_name == name)
+            current_view.remove_row(current_view.iterators[name])
+            target_view.add_row(
+                [self.PIN_GLYPH if download_list.pinned else "", name, self._list_summary_text(download_list)],
+                select_row=was_selected
+            )
+            self._update_completed_section_visibility()
+            return
+
+        iterator = current_view.iterators.get(name)
+
+        if iterator is None:
+            return
+
+        current_view.set_row_values(
             iterator,
             ["pin", "summary"],
             [self.PIN_GLYPH if download_list.pinned else "", self._list_summary_text(download_list)]
@@ -917,30 +1051,37 @@ class Wishlists:
     # Core Events #
 
     def on_add_download_list_event(self, name):
-        self._add_list_row(name, select=True)
+        # A new list is always lowest priority (the very back of self.lists), but
+        # a plain add_row() would put its row at the top instead (see
+        # _rebuild_lists_view) — rebuild so it lands in its correct position
+        self.current_list_name = name
+        self._rebuild_lists_view()
 
     def on_remove_download_list_event(self, name):
 
-        iterator = self.lists_view.iterators.get(name)
+        for view in (self.lists_view, self.completed_lists_view):
+            iterator = view.iterators.get(name)
 
-        if iterator is not None:
-            self.lists_view.remove_row(iterator)
+            if iterator is not None:
+                view.remove_row(iterator)
+                break
+
+        self._update_completed_section_visibility()
 
         if self.current_list_name == name:
             self._show_list(None)
 
     def on_rename_download_list_event(self, old_name, new_name):
 
-        iterator = self.lists_view.iterators.get(old_name)
-
-        if iterator is not None:
-            self.lists_view.remove_row(iterator)
-
-        was_current = (self.current_list_name == old_name)
-        self._add_list_row(new_name, select=was_current)
-
-        if was_current:
+        if self.current_list_name == old_name:
             self.current_list_name = new_name
+
+        # A plain remove+re-add would drop the row to the back of its section
+        # instead of keeping its priority position, so rebuild instead
+        self._rebuild_lists_view()
+
+    def on_reorder_download_lists_event(self):
+        self._rebuild_lists_view()
 
     def on_update_download_list_event(self, name):
 
@@ -1023,14 +1164,10 @@ class Wishlists:
 
     def on_popup_lists_menu(self, menu, _widget):
         """Right-clicking a row selects it first, so by the time this fires,
-        the popup's target list is whatever's currently selected."""
+        the popup's target list is whatever's currently selected — in either
+        the Active or Completed section."""
 
-        download_list = None
-
-        for iterator in self.lists_view.get_selected_rows():
-            name = self.lists_view.get_row_value(iterator, "name")
-            download_list = core.download_lists.lists.get(name)
-            break
+        download_list = core.download_lists.lists.get(self.current_list_name)
 
         menu.update_item_label(self.PAUSE_LABEL, self._pause_resume_label(download_list))
         menu.update_item_label(
@@ -1040,14 +1177,21 @@ class Wishlists:
 
     def on_pin_unpin_list(self, *_args):
 
-        for iterator in self.lists_view.get_selected_rows():
-            name = self.lists_view.get_row_value(iterator, "name")
-            download_list = core.download_lists.lists.get(name)
+        name = self.current_list_name
+        download_list = core.download_lists.lists.get(name)
 
-            if download_list is not None:
-                core.download_lists.set_list_pinned(name, not download_list.pinned)
+        if download_list is not None:
+            core.download_lists.set_list_pinned(name, not download_list.pinned)
 
-            return
+    def on_move_list_up(self, *_args):
+
+        if self.current_list_name is not None:
+            core.download_lists.move_list_up(self.current_list_name)
+
+    def on_move_list_down(self, *_args):
+
+        if self.current_list_name is not None:
+            core.download_lists.move_list_down(self.current_list_name)
 
     def on_pause_resume_list(self, *_args):
 
@@ -1087,42 +1231,44 @@ class Wishlists:
 
     def on_rename_list(self, *_args):
 
-        for iterator in self.lists_view.get_selected_rows():
-            old_name = self.lists_view.get_row_value(iterator, "name")
+        old_name = self.current_list_name
 
-            EntryDialog(
-                application=self.window.application,
-                title=_("Rename List"),
-                message=_("Enter a new name:"),
-                default=old_name,
-                action_button_label=_("_Rename"),
-                callback=self.on_rename_list_response,
-                callback_data=old_name
-            ).present()
+        if old_name is None:
             return
+
+        EntryDialog(
+            application=self.window.application,
+            title=_("Rename List"),
+            message=_("Enter a new name:"),
+            default=old_name,
+            action_button_label=_("_Rename"),
+            callback=self.on_rename_list_response,
+            callback_data=old_name
+        ).present()
 
     def on_remove_list_response(self, _dialog, _response_id, name):
         core.download_lists.remove_list(name)
 
     def on_remove_list(self, *_args):
 
-        for iterator in self.lists_view.get_selected_rows():
-            name = self.lists_view.get_row_value(iterator, "name")
+        name = self.current_list_name
 
-            OptionDialog(
-                application=self.window.application,
-                title=_("Remove List?"),
-                message=_('Do you want to remove "%s"? Files already downloaded are not deleted, '
-                          "only the list itself and its history.") % name,
-                buttons=[
-                    ("cancel", _("_Cancel")),
-                    ("ok", _("Remove"))
-                ],
-                destructive_response_id="ok",
-                callback=self.on_remove_list_response,
-                callback_data=name
-            ).present()
+        if name is None:
             return
+
+        OptionDialog(
+            application=self.window.application,
+            title=_("Remove List?"),
+            message=_('Do you want to remove "%s"? Files already downloaded are not deleted, '
+                      "only the list itself and its history.") % name,
+            buttons=[
+                ("cancel", _("_Cancel")),
+                ("ok", _("Remove"))
+            ],
+            destructive_response_id="ok",
+            callback=self.on_remove_list_response,
+            callback_data=name
+        ).present()
 
     def on_start_next_item(self, *_args):
 

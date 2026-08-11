@@ -151,6 +151,120 @@ class DownloadListsTest(TestCase):
         core.download_lists.set_list_pinned("Toggle Pin List", False)
         self.assertFalse(download_list.pinned)
 
+    def test_set_list_pinned_keeps_pinned_lists_grouped_first(self):
+        """Pinning a list moves it ahead of every unpinned list (to the back of
+        the pinned block); unpinning moves it back to the front of the unpinned
+        block. Priority order (self.lists key order) must reflect this."""
+
+        core.download_lists.add_list("List A")
+        core.download_lists.add_list("List B")
+        core.download_lists.add_list("List C")
+
+        core.download_lists.set_list_pinned("List B", True)
+        self.assertEqual(list(core.download_lists.lists), ["List B", "List A", "List C"])
+
+        core.download_lists.set_list_pinned("List C", True)
+        self.assertEqual(list(core.download_lists.lists), ["List B", "List C", "List A"])
+
+        core.download_lists.set_list_pinned("List B", False)
+        self.assertEqual(list(core.download_lists.lists), ["List C", "List B", "List A"])
+
+    def test_move_list_up_and_down_reorders_within_pinned_tier(self):
+        """Move Up/Down swaps a list with its neighbor, but only within the same
+        pinned/unpinned group -- it can't cross the pinned/unpinned boundary."""
+
+        core.download_lists.add_list("List A")
+        core.download_lists.add_list("List B")
+        core.download_lists.add_list("List C")
+        core.download_lists.set_list_pinned("List A", True)
+
+        # List A (pinned) is alone in its group; moving it should be a no-op
+        core.download_lists.move_list_down("List A")
+        self.assertEqual(list(core.download_lists.lists), ["List A", "List B", "List C"])
+
+        core.download_lists.move_list_down("List B")
+        self.assertEqual(list(core.download_lists.lists), ["List A", "List C", "List B"])
+
+        core.download_lists.move_list_up("List B")
+        self.assertEqual(list(core.download_lists.lists), ["List A", "List B", "List C"])
+
+        # Already at the front of its group -- no-op, doesn't cross into pinned territory
+        core.download_lists.move_list_up("List B")
+        self.assertEqual(list(core.download_lists.lists), ["List A", "List B", "List C"])
+
+    def test_move_list_excludes_completed_unpinned_lists(self):
+        """A completed, unpinned list has no meaningful priority left, and isn't
+        a valid Move Up/Down neighbor for a still-active list."""
+
+        core.download_lists.add_list("Active List", auto_download=False)
+        completed_list = core.download_lists.add_list("Completed List", auto_download=False)
+        core.download_lists.add_list_items("Completed List", ["Only Song"])
+        completed_list.items["Only Song"].status = DownloadListItemStatus.COMPLETED
+
+        self.assertTrue(completed_list.is_complete)
+
+        # Nothing in the same (active-only) group to swap with -- no-op, and
+        # nothing should crash trying to reorder past the completed list
+        core.download_lists.move_list_down("Active List")
+        self.assertEqual(list(core.download_lists.lists), ["Active List", "Completed List"])
+
+    def test_dispatch_priority_follows_list_order_beyond_pinned_binary(self):
+        """Among unpinned lists, priority order (not just plain queue order)
+        determines dispatch order -- moving a list up gets it served first even
+        though its item was queued after the other list's."""
+
+        from pynicotine.slskmessages import UserStatus
+
+        core.users.login_status = UserStatus.ONLINE
+        self.addCleanup(setattr, core.users, "login_status", UserStatus.OFFLINE)
+
+        core.download_lists.update_max_concurrent_downloads(1)
+        self.addCleanup(core.download_lists.update_max_concurrent_downloads, 3)
+
+        first_list = core.download_lists.add_list("First List", auto_download=True)
+        core.download_lists.add_list_items("First List", ["First Song"])
+
+        second_list = core.download_lists.add_list("Second List", auto_download=True)
+        core.download_lists.add_list_items("Second List", ["Second Song"])
+
+        # Second List was queued after First List, but raise its priority above it
+        core.download_lists.move_list_up("Second List")
+
+        core.download_lists._pump_queue()
+
+        self.assertEqual(second_list.items["Second Song"].status, DownloadListItemStatus.SEARCHING)
+        self.assertEqual(first_list.items["First Song"].status, DownloadListItemStatus.PENDING)
+
+    def test_rename_list_preserves_priority_position(self):
+        """Renaming a list must not silently drop it to the back of the priority
+        order -- it should keep its exact position."""
+
+        core.download_lists.add_list("List A")
+        core.download_lists.add_list("List B")
+        core.download_lists.add_list("List C")
+
+        core.download_lists.rename_list("List B", "List B Renamed")
+
+        self.assertEqual(list(core.download_lists.lists), ["List A", "List B Renamed", "List C"])
+
+    def test_list_is_complete_once_every_item_is_terminal(self):
+
+        download_list = core.download_lists.add_list("Completion List", auto_download=False)
+        self.assertFalse(download_list.is_complete, "An empty list is never complete")
+
+        core.download_lists.add_list_items("Completion List", ["Song One", "Song Two"])
+        self.assertFalse(download_list.is_complete)
+
+        download_list.items["Song One"].status = DownloadListItemStatus.COMPLETED
+        self.assertFalse(download_list.is_complete, "Still one pending item left")
+
+        download_list.items["Song Two"].status = DownloadListItemStatus.NOT_FOUND
+        self.assertTrue(download_list.is_complete, "Completed + Not Found both count as terminal")
+
+        # Resetting an item makes the list incomplete again
+        core.download_lists.reset_list_item("Completion List", "Song Two")
+        self.assertFalse(download_list.is_complete)
+
     def test_add_list_duplicate_name(self):
         """Adding a list with a name that's already taken is a no-op."""
 

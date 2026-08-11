@@ -138,6 +138,7 @@ EVENT_NAMES = {
     "download-list-completed",
     "remove-download-list",
     "rename-download-list",
+    "reorder-download-lists",
     "update-download-list",
     "update-download-list-item",
 
