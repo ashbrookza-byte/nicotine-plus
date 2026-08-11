@@ -141,6 +141,15 @@ EVENT_NAMES = {
     "update-download-list",
     "update-download-list-item",
 
+    # Spotify
+    "add-spotify-playlist",
+    "remove-spotify-playlist",
+    "spotify-authorization",
+    "spotify-poll-failed",
+    "spotify-poll-finished",
+    "spotify-poll-now",
+    "update-spotify-playlist",
+
     # Statistics
     "update-stat",
 

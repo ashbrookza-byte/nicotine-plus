@@ -414,6 +414,13 @@ class Config:
                 "likes": [],
                 "dislikes": []
             },
+            "spotify": {
+                "enabled": False,
+                "clientid": "",
+                "callbackport": 8888,
+                "pollinterval": 15,
+                "refreshtoken": ""
+            },
             "players": {
                 "npothercommand": "",
                 "npplayer": "mpris",
