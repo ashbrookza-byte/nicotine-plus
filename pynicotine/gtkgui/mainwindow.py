@@ -168,7 +168,12 @@ class MainWindow(Window):
             self.userlist_page,
             self.userlist_title,
             self.userlist_toolbar,
-            self.vertical_paned
+            self.vertical_paned,
+            self.wishlists_content,
+            self.wishlists_end,
+            self.wishlists_page,
+            self.wishlists_title,
+            self.wishlists_toolbar
         ) = ui.load(scope=self, path="mainwindow.ui")
 
         super().__init__(widget=Gtk.ApplicationWindow(child=self.container))
