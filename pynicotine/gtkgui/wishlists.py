@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Nicotine+ Contributors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import os
+
 from gi.repository import Gtk
 
 from pynicotine.config import config
@@ -15,6 +17,7 @@ from pynicotine.gtkgui.widgets.dialogs import EntryDialog
 from pynicotine.gtkgui.widgets.dialogs import OptionDialog
 from pynicotine.gtkgui.widgets.filechooser import FileChooserButton
 from pynicotine.gtkgui.widgets.filechooser import FileChooserSave
+from pynicotine.gtkgui.widgets.filechooser import FolderChooser
 from pynicotine.gtkgui.widgets.popupmenu import PopupMenu
 from pynicotine.gtkgui.widgets.theme import add_css_class
 from pynicotine.gtkgui.widgets.treeview import TreeView
@@ -237,20 +240,47 @@ class WishlistSettingsDialog(Dialog):
         folder_label = Gtk.Label(label=_("Folder to watch:"), wrap=True, xalign=0, visible=True)
         self._append(folder_label)
 
-        folder_row = Gtk.Box(visible=True)
+        folder_row = Gtk.Box(spacing=6, visible=True)
         self._append(folder_row)
 
-        self.folder_chooser = FileChooserButton(folder_row, self.application, chooser_type="folder")
+        self.folder_entry = Gtk.Entry(
+            hexpand=True, placeholder_text=_("Paste or type a folder path…"), visible=True, text=folder_path or "")
+        folder_label.set_mnemonic_widget(self.folder_entry)
 
-        if folder_path:
-            self.folder_chooser.set_path(folder_path)
+        browse_button = Gtk.Button(tooltip_text=_("Browse…"), valign=Gtk.Align.CENTER, visible=True)
+        browse_button.connect("clicked", self.on_browse_folder)
+
+        if GTK_API_VERSION >= 4:
+            browse_button.set_icon_name("folder-symbolic")  # pylint: disable=no-member
+            folder_row.append(self.folder_entry)             # pylint: disable=no-member
+            folder_row.append(browse_button)                 # pylint: disable=no-member
+        else:
+            browse_button.set_image(Gtk.Image(icon_name="folder-symbolic"))  # pylint: disable=no-member
+            folder_row.add(self.folder_entry)                 # pylint: disable=no-member
+            folder_row.add(browse_button)                     # pylint: disable=no-member
+
+    def on_browse_folder_response(self, selected, _data):
+
+        selected_path = next(iter(selected), None)
+
+        if selected_path:
+            self.folder_entry.set_text(selected_path)
+
+    def on_browse_folder(self, *_args):
+
+        FolderChooser(
+            application=self.application,
+            callback=self.on_browse_folder_response,
+            initial_folder=self.folder_entry.get_text().strip()
+        ).present()
 
     def on_cancel(self, *_args):
         self.close()
 
     def on_save(self, *_args):
 
-        self.callback(self.watch_enabled_switch.get_active(), self.folder_chooser.get_path())
+        folder_path = os.path.expandvars(self.folder_entry.get_text().strip())
+        self.callback(self.watch_enabled_switch.get_active(), folder_path)
         self.close()
 
 
