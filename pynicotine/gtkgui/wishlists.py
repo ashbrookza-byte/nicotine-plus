@@ -566,6 +566,7 @@ class Wishlists:
             self.export_summary_button,
             self.items_container,
             self.items_pane,
+            self.items_search_entry,
             self.list_settings_button,
             self.lists_container,
             self.lists_pane,
@@ -583,6 +584,7 @@ class Wishlists:
         self.toolbar_default_widget = self.add_list_button
 
         self.current_list_name = None
+        self.items_search_query = ""
 
         if GTK_API_VERSION >= 4:
             window.wishlists_content.append(self.container)  # pylint: disable=no-member
@@ -700,6 +702,16 @@ class Wishlists:
     def on_focus(self, *_args):
         self.lists_view.grab_focus()
 
+    def on_items_search_changed(self, entry, *_args):
+
+        self.items_search_query = entry.get_text().strip().lower()
+
+        if self.current_list_name is not None:
+            self._show_list(self.current_list_name, reset_search=False)
+
+    def on_items_search_stop(self, entry, *_args):
+        entry.set_text("")
+
     def on_select_list_row(self, list_view, iterator):
 
         if iterator is None:
@@ -774,7 +786,31 @@ class Wishlists:
             item.h_length
         ]
 
+    def _matches_items_search(self, item):
+        """Whether an item matches the current items-list search query — checked
+        against the search term, what it was actually searched as, its status,
+        and the downloaded filename, so e.g. typing an artist name, "not found",
+        or part of a filename all work."""
+
+        query = self.items_search_query
+
+        if not query:
+            return True
+
+        haystack = " ".join((
+            item.term,
+            item.searched_term or "",
+            self.STATUS_LABELS.get(item.status, item.status),
+            item.download_filename
+        )).lower()
+
+        return query in haystack
+
     def _add_item_row(self, item):
+
+        if not self._matches_items_search(item):
+            return
+
         self.items_view.add_row(self._item_row_values(item), select_row=False)
 
     def _update_item_row(self, name, term):
@@ -814,12 +850,23 @@ class Wishlists:
         self.pause_resume_button.set_label(self._pause_resume_label(download_list))
         self.pause_resume_button.set_use_underline(True)
 
-    def _show_list(self, name):
+    def _show_list(self, name, reset_search=True):
+        """reset_search is False when re-showing the same list after a background
+        update (e.g. an item's status changed), so an in-progress search isn't
+        wiped out from under the user; switching to a different list always
+        starts that list's view unfiltered."""
+
+        is_new_list = reset_search and name != self.current_list_name
 
         self.current_list_name = name
         has_list = name is not None
         download_list = core.download_lists.lists.get(name) if has_list else None
 
+        if is_new_list:
+            self.items_search_query = ""
+            self.items_search_entry.set_text("")
+
+        self.items_search_entry.set_sensitive(has_list)
         self.add_songs_button.set_sensitive(has_list)
         self.list_settings_button.set_sensitive(has_list)
         self.export_summary_button.set_sensitive(has_list)
