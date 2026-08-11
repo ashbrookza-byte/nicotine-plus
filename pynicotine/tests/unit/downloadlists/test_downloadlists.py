@@ -1499,6 +1499,61 @@ class DownloadListsTest(TestCase):
         self.assertEqual(len(plain_item.download_candidates), 1)
         self.assertEqual(len(remix_item.download_candidates), 1)
 
+    def test_search_text_excludes_remix_when_term_has_no_remix(self):
+        """"-word" is Soulseek search syntax excluding results containing that
+        word -- appended to the actual network search request (not just
+        filtered locally afterwards) when the term itself has no remix, so a
+        peer that honors it won't send remixes back in the first place."""
+
+        from pynicotine.events import events
+        from pynicotine.slskmessages import FileSearch
+
+        download_list = core.download_lists.add_list("No Remix Search List", auto_download=True)
+        core.download_lists.add_list_items("No Remix Search List", ["Blissful Thinking - Das Pharaoh"])
+        item = download_list.items["Blissful Thinking - Das Pharaoh"]
+
+        sent_messages = []
+
+        def capture_message(msg):
+            sent_messages.append(msg)
+
+        events.connect("queue-network-message", capture_message)
+        try:
+            core.download_lists._dispatch_item(download_list, item)
+        finally:
+            events.disconnect("queue-network-message", capture_message)
+
+        searches = [msg for msg in sent_messages if isinstance(msg, FileSearch)]
+        self.assertEqual(len(searches), 1)
+        self.assertTrue(searches[0].searchterm.endswith(" -remix"))
+
+    def test_search_text_does_not_exclude_remix_when_term_wants_one(self):
+        """The term already asks for a remix -- excluding "remix" from its own
+        search would find nothing, so no exclusion is added."""
+
+        from pynicotine.events import events
+        from pynicotine.slskmessages import FileSearch
+
+        download_list = core.download_lists.add_list("Wants Remix Search List", auto_download=True)
+        core.download_lists.add_list_items(
+            "Wants Remix Search List", ["Blissful Thinking (Someone Remix) - Das Pharaoh"])
+        item = download_list.items["Blissful Thinking (Someone Remix) - Das Pharaoh"]
+
+        sent_messages = []
+
+        def capture_message(msg):
+            sent_messages.append(msg)
+
+        events.connect("queue-network-message", capture_message)
+        try:
+            core.download_lists._dispatch_item(download_list, item)
+        finally:
+            events.disconnect("queue-network-message", capture_message)
+
+        searches = [msg for msg in sent_messages if isinstance(msg, FileSearch)]
+        self.assertEqual(len(searches), 1)
+        self.assertNotIn("-remix", searches[0].searchterm)
+
     # Watch Folder #
 
     def _set_up_watch_folder(self, enabled=True):

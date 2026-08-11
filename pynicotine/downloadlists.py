@@ -1412,6 +1412,16 @@ class DownloadLists:
         if not text:
             return
 
+        if "remix" not in self._term_words(item.term):
+            # "-word" is Soulseek search syntax excluding results containing
+            # that word -- added after sanitizing, since "-" is itself one of
+            # the characters _sanitize_text() strips out. A peer that honors
+            # it won't even send back remixes in the first place, on top of
+            # _matches_remix_requirement()'s local backstop for ones that
+            # don't (or for the reverse case: a term that does want a remix
+            # has no single word to exclude the plain original by)
+            text += " -remix"
+
         log.add_search(_('Searching for download list item "%s"'), text)
 
         core.send_message_to_network_thread(AddAllowedResponse(FileSearchResponse, item.token))
