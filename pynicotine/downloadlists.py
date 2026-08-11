@@ -503,6 +503,14 @@ class DownloadLists:
                 items=items
             )
 
+        # Guarantee the pinned-ahead-of-unpinned invariant _pop_next_queued_entry and
+        # the GUI sidebar rely on, in case saved data predates it or was hand-edited.
+        # sorted() is stable, so relative order within each group is preserved
+        self.lists = {
+            name: self.lists[name]
+            for name in sorted(self.lists, key=lambda list_name: not self.lists[list_name].pinned)
+        }
+
         # Re-queue anything left pending from a previous session
         for download_list in self.lists.values():
             if not download_list.effective_auto_download:
@@ -756,12 +764,14 @@ class DownloadLists:
                     {"old": old_folder_path, "new": new_folder_path, "error": error})
 
     def set_list_pinned(self, name, pinned):
-        """Pinning keeps a list in the GUI's Active section even once every item
-        is done, instead of it moving to Completed -- for a list the user wants
-        to keep adding to indefinitely. It doesn't change dispatch priority or
-        position on its own; that's controlled purely by drag-and-drop/Move
-        Up/Down (see reorder_lists/move_list_up/down) -- top is priority 1,
-        pinned or not."""
+        """A pinned list always stays at the top of the GUI's Active section,
+        ahead of every unpinned list, and never moves to Completed even once
+        every item is done -- for a list the user wants to keep adding to and
+        always see first. Pinned lists can only be reordered against other
+        pinned lists (and likewise unpinned ones against each other) -- see
+        reorder_lists/_swap_list_priority -- so pinning/unpinning here also
+        moves the list to the back of the pinned block / front of the
+        unpinned block, keeping that grouping intact."""
 
         download_list = self.lists.get(name)
 
@@ -769,12 +779,27 @@ class DownloadLists:
             return
 
         download_list.pinned = bool(pinned)
+        self._regroup_pinned_lists(name)
 
         events.emit("update-download-list", name)
+        events.emit("reorder-download-lists")
         self._save()
 
         if download_list.pinned:
             self._kick_queue()
+
+    def _regroup_pinned_lists(self, name):
+        """Move name to the back of the pinned block if it was just pinned, or
+        to the front of the unpinned block if it was just unpinned, keeping
+        pinned lists always grouped ahead of unpinned ones in priority order."""
+
+        names = list(self.lists.keys())
+        names.remove(name)
+
+        insert_at = sum(1 for other in names if self.lists[other].pinned)
+        names.insert(insert_at, name)
+
+        self.lists = {list_name: self.lists[list_name] for list_name in names}
 
     def _active_list_names(self):
         """Names of lists in the GUI's Active section, in current priority
@@ -794,14 +819,21 @@ class DownloadLists:
         self._swap_list_priority(name, 1)
 
     def _swap_list_priority(self, name, direction):
-        """Swap name with its neighbor (direction -1 for up, +1 for down) among
-        Active-section lists -- a completed, unpinned list has no meaningful
-        priority left, so it's never a valid swap target."""
+        """Swap name with its neighbor (direction -1 for up, +1 for down)
+        among lists in the same priority group -- pinned lists only reorder
+        among other pinned lists, and likewise for unpinned/active ones -- so
+        a swap can't cross the pinned/unpinned boundary or touch a completed,
+        unpinned list, which has no meaningful priority anymore."""
 
-        group = self._active_list_names()
+        download_list = self.lists.get(name)
 
-        if name not in group:
+        if download_list is None:
             return
+
+        group = [
+            list_name for list_name, other in self.lists.items()
+            if other.pinned == download_list.pinned and (other.pinned or not other.is_complete)
+        ]
 
         index = group.index(name)
         swap_index = index + direction
@@ -823,8 +855,12 @@ class DownloadLists:
     def reorder_lists(self, ordered_names):
         """Apply a full new priority order for the Active section's lists --
         e.g. from a drag-and-drop reorder in the GUI sidebar, where the top
-        row is priority 1. Lists not in the Active section (completed and
-        unpinned) keep their existing relative order, appended after it.
+        row is priority 1. Pinned lists always stay grouped ahead of unpinned
+        ones: each tier's relative order is taken from ordered_names, but a
+        drag that crossed the pinned/unpinned boundary is snapped back into
+        the correct group rather than breaking that invariant. Lists not in
+        the Active section (completed and unpinned) keep their existing
+        relative order, appended after it.
 
         ordered_names must include every current Active-section list exactly
         once, or this is a no-op -- a partial list would otherwise risk
@@ -836,8 +872,11 @@ class DownloadLists:
         if len(new_order) != len(active_names) or len(set(new_order)) != len(new_order):
             return
 
+        pinned_order = [name for name in new_order if self.lists[name].pinned]
+        unpinned_order = [name for name in new_order if not self.lists[name].pinned]
         remaining = [name for name in self.lists if name not in active_names]
-        self.lists = {name: self.lists[name] for name in new_order + remaining}
+
+        self.lists = {name: self.lists[name] for name in pinned_order + unpinned_order + remaining}
 
         events.emit("reorder-download-lists")
         self._save()
@@ -1534,13 +1573,31 @@ class DownloadLists:
         return True
 
     @staticmethod
-    def _match_percentage(term_words, path_lower):
+    def _match_percentage(term_words, filename_lower, path_lower):
+        """Score how well the search term matches a candidate file. A word
+        found in the filename itself counts in full; one found only in a
+        parent folder counts for half, since many shares put the artist in
+        the folder name and only the track title in the filename.
+
+        Weighting the filename this way is what keeps a compilation/mix set
+        whose FOLDER happens to be named after the search term (e.g. a "Carl
+        Cox - Pure" radio show archive) from being treated as a 100% match
+        for every individual, differently-titled track file inside it --
+        those only ever match in the folder, so they top out at 50%, well
+        below fuzzy_match_threshold's default of 70."""
 
         if not term_words:
             return 100.0
 
-        num_matched = sum(1 for word in term_words if word in path_lower)
-        return (num_matched / len(term_words)) * 100
+        score = 0.0
+
+        for word in term_words:
+            if word in filename_lower:
+                score += 1.0
+            elif word in path_lower:
+                score += 0.5
+
+        return (score / len(term_words)) * 100
 
     @staticmethod
     def _parse_keywords(keywords_text):
@@ -1603,7 +1660,8 @@ class DownloadLists:
                 continue
 
             path_lower = virtual_path.lower()
-            match_percentage = self._match_percentage(term_words, path_lower)
+            filename_lower = path_lower.replace("\\", "/").rsplit("/", 1)[-1]
+            match_percentage = self._match_percentage(term_words, filename_lower, path_lower)
 
             if match_percentage < download_list.effective_fuzzy_match_threshold:
                 # Doesn't look enough like the original term, e.g. a search that was

@@ -601,10 +601,11 @@ class Wishlists:
         # placeholder bound to its visibility
         window.wishlists_content.set_visible(True)
 
-        # Active lists are shown in priority order (top = priority 1), reorderable
-        # by dragging a row or via Move Up/Down — see DownloadLists.reorder_lists/
-        # move_list_up/down — so they're intentionally left unsorted here rather
-        # than alphabetically
+        # Active lists are shown in priority order (top = priority 1, pinned
+        # lists always grouped ahead of unpinned ones), reorderable by dragging
+        # a row or via Move Up/Down within its own pinned/unpinned group — see
+        # DownloadLists.reorder_lists/move_list_up/down — so they're
+        # intentionally left unsorted here rather than alphabetically
         self.lists_view = TreeView(
             window, parent=self.lists_container, select_row_callback=self.on_select_list_row,
             reorder_callback=self.on_lists_view_reordered,
@@ -739,6 +740,7 @@ class Wishlists:
 
         self.items_popup_menu = PopupMenu(window.application, self.items_view.widget)
         self.items_popup_menu.add_items(
+            ("#" + _("_Search"), self.on_search_item),
             ("#" + _("Start _Next"), self.on_start_next_item),
             ("#" + _("_Reset"), self.on_reset_item),
             ("", None),
@@ -1277,6 +1279,19 @@ class Wishlists:
             callback=self.on_remove_list_response,
             callback_data=name
         ).present()
+
+    def on_search_item(self, *_args):
+        """Run a fresh Search Files search for the (first) selected item's
+        search term, and switch to that tab -- the same lookup this item's
+        own automatic search is already trying, just user-driven and visible."""
+
+        iterator = next(self.items_view.get_selected_rows(), None)
+
+        if iterator is None:
+            return
+
+        term = self.items_view.get_row_value(iterator, "term")
+        core.search.do_search(term, mode="global")
 
     def on_start_next_item(self, *_args):
 
