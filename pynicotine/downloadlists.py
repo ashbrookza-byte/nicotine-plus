@@ -63,7 +63,7 @@ class DownloadListItem:
         "term", "list_name", "time_added", "status", "searched_term", "token",
         "download_username", "download_virtual_path", "download_size", "download_attributes",
         "download_candidates", "variant_index", "collect_timer_id", "escalation_timer_id",
-        "download_percent"
+        "download_percent", "stall_timer_id"
     )
 
     def __init__(self, term, list_name, time_added=None, status=DownloadListItemStatus.PENDING,
@@ -93,6 +93,7 @@ class DownloadListItem:
         self.collect_timer_id = None
         self.escalation_timer_id = None
         self.download_percent = 100 if status == DownloadListItemStatus.COMPLETED else 0
+        self.stall_timer_id = None
 
     @property
     def h_quality(self):
@@ -296,6 +297,11 @@ class DownloadLists:
 
     # How long to wait for results before broadening an item's search term
     ESCALATION_DELAY = 10
+
+    # A download whose transfer speed stays below MIN_TRANSFER_SPEED for this long
+    # (whether it's stuck at 0% or just crawling) is abandoned and searched again
+    STALL_TIMEOUT = 15
+    MIN_TRANSFER_SPEED = 5 * 1024  # 5 KiB/s
 
     QUALITY_LABELS = {
         "any": _("Any"),
@@ -949,6 +955,9 @@ class DownloadLists:
 
         self._forget_search(item)
 
+        events.cancel_scheduled(item.stall_timer_id)
+        item.stall_timer_id = None
+
         transfer_key = next(
             (key for key, value in self._transfer_map.items() if value == (item.list_name, item.term)), None)
 
@@ -1262,6 +1271,8 @@ class DownloadLists:
         item.download_size = size
         item.download_attributes = attributes
         item.download_percent = 0
+        item.stall_timer_id = events.schedule(
+            delay=self.STALL_TIMEOUT, callback=lambda: self._handle_stalled_download(list_name, term))
 
         transfer_key = username + virtual_path
         self._transfer_map[transfer_key] = (list_name, term)
@@ -1303,6 +1314,14 @@ class DownloadLists:
             return
 
         if transfer.status != TransferStatus.FINISHED:
+            if transfer.speed >= self.MIN_TRANSFER_SPEED:
+                # Healthy throughput observed just now: push the stall deadline back out.
+                # Anything below the threshold (including exactly 0, e.g. still queued or
+                # stuck) leaves the existing timer running toward its original deadline
+                events.cancel_scheduled(item.stall_timer_id)
+                item.stall_timer_id = events.schedule(
+                    delay=self.STALL_TIMEOUT, callback=lambda: self._handle_stalled_download(list_name, term))
+
             percent = self._transfer_percent(transfer.current_byte_offset, transfer.size)
 
             if percent == item.download_percent:
@@ -1329,3 +1348,46 @@ class DownloadLists:
 
         if download_list is not None and download_list.is_complete:
             events.emit("download-list-completed", list_name)
+
+    def _handle_stalled_download(self, list_name, term):
+        """A download whose transfer speed stayed below MIN_TRANSFER_SPEED for
+        STALL_TIMEOUT seconds straight: give up on this candidate, cancel its
+        transfer, and search again so a different source gets a chance."""
+
+        download_list = self.lists.get(list_name)
+        item = download_list.items.get(term) if download_list is not None else None
+
+        if item is None or item.status != DownloadListItemStatus.DOWNLOADING:
+            # Already moved on (completed, reset, removed) since this timer was scheduled
+            return
+
+        item.stall_timer_id = None
+
+        transfer_key = item.download_username + item.download_virtual_path
+        transfer = core.downloads.transfers.get(transfer_key)
+
+        log.add_search(
+            _('Download stalled for "%(term)s" (no meaningful progress for %(seconds)s seconds), '
+              "searching for a different source"),
+            {"term": term, "seconds": self.STALL_TIMEOUT}
+        )
+
+        if transfer is not None:
+            core.downloads.abort_downloads([transfer], status=TransferStatus.CANCELLED)
+            core.downloads.clear_downloads([transfer])
+
+        self._forget_item(item)
+
+        item.status = DownloadListItemStatus.PENDING
+        item.download_username = None
+        item.download_virtual_path = None
+        item.download_size = 0
+        item.download_attributes = None
+        item.download_percent = 0
+
+        if download_list.effective_auto_download:
+            self._queue.appendleft((list_name, term))
+            self._kick_queue()
+
+        events.emit("update-download-list-item", list_name, term)
+        self._save()

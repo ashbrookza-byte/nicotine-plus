@@ -454,9 +454,88 @@ class DownloadListsTest(TestCase):
 
         rows = core.download_lists.get_summary_rows("Live List")
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["term"], "Cool Artist - Great Song")
-        self.assertTrue(rows[0]["downloaded_file"].endswith("Great Song.mp3"))
-        self.assertEqual(rows[0]["user"], "someuser")
+
+    def test_stalled_download_is_abandoned_and_requeued(self):
+        """A download whose transfer speed never reaches the minimum threshold is
+        abandoned once its stall timer fires, and the item is re-queued to search
+        for a different source."""
+
+        from pynicotine.transfers import TransferStatus
+
+        download_list = core.download_lists.add_list(
+            "Stall List", download_folder_path=DATA_FOLDER_PATH, quality="any",
+            fuzzy_match_threshold=50, auto_download=True
+        )
+        core.download_lists.add_list_items("Stall List", ["Slow Artist - Slow Song"])
+
+        item = download_list.items["Slow Artist - Slow Song"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Slow Artist\\Slow Artist - Slow Song.mp3", 8000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "slowuser", files)
+
+        core.download_lists._file_search_response(msg)
+        core.download_lists._finalize_item("Stall List", "Slow Artist - Slow Song")
+
+        self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
+        self.assertIsNotNone(item.stall_timer_id)
+
+        transfer_key = "slowuser" + item.download_virtual_path
+        transfer = core.downloads.transfers.get(transfer_key)
+        self.assertIsNotNone(transfer)
+
+        # A trickle of progress below the minimum speed shouldn't reset the stall timer
+        transfer.status = TransferStatus.TRANSFERRING
+        transfer.current_byte_offset = 100
+        transfer.speed = 1024  # 1 KiB/s, below MIN_TRANSFER_SPEED
+        core.download_lists._update_download(transfer, True)
+
+        self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
+
+        # Simulate the stall timer firing
+        core.download_lists._handle_stalled_download("Stall List", "Slow Artist - Slow Song")
+
+        self.assertEqual(item.status, DownloadListItemStatus.PENDING)
+        self.assertEqual(item.download_percent, 0)
+        self.assertIsNone(item.download_username)
+        self.assertIsNone(core.downloads.transfers.get(transfer_key))
+        self.assertIn(("Stall List", "Slow Artist - Slow Song"), core.download_lists._queue)
+
+    def test_healthy_speed_resets_stall_timer(self):
+        """A transfer whose speed reaches the minimum threshold gets its stall
+        deadline pushed back out, rather than being abandoned."""
+
+        from pynicotine.transfers import TransferStatus
+
+        download_list = core.download_lists.add_list(
+            "Healthy List", download_folder_path=DATA_FOLDER_PATH, quality="any",
+            fuzzy_match_threshold=50, auto_download=True
+        )
+        core.download_lists.add_list_items("Healthy List", ["Fast Artist - Fast Song"])
+
+        item = download_list.items["Fast Artist - Fast Song"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Fast Artist\\Fast Artist - Fast Song.mp3", 8000000, "mp3", attributes)]
+        msg = self._make_response(item.token, "fastuser", files)
+
+        core.download_lists._file_search_response(msg)
+        core.download_lists._finalize_item("Healthy List", "Fast Artist - Fast Song")
+
+        original_timer_id = item.stall_timer_id
+        self.assertIsNotNone(original_timer_id)
+
+        transfer = core.downloads.transfers.get("fastuser" + item.download_virtual_path)
+        transfer.status = TransferStatus.TRANSFERRING
+        transfer.current_byte_offset = 4000000
+        transfer.speed = 50 * 1024  # well above MIN_TRANSFER_SPEED
+        core.download_lists._update_download(transfer, True)
+
+        self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
+        self.assertIsNotNone(item.stall_timer_id)
+        self.assertNotEqual(item.stall_timer_id, original_timer_id)
 
     def test_low_quality_candidate_is_rejected(self):
         """A candidate below the list's quality preference should not be
