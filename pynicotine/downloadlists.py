@@ -1233,12 +1233,19 @@ class DownloadLists:
 
             keyword_match = self._matches_preferred_keywords(download_list.effective_preferred_keywords, path_lower)
 
+            # A lossless file's "bitrate" here is really sample_rate * bit_depth * channels
+            # (e.g. ~1411 for 44.1kHz/16-bit), which dwarfs any real lossy bitrate (normally
+            # <=320) and would otherwise decide every tie in favor of lossless regardless of
+            # the preference below. Capping it keeps bitrate a genuine tiebreaker between
+            # comparable candidates instead of an accidental format preference of its own
+            capped_bitrate = min(bitrate, 320)
+
             score = (
                 round(match_percentage),
                 bool(msg.freeulslots),
                 keyword_match,
-                is_lossless if download_list.effective_prefer_lossless else False,
-                bitrate,
+                is_lossless if download_list.effective_prefer_lossless else not is_lossless,
+                capped_bitrate,
                 length if download_list.effective_prefer_longer else 0,
                 -msg.inqueue
             )

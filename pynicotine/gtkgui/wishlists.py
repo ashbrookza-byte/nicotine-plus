@@ -175,8 +175,9 @@ class ListSettingsDialog(Dialog):
         self._labeled_row(
             _("Prefer lossless (FLAC/WAV) over lossy when both are available"), self.prefer_lossless_switch,
             track_override=True,
-            tooltip_text=_("Doesn't exclude lossy files by itself — pair with a minimum file quality "
-                            "of \"Lossless only\" above to require lossless.")
+            tooltip_text=_("On: a lossless result wins over an otherwise-equal lossy one. Off: a lossy "
+                            "(e.g. mp3) result wins instead. Doesn't exclude either format by itself — "
+                            "pair with a minimum file quality of \"Lossless only\" above to require lossless.")
         )
 
     def _add_keywords_option(self):
@@ -357,8 +358,9 @@ class WishlistSettingsDialog(Dialog):
             active=transfers["downloadlistdefaultpreferlossless"], valign=Gtk.Align.CENTER, visible=True)
         self._labeled_row(
             _("Prefer lossless (FLAC/WAV) over lossy when both are available"), self.default_prefer_lossless_switch,
-            tooltip_text=_("Doesn't exclude lossy files by itself — pair with a minimum file quality "
-                            "of \"Lossless only\" above to require lossless."))
+            tooltip_text=_("On: a lossless result wins over an otherwise-equal lossy one. Off: a lossy "
+                            "(e.g. mp3) result wins instead. Doesn't exclude either format by itself — "
+                            "pair with a minimum file quality of \"Lossless only\" above to require lossless."))
 
         keywords_label = Gtk.Label(
             label=_("Preferred source keywords (comma-separated):"), wrap=True, xalign=0, visible=True)

@@ -268,6 +268,61 @@ class DownloadListsTest(TestCase):
         _score, _username, virtual_path, _size, _attributes = item.download_candidates[0]
         self.assertIn("lossless", virtual_path)
 
+    def test_prefer_lossless_off_actually_prefers_mp3(self):
+        """A 44.1kHz/16-bit FLAC's estimated "bitrate" (~1411) dwarfs a real mp3's
+        (<=320), which would silently win the raw bitrate tiebreaker regardless of
+        preference if left uncapped. With prefer_lossless off, the mp3 must win —
+        turning the preference off should actually mean "prefer mp3", not "no
+        preference, let the inflated FLAC number decide"."""
+
+        download_list = core.download_lists.add_list(
+            "Mp3 Preferring List", quality="any", fuzzy_match_threshold=50,
+            auto_download=True, prefer_lossless=False)
+        core.download_lists.add_list_items("Mp3 Preferring List", ["Kasablanca - Time Is A Circle"])
+
+        item = download_list.items["Kasablanca - Time Is A Circle"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        lossy_attributes = FileAttributes(bitrate=320, length=258, vbr=0)
+        lossless_attributes = FileAttributes(length=258, sample_rate=44100, bit_depth=16)
+        files = [
+            (1, "@@abc\\Kasablanca - Time Is A Circle.flac", 28100000, "flac", lossless_attributes),
+            (1, "@@abc\\Kasablanca - Time Is A Circle (Extended Club Mix).mp3", 13700000, "mp3", lossy_attributes),
+        ]
+        msg = self._make_response(item.token, "someuser", files)
+
+        core.download_lists._file_search_response(msg)
+
+        self.assertEqual(len(item.download_candidates), 1)
+        _score, _username, virtual_path, _size, _attributes = item.download_candidates[0]
+        self.assertTrue(virtual_path.endswith(".mp3"))
+
+    def test_prefer_lossless_on_still_prefers_flac_despite_capped_bitrate(self):
+        """Capping the bitrate tiebreaker must not break the normal case: with
+        prefer_lossless on, FLAC should still win over mp3."""
+
+        download_list = core.download_lists.add_list(
+            "Flac Preferring List", quality="any", fuzzy_match_threshold=50,
+            auto_download=True, prefer_lossless=True)
+        core.download_lists.add_list_items("Flac Preferring List", ["Kasablanca - Time Is A Circle"])
+
+        item = download_list.items["Kasablanca - Time Is A Circle"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        lossy_attributes = FileAttributes(bitrate=320, length=258, vbr=0)
+        lossless_attributes = FileAttributes(length=258, sample_rate=44100, bit_depth=16)
+        files = [
+            (1, "@@abc\\Kasablanca - Time Is A Circle.flac", 28100000, "flac", lossless_attributes),
+            (1, "@@abc\\Kasablanca - Time Is A Circle (Extended Club Mix).mp3", 13700000, "mp3", lossy_attributes),
+        ]
+        msg = self._make_response(item.token, "someuser", files)
+
+        core.download_lists._file_search_response(msg)
+
+        self.assertEqual(len(item.download_candidates), 1)
+        _score, _username, virtual_path, _size, _attributes = item.download_candidates[0]
+        self.assertTrue(virtual_path.endswith(".flac"))
+
     def test_matches_preferred_keywords_uses_word_boundaries(self):
         """"bp" should match a whole "BP" folder/word, not an unrelated substring
         like "bpm128" where "bp" isn't a standalone word."""
