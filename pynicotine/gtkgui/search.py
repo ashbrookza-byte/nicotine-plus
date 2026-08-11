@@ -41,6 +41,7 @@ from pynicotine.gtkgui.widgets.treeview import TreeView
 from pynicotine.gtkgui.widgets.treeview import create_grouping_menu
 from pynicotine.logfacility import log
 from pynicotine.search import ResultFilterMode
+from pynicotine.search import SearchRequest
 from pynicotine.shares import FileTypes
 from pynicotine.slskmessages import FileListMessage
 from pynicotine.transfers import TransferStatus
@@ -371,7 +372,10 @@ class Searches(IconNotebook):
         if page is None:
             search_item = core.search.searches.get(msg.token)
 
-            if search_item is None:
+            # Download list items also register themselves in core.search.searches (to
+            # reuse its response routing/allowed-token bookkeeping), but they aren't
+            # SearchRequest objects and are displayed on the Wishlists page, not here
+            if not isinstance(search_item, SearchRequest):
                 return
 
             search_term = search_item.term
