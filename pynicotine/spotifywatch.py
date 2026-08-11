@@ -326,7 +326,7 @@ class SpotifyWatch:
         class CallbackHandler(BaseHTTPRequestHandler):
             """Receives the single OAuth redirect, then the server is shut down."""
 
-            def do_GET(self):  # noqa: N802 (name required by BaseHTTPRequestHandler)
+            def do_GET(self):  # pylint: disable=invalid-name
 
                 query = parse_qs(urlparse(self.path).query)
                 code = query.get("code", [None])[0]
@@ -486,7 +486,7 @@ class SpotifyWatch:
                     return json.loads(response.read().decode("utf-8"))
 
             except HTTPError as error:
-                if error.code == 401 and attempt == 0:
+                if error.code == 401 and not attempt:
                     # Token rejected, force a refresh and try once more
                     self._access_token = None
                     continue
