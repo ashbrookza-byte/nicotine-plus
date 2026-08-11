@@ -59,7 +59,7 @@ class TreeView:
     def __init__(self, window, parent, columns, has_tree=False, multi_select=False,
                  persistent_sort=False, persistent_widths=True, name=None, secondary_name=None,
                  activate_row_callback=None, focus_in_callback=None, select_row_callback=None,
-                 delete_accelerator_callback=None, search_entry=None):
+                 delete_accelerator_callback=None, search_entry=None, reorder_callback=None):
 
         self.window = window
         self.widget = Gtk.TreeView(fixed_height_mode=True, has_tooltip=True, visible=True)
@@ -139,6 +139,32 @@ class TreeView:
         if search_entry:
             self.widget.set_search_entry(search_entry)
 
+        self._reorder_callback = reorder_callback
+        self._rows_reordered_handler = None
+        self._reorder_drag_key = None
+
+        if reorder_callback:
+            if GTK_API_VERSION >= 4:
+                # GtkTreeView's own row drag-and-drop (Gtk.TreeView.set_reorderable())
+                # corrupts the model in GTK >=4.22 (duplicates rows instead of moving
+                # them) — the same underlying bug as the column-reordering one noted
+                # below. A hand-rolled Gtk.DragSource/Gtk.DropTarget pair (GTK4's
+                # modern replacement for the old per-widget DND API, which no longer
+                # exists at all in GTK4) doesn't fare any better: GtkTreeView's own
+                # built-in drag handling silently claims the press-and-move gesture
+                # before an externally attached DragSource ever sees it, so "prepare"
+                # never fires, reorder or not. Gtk.GestureDrag sidesteps the whole
+                # DND negotiation system (no ghost icon, no OS-level drag) and is
+                # driven entirely by this file's own press/motion/release tracking
+                # instead, which does reliably reach GtkTreeView.
+                drag_gesture = Gtk.GestureDrag()
+                drag_gesture.connect("drag-begin", self._on_reorder_drag_begin)
+                drag_gesture.connect("drag-end", self._on_reorder_drag_end)
+                self.widget.add_controller(drag_gesture)                  # pylint: disable=no-member
+            else:
+                self.widget.set_reorderable(True)
+                self._rows_reordered_handler = self.model.connect("rows-reordered", self._on_rows_reordered)
+
         self._query_tooltip_handler = self.widget.connect("query-tooltip", self.on_tooltip)
         self.widget.connect("move-cursor", self.on_key_move_cursor)
         self.widget.set_search_equal_func(self.on_search_match)
@@ -152,8 +178,108 @@ class TreeView:
         self.widget.disconnect(self._query_tooltip_handler)
         self._v_adjustment.disconnect(self.notify_value_handler)
 
+        if self._rows_reordered_handler is not None:
+            self.model.disconnect(self._rows_reordered_handler)
+
         self._column_menu.destroy()
         self.__dict__.clear()
+
+    def _on_rows_reordered(self, model, _path, _iterator, _new_order):
+        """GTK 3 only — see reorder_callback. A drag-and-drop reorder finished;
+        report the resulting top-to-bottom row order back."""
+
+        self._report_reordered_rows(model)
+
+    def _report_reordered_rows(self, model):
+
+        ordered_keys = []
+        iterator = model.get_iter_first()
+
+        while iterator is not None:
+            ordered_keys.append(self._row_key_at_iterator(iterator))
+            iterator = model.iter_next(iterator)
+
+        self._reorder_callback([key for key in ordered_keys if key is not None])
+
+    def _get_path_at_widget_pos(self, x, y):
+        """get_path_at_pos() takes bin-window-relative coordinates (i.e.
+        excluding the header row), but every position this class receives from
+        an event/gesture is widget-relative -- convert first, matching what
+        on_tooltip() above already does for the same reason."""
+
+        bin_x, bin_y = self.widget.convert_widget_to_bin_window_coords(int(x), int(y))
+        return self.widget.get_path_at_pos(bin_x, bin_y)
+
+    def _row_key_at_iterator(self, iterator):
+        """A Gtk.TreeIter freshly obtained from get_iter(path) doesn't reliably
+        hash/compare equal to the original iterator object add_row() stored in
+        _iterator_keys, even for the same row -- so look the key up by reading
+        the model's iterator-key column directly instead, which sidesteps
+        iterator identity entirely."""
+
+        return self.model.get_value(iterator, self._iterator_key_column)
+
+    def _on_reorder_drag_begin(self, _gesture, x, y):
+        """GTK 4 only — see reorder_callback. Remember which row the press
+        started on, if any — this is the row that may end up moved once
+        drag-end fires, if the release turns out to be a real drag and not
+        just a plain click. This gesture never claims the event sequence
+        (see the class-level note above), so row selection's own separate
+        gesture keeps seeing every press/release exactly as before."""
+
+        self._reorder_drag_key = None
+        path_result = self._get_path_at_widget_pos(x, y)
+
+        if path_result is None:
+            return
+
+        iterator = self.model.get_iter(path_result[0])
+        self._reorder_drag_key = self._row_key_at_iterator(iterator)
+
+    def _on_reorder_drag_end(self, gesture, offset_x, offset_y):
+        """GTK 4 only — see reorder_callback. If the press-to-release amounted
+        to a real drag (moved far enough to not just be a click/double-click),
+        move the row to wherever it was released: above the target row if the
+        drag came from further down the list, below it if from further up."""
+
+        dragged_key = self._reorder_drag_key
+        self._reorder_drag_key = None
+
+        # A plain click still fires drag-begin/end with ~0 offset -- ignore those
+        if dragged_key is None or (abs(offset_x) < 4 and abs(offset_y) < 4):
+            return
+
+        source_iterator = self.iterators.get(dragged_key)
+
+        if source_iterator is None:
+            return
+
+        has_start_point, start_x, start_y = gesture.get_start_point()
+
+        if not has_start_point:
+            return
+
+        path_result = self._get_path_at_widget_pos(start_x + offset_x, start_y + offset_y)
+
+        if path_result is None:
+            return
+
+        target_path = path_result[0]
+        target_iterator = self.model.get_iter(target_path)
+        target_key = self._row_key_at_iterator(target_iterator)
+
+        if target_key is None or target_key == dragged_key:
+            return
+
+        source_index = self.model.get_path(source_iterator).get_indices()[0]
+        target_index = target_path.get_indices()[0]
+
+        if target_index > source_index:
+            self.model.move_after(source_iterator, target_iterator)
+        else:
+            self.model.move_before(source_iterator, target_iterator)
+
+        self._report_reordered_rows(self.model)
 
     def create_model(self):
 

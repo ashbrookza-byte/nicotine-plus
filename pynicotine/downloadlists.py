@@ -503,14 +503,6 @@ class DownloadLists:
                 items=items
             )
 
-        # Guarantee the pinned-ahead-of-unpinned invariant _pop_next_queued_entry and
-        # the GUI sidebar rely on, in case saved data predates it or was hand-edited.
-        # sorted() is stable, so relative order within each group is preserved
-        self.lists = {
-            name: self.lists[name]
-            for name in sorted(self.lists, key=lambda list_name: not self.lists[list_name].pinned)
-        }
-
         # Re-queue anything left pending from a previous session
         for download_list in self.lists.values():
             if not download_list.effective_auto_download:
@@ -764,10 +756,12 @@ class DownloadLists:
                     {"old": old_folder_path, "new": new_folder_path, "error": error})
 
     def set_list_pinned(self, name, pinned):
-        """A pinned list's queued items are dispatched ahead of every other
-        list's, so it keeps making progress even behind a long queue elsewhere.
-        Pinned lists are also kept grouped ahead of unpinned ones in priority
-        order, and never move to the Completed section in the GUI."""
+        """Pinning keeps a list in the GUI's Active section even once every item
+        is done, instead of it moving to Completed -- for a list the user wants
+        to keep adding to indefinitely. It doesn't change dispatch priority or
+        position on its own; that's controlled purely by drag-and-drop/Move
+        Up/Down (see reorder_lists/move_list_up/down) -- top is priority 1,
+        pinned or not."""
 
         download_list = self.lists.get(name)
 
@@ -775,27 +769,19 @@ class DownloadLists:
             return
 
         download_list.pinned = bool(pinned)
-        self._regroup_pinned_lists(name)
 
         events.emit("update-download-list", name)
-        events.emit("reorder-download-lists")
         self._save()
 
         if download_list.pinned:
             self._kick_queue()
 
-    def _regroup_pinned_lists(self, name):
-        """Move name to the back of the pinned block if it was just pinned, or to
-        the front of the unpinned block if it was just unpinned, keeping pinned
-        lists always grouped ahead of unpinned ones in priority order."""
+    def _active_list_names(self):
+        """Names of lists in the GUI's Active section, in current priority
+        order -- everything except a completed, unpinned list."""
 
-        names = list(self.lists.keys())
-        names.remove(name)
-
-        insert_at = sum(1 for other in names if self.lists[other].pinned)
-        names.insert(insert_at, name)
-
-        self.lists = {list_name: self.lists[list_name] for list_name in names}
+        return [name for name, download_list in self.lists.items()
+                if download_list.pinned or not download_list.is_complete]
 
     def move_list_up(self, name):
         """Raise a list's priority relative to its neighbors — earlier in this
@@ -809,20 +795,13 @@ class DownloadLists:
 
     def _swap_list_priority(self, name, direction):
         """Swap name with its neighbor (direction -1 for up, +1 for down) among
-        lists in the same priority group — pinned lists only reorder among other
-        pinned lists, and likewise for unpinned/active ones — so a swap can't
-        cross the pinned/unpinned boundary or touch a completed, unpinned list
-        (which has no meaningful priority anymore)."""
+        Active-section lists -- a completed, unpinned list has no meaningful
+        priority left, so it's never a valid swap target."""
 
-        download_list = self.lists.get(name)
+        group = self._active_list_names()
 
-        if download_list is None:
+        if name not in group:
             return
-
-        group = [
-            list_name for list_name, other in self.lists.items()
-            if other.pinned == download_list.pinned and (other.pinned or not other.is_complete)
-        ]
 
         index = group.index(name)
         swap_index = index + direction
@@ -837,6 +816,28 @@ class DownloadLists:
         names[i], names[j] = names[j], names[i]
 
         self.lists = {list_name: self.lists[list_name] for list_name in names}
+
+        events.emit("reorder-download-lists")
+        self._save()
+
+    def reorder_lists(self, ordered_names):
+        """Apply a full new priority order for the Active section's lists --
+        e.g. from a drag-and-drop reorder in the GUI sidebar, where the top
+        row is priority 1. Lists not in the Active section (completed and
+        unpinned) keep their existing relative order, appended after it.
+
+        ordered_names must include every current Active-section list exactly
+        once, or this is a no-op -- a partial list would otherwise risk
+        silently losing track of one."""
+
+        active_names = set(self._active_list_names())
+        new_order = [name for name in ordered_names if name in active_names]
+
+        if len(new_order) != len(active_names) or len(set(new_order)) != len(new_order):
+            return
+
+        remaining = [name for name in self.lists if name not in active_names]
+        self.lists = {name: self.lists[name] for name in new_order + remaining}
 
         events.emit("reorder-download-lists")
         self._save()
@@ -1305,11 +1306,10 @@ class DownloadLists:
         )
 
     def _pop_next_queued_entry(self):
-        """Pop the next (list_name, term) to dispatch, in list priority order.
-        self.lists is always kept with pinned lists grouped ahead of unpinned
-        ones (see _regroup_pinned_lists), and Move Up/Down lets the user adjust
-        relative priority within each group — so its key order alone fully
-        determines dispatch priority. Entries from the same list (equal
+        """Pop the next (list_name, term) to dispatch, in list priority order --
+        self.lists key order (top of the GUI sidebar = priority 1), set by
+        drag-and-drop/Move Up/Down (see reorder_lists/_swap_list_priority) and
+        otherwise by insertion order. Entries from the same list (equal
         priority) keep plain queue (FIFO) order relative to each other."""
 
         list_order = {name: index for index, name in enumerate(self.lists)}

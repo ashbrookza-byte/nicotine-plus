@@ -601,11 +601,13 @@ class Wishlists:
         # placeholder bound to its visibility
         window.wishlists_content.set_visible(True)
 
-        # Active lists are shown in priority order (pinned lists first, then by their
-        # relative position — see DownloadLists.move_list_up/down), so they're
-        # intentionally left unsorted here rather than alphabetically
+        # Active lists are shown in priority order (top = priority 1), reorderable
+        # by dragging a row or via Move Up/Down — see DownloadLists.reorder_lists/
+        # move_list_up/down — so they're intentionally left unsorted here rather
+        # than alphabetically
         self.lists_view = TreeView(
             window, parent=self.lists_container, select_row_callback=self.on_select_list_row,
+            reorder_callback=self.on_lists_view_reordered,
             columns={
                 "pin": {
                     "column_type": "text",
@@ -800,6 +802,12 @@ class Wishlists:
 
         name = list_view.get_row_value(iterator, "name")
         self._show_list(name)
+
+    def on_lists_view_reordered(self, ordered_names):
+        """The user dragged a row to a new position in the Active section —
+        top of the list is priority 1."""
+
+        core.download_lists.reorder_lists(ordered_names)
 
     def on_start(self):
         self._rebuild_lists_view()

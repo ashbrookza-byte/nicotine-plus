@@ -114,9 +114,11 @@ class DownloadListsTest(TestCase):
         self.assertEqual(pending, 3)
         self.assertEqual(core.download_lists._count_active_items(), 2)
 
-    def test_pinned_list_is_dispatched_ahead_of_others(self):
-        """A pinned list's queued item is dispatched before an earlier-queued
-        item from a plain, unpinned list."""
+    def test_pinning_alone_does_not_change_dispatch_priority(self):
+        """Pinning only exempts a list from moving to Completed -- it doesn't
+        reposition it or grant dispatch priority on its own. A list only
+        dispatches ahead of another by actually being higher in priority
+        order (drag-and-drop/Move Up/Down), pinned or not."""
 
         from pynicotine.slskmessages import UserStatus
 
@@ -126,19 +128,26 @@ class DownloadListsTest(TestCase):
         core.download_lists.update_max_concurrent_downloads(1)
         self.addCleanup(core.download_lists.update_max_concurrent_downloads, 3)
 
-        # Queued first, but not pinned
+        # Queued first, and higher priority (earlier in self.lists) -- goes first
         plain_list = core.download_lists.add_list("Plain List", auto_download=True)
         core.download_lists.add_list_items("Plain List", ["Plain Song"])
 
-        # Queued second, but pinned -- should still go first
+        # Queued second, and pinned -- pinning alone doesn't override priority order
         pinned_list = core.download_lists.add_list("Pinned List", auto_download=True)
         core.download_lists.set_list_pinned("Pinned List", True)
         core.download_lists.add_list_items("Pinned List", ["Pinned Song"])
 
         core.download_lists._pump_queue()
 
+        self.assertEqual(plain_list.items["Plain Song"].status, DownloadListItemStatus.SEARCHING)
+        self.assertEqual(pinned_list.items["Pinned Song"].status, DownloadListItemStatus.PENDING)
+
+        # Moving the pinned list to the top now does get it dispatched first
+        core.download_lists.move_list_up("Pinned List")
+        core.download_lists.reset_list_item("Plain List", "Plain Song")
+        core.download_lists._pump_queue()
+
         self.assertEqual(pinned_list.items["Pinned Song"].status, DownloadListItemStatus.SEARCHING)
-        self.assertEqual(plain_list.items["Plain Song"].status, DownloadListItemStatus.PENDING)
 
     def test_set_list_pinned_persists_and_toggles(self):
 
@@ -151,45 +160,63 @@ class DownloadListsTest(TestCase):
         core.download_lists.set_list_pinned("Toggle Pin List", False)
         self.assertFalse(download_list.pinned)
 
-    def test_set_list_pinned_keeps_pinned_lists_grouped_first(self):
-        """Pinning a list moves it ahead of every unpinned list (to the back of
-        the pinned block); unpinning moves it back to the front of the unpinned
-        block. Priority order (self.lists key order) must reflect this."""
+    def test_set_list_pinned_does_not_change_priority_position(self):
+        """Pinning/unpinning is purely about Completed-section membership --
+        it must never reposition a list. Only drag-and-drop (reorder_lists)
+        and Move Up/Down change priority order."""
 
         core.download_lists.add_list("List A")
         core.download_lists.add_list("List B")
         core.download_lists.add_list("List C")
 
         core.download_lists.set_list_pinned("List B", True)
-        self.assertEqual(list(core.download_lists.lists), ["List B", "List A", "List C"])
-
-        core.download_lists.set_list_pinned("List C", True)
-        self.assertEqual(list(core.download_lists.lists), ["List B", "List C", "List A"])
+        self.assertEqual(list(core.download_lists.lists), ["List A", "List B", "List C"])
 
         core.download_lists.set_list_pinned("List B", False)
-        self.assertEqual(list(core.download_lists.lists), ["List C", "List B", "List A"])
+        self.assertEqual(list(core.download_lists.lists), ["List A", "List B", "List C"])
 
-    def test_move_list_up_and_down_reorders_within_pinned_tier(self):
-        """Move Up/Down swaps a list with its neighbor, but only within the same
-        pinned/unpinned group -- it can't cross the pinned/unpinned boundary."""
+    def test_move_list_up_and_down(self):
+        """Move Up/Down swaps a list with its immediate neighbor in the Active
+        section, regardless of pin state -- top is priority 1 for everyone."""
 
         core.download_lists.add_list("List A")
         core.download_lists.add_list("List B")
         core.download_lists.add_list("List C")
         core.download_lists.set_list_pinned("List A", True)
 
-        # List A (pinned) is alone in its group; moving it should be a no-op
+        # Already first overall -- no-op
+        core.download_lists.move_list_up("List A")
+        self.assertEqual(list(core.download_lists.lists), ["List A", "List B", "List C"])
+
+        # A pinned list can be moved down past an unpinned one -- position, not
+        # pin state, is what determines priority now
         core.download_lists.move_list_down("List A")
+        self.assertEqual(list(core.download_lists.lists), ["List B", "List A", "List C"])
+
+        core.download_lists.move_list_up("List A")
         self.assertEqual(list(core.download_lists.lists), ["List A", "List B", "List C"])
 
-        core.download_lists.move_list_down("List B")
-        self.assertEqual(list(core.download_lists.lists), ["List A", "List C", "List B"])
+    def test_reorder_lists_from_drag_and_drop(self):
+        """reorder_lists() applies a full new order for the Active section, top
+        row first -- as if the user dragged List C to the top."""
 
-        core.download_lists.move_list_up("List B")
-        self.assertEqual(list(core.download_lists.lists), ["List A", "List B", "List C"])
+        core.download_lists.add_list("List A")
+        core.download_lists.add_list("List B")
+        core.download_lists.add_list("List C")
 
-        # Already at the front of its group -- no-op, doesn't cross into pinned territory
-        core.download_lists.move_list_up("List B")
+        core.download_lists.reorder_lists(["List C", "List A", "List B"])
+        self.assertEqual(list(core.download_lists.lists), ["List C", "List A", "List B"])
+
+    def test_reorder_lists_ignores_incomplete_input(self):
+        """A partial/invalid order (e.g. from a bug that lost track of a row)
+        must not be applied -- risking silently dropping a list is worse than
+        just ignoring the drag."""
+
+        core.download_lists.add_list("List A")
+        core.download_lists.add_list("List B")
+        core.download_lists.add_list("List C")
+
+        core.download_lists.reorder_lists(["List C", "List A"])  # missing List B
         self.assertEqual(list(core.download_lists.lists), ["List A", "List B", "List C"])
 
     def test_move_list_excludes_completed_unpinned_lists(self):
