@@ -19,6 +19,7 @@ user's own (browsable via fetch_own_playlists) or someone else's, by URL."""
 import base64
 import json
 import re
+import socket
 import threading
 import time
 import urllib.error
@@ -257,7 +258,7 @@ class SpotifyWatch:
             events.invoke_main_thread(result_callback, False, message)
             return
 
-        list_name = self._unique_list_name(playlist.get("name") or playlist_id)
+        list_name = self._unique_list_name((playlist.get("name") or playlist_id).strip())
 
         entry = {
             "playlist_id": playlist_id,
@@ -268,6 +269,16 @@ class SpotifyWatch:
         config.write_configuration()
 
         events.invoke_main_thread(self._ensure_polling)
+
+        # Create the wishlist immediately, even if this playlist turns out
+        # to have zero importable tracks right now (confirmed live: an
+        # owned, successfully-watched playlist with no current tracks polls
+        # cleanly but silently, since _apply_new_tracks only runs when
+        # there's something new to add) -- without this, watching it gives
+        # no visible confirmation at all that anything happened, and it
+        # never appears in the sidebar until its first track shows up,
+        # indistinguishable from watching having silently failed
+        events.invoke_main_thread(self._ensure_list_exists, list_name)
         events.invoke_main_thread(result_callback, True, list_name)
 
         # In case this list already existed (e.g. re-watching one that was
@@ -282,6 +293,19 @@ class SpotifyWatch:
         # a background thread here, so call the network-bound method
         # directly instead of _poll_playlists (which would spawn another one)
         self._poll_single_playlist(entry)
+
+    @staticmethod
+    def _ensure_list_exists(list_name):
+        """Create the wishlist if it doesn't already exist -- called right
+        after successfully starting to watch a playlist (see
+        _add_watched_playlist_thread), separately from _apply_new_tracks,
+        so the list shows up immediately even for a playlist with nothing
+        currently importable."""
+
+        from pynicotine.core import core
+
+        if list_name not in core.download_lists.lists:
+            core.download_lists.add_list(list_name)
 
     @staticmethod
     def _extract_playlist_id(playlist_url_or_id):
@@ -702,10 +726,28 @@ class SpotifyWatch:
         failure is also always logged in full (method, URL, status, raw
         body, that header) via log.add, regardless of what ends up in the
         exception message shown in the GUI -- check the log window for the
-        complete picture if something still looks wrong."""
+        complete picture if something still looks wrong.
+
+        Confirmed live: urlopen's own timeout= can still hang far longer
+        than requested -- it covers socket connect/read, but DNS resolution
+        (socket.getaddrinfo, called internally before any socket even
+        exists) only honors socket.setdefaulttimeout(), not per-call
+        timeouts, and can stall independently of them on some networks/DNS
+        configurations. That default is set once, globally, the first time
+        this runs (see _ensure_dns_timeout_set below) rather than saved and
+        restored around each call -- now that playlists poll concurrently
+        (one thread per playlist, see _poll_playlists_thread), a
+        save/restore here would race: one thread's "restore to whatever it
+        was before" could reset the default back to unbounded while another
+        thread's request is still relying on it. Nothing else in this
+        codebase reads or relies on Python's global socket default (the
+        Soulseek network thread manages its own non-blocking sockets with
+        their own explicit timeouts), so tightening it once, permanently,
+        for the life of the process is safe."""
 
         method = request.get_method()
         url = request.full_url
+        SpotifyWatch._ensure_dns_timeout_set()
 
         try:
             with urllib.request.urlopen(request, timeout=15) as handle:  # noqa: S310 (fixed https:// URLs only)
@@ -751,6 +793,18 @@ class SpotifyWatch:
             })
             raise SpotifyAPIError(_("Couldn't reach Spotify: %s") % error) from error
 
+    @staticmethod
+    def _ensure_dns_timeout_set():
+        """Only ever raises Python's global socket default timeout from
+        unbounded to 15s, never lowers or restores it -- see _send_request
+        for why a plain module-level socket.setdefaulttimeout(15) call
+        isn't used instead: import order isn't guaranteed to run before
+        anything else might have already set a smaller default on purpose,
+        and this way a concurrent caller can never observe it as unset."""
+
+        if socket.getdefaulttimeout() is None:
+            socket.setdefaulttimeout(15)
+
     def _api_get(self, path, params=None):
         """Raises SpotifyAPIError on any failure, including "not logged in"
         (no access token available) -- callers that loop over multiple
@@ -789,8 +843,20 @@ class SpotifyWatch:
         thread.start()
 
     def _poll_playlists_thread(self):
+        """Dispatches one independent thread per watched playlist, rather
+        than checking them one after another on this single thread --
+        confirmed live: a single playlist's request can hang far past
+        _send_request's own 15-second timeout (name resolution stalls are a
+        known, hard-to-fully-prevent cause, platform-dependent and outside
+        this code's control), and polling sequentially meant that one
+        playlist getting stuck silently starved every other watched
+        playlist forever -- no further polling, no new tracks, no error,
+        nothing -- until the app was restarted. Each playlist's poll is
+        already fully self-contained (_poll_single_playlist only touches
+        its own entry dict), so running them concurrently is safe."""
+
         for entry in list(config.sections["spotify"]["watched_playlists"]):
-            self._poll_single_playlist(entry)
+            threading.Thread(target=self._poll_single_playlist, args=(entry,), daemon=True).start()
 
     def _poll_single_playlist(self, entry):
         """Runs on a background thread (see _poll_playlists/
@@ -849,6 +915,16 @@ class SpotifyWatch:
         config.write_configuration()
 
         if not new_terms:
+            # Not an error -- the request succeeded, there's just nothing
+            # new to import right now (an empty playlist, or every track
+            # already seen). Debug-level only so a normal, working playlist
+            # doesn't spam the log every POLL_INTERVAL; the list itself
+            # already exists (see _ensure_list_exists) so there's no
+            # visibility gap for the user even when this says nothing
+            log.add_debug(
+                'Spotify: checked playlist "%(playlist)s" -- %(count)s track(s), nothing new to import',
+                {"playlist": list_name, "count": len(current_track_ids)}
+            )
             return
 
         events.invoke_main_thread(self._apply_new_tracks, list_name, new_terms)

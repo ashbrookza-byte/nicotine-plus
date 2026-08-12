@@ -3,6 +3,7 @@
 
 import os
 import shutil
+import threading
 
 from unittest import TestCase
 from unittest.mock import patch
@@ -285,6 +286,39 @@ class SpotifyWatchTest(TestCase):
         # An immediate poll must also have (re)started the periodic timer
         self.assertIsNotNone(core.spotify_watch._poll_timer_id)
 
+    def test_add_watched_playlist_thread_creates_list_even_when_empty(self):
+        """Confirmed live: a playlist the connected account genuinely owns
+        can still have zero currently-importable tracks (empty, or every
+        track missing name/artist data) -- _apply_new_tracks never runs in
+        that case (nothing to add), so without a separate creation step the
+        list would never appear at all, indistinguishable from watching
+        having silently failed. Also confirms the playlist name gets
+        stripped of surrounding whitespace (Spotify returned "Worship "
+        with a trailing space for the playlist that exposed this)."""
+
+        config.sections["spotify"]["refresh_token"] = "some-refresh-token"
+
+        def fake_api_get(path, params=None):  # noqa: ARG001
+            if path == "/playlists/abc123":
+                return {"name": "Worship "}
+
+            if path == "/playlists/abc123/items":
+                return {"items": [], "next": None}
+
+            raise AssertionError(f"Unexpected path requested: {path}")
+
+        results = []
+
+        with patch.object(SpotifyWatch, "_api_get", side_effect=fake_api_get):
+            core.spotify_watch._add_watched_playlist_thread(
+                "abc123", lambda success, message: results.append((success, message)))
+
+        self._flush_main_thread_callbacks()
+
+        self.assertEqual(results, [(True, "Worship")])
+        self.assertIn("Worship", core.download_lists.lists)
+        self.assertEqual(core.download_lists.lists["Worship"].items, {})
+
     def test_add_watched_playlist_thread_disambiguates_name_collision(self):
         """A pre-existing list (manually created, Watch Folder import, or a
         different watched playlist) with the same name must not silently
@@ -512,8 +546,17 @@ class SpotifyWatchTest(TestCase):
 
             raise AssertionError(f"Unexpected path requested: {path}")
 
+        # _poll_playlists_thread dispatches one independent thread per
+        # playlist (see its own docstring for why) rather than checking
+        # them inline -- capture and join the ones it spawns so this test
+        # doesn't race ahead of them finishing
+        threads_before = set(threading.enumerate())
+
         with patch.object(SpotifyWatch, "_api_get", side_effect=fake_api_get):
             core.spotify_watch._poll_playlists_thread()
+
+        for thread in set(threading.enumerate()) - threads_before:
+            thread.join(timeout=5)
 
         self._flush_main_thread_callbacks()
 

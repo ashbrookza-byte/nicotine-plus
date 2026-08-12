@@ -392,7 +392,17 @@ class Events:
         if self._scheduler_thread is not None and self._scheduler_thread.is_alive():
             return
 
-        self._scheduler_thread = Thread(target=self._run_scheduler, name="SchedulerThread")
+        # daemon=True: without this, an unhandled exception anywhere that
+        # reaches Events.emit's own exception handler triggers core.quit()
+        # automatically (see emit() below) -- if that happens while this
+        # thread doesn't yet see _is_active go False for some reason (or
+        # anything else about shutdown misbehaves), a non-daemon thread
+        # blocks the interpreter from ever exiting at all: Py_Finalize
+        # waits for every non-daemon thread to finish before the process
+        # can terminate, so the whole app hangs forever with no way to
+        # quit, confirmed live via a hung "sample" stack trace stuck in
+        # exactly that wait. A daemon thread never blocks process exit.
+        self._scheduler_thread = Thread(target=self._run_scheduler, name="SchedulerThread", daemon=True)
         self._scheduler_thread.start()
 
     def _thread_callback(self, callback, *args, **kwargs):
