@@ -276,6 +276,37 @@ class SpotifyWatchTest(TestCase):
         self.assertEqual(
             [entry["playlist_id"] for entry in config.sections["spotify"]["watched_playlists"]], ["def456"])
 
+    def test_deleting_wishlist_unwatches_its_playlist(self):
+        """Confirmed live: deleting a Spotify-backed wishlist (e.g. via the
+        sidebar's Remove) left its watched_playlists entry behind --
+        invisible (its list is gone) but still tripping
+        add_watched_playlist's "already watching this playlist" guard
+        forever, with no way to watch that playlist again short of manually
+        finding and removing the orphaned entry in Wishlist Settings."""
+
+        config.sections["spotify"]["watched_playlists"] = [
+            {"playlist_id": "abc123", "list_name": "My Playlist", "seen_track_ids": []},
+            {"playlist_id": "def456", "list_name": "Another Playlist", "seen_track_ids": []}
+        ]
+
+        core.download_lists.add_list("My Playlist")
+        core.download_lists.remove_list("My Playlist")
+
+        watched = config.sections["spotify"]["watched_playlists"]
+        self.assertEqual([entry["playlist_id"] for entry in watched], ["def456"])
+
+    def test_deleting_unrelated_wishlist_leaves_watched_playlists_alone(self):
+
+        config.sections["spotify"]["watched_playlists"] = [
+            {"playlist_id": "abc123", "list_name": "My Playlist", "seen_track_ids": []}
+        ]
+
+        core.download_lists.add_list("Some Other List")
+        core.download_lists.remove_list("Some Other List")
+
+        watched = config.sections["spotify"]["watched_playlists"]
+        self.assertEqual([entry["playlist_id"] for entry in watched], ["abc123"])
+
     def test_remove_watched_playlist_unknown_id_is_noop(self):
 
         config.sections["spotify"]["watched_playlists"] = [

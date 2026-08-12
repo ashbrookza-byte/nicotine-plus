@@ -64,7 +64,8 @@ class SpotifyWatch:
 
         for event_name, callback in (
             ("quit", self._quit),
-            ("start", self._start)
+            ("start", self._start),
+            ("remove-download-list", self._on_download_list_removed)
         ):
             events.connect(event_name, callback)
 
@@ -142,6 +143,19 @@ class SpotifyWatch:
         # sidebar that categorizes by watched-playlist status (Folders vs.
         # Spotify Playlists) moves it back out of the Spotify category.
         events.emit("update-download-list", removed_entry["list_name"])
+
+    def _on_download_list_removed(self, name):
+        """If the deleted wishlist was backed by a watched playlist, stop
+        watching it too -- otherwise the watched_playlists entry is
+        orphaned: its list is gone, so it's invisible everywhere, but
+        add_watched_playlist's "already watching this playlist" guard would
+        still block ever watching that same playlist again."""
+
+        entry = next(
+            (entry for entry in config.sections["spotify"]["watched_playlists"] if entry["list_name"] == name), None)
+
+        if entry is not None:
+            self.remove_watched_playlist(entry["playlist_id"])
 
     def add_watched_playlist(self, playlist_url_or_id, result_callback):
         """Starts watching a playlist -- public, anyone's, by URL or ID; no
