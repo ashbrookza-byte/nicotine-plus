@@ -22,6 +22,7 @@ from pynicotine.gtkgui.widgets.filechooser import FolderChooser
 from pynicotine.gtkgui.widgets.popupmenu import PopupMenu
 from pynicotine.gtkgui.widgets.theme import add_css_class
 from pynicotine.gtkgui.widgets.treeview import TreeView
+from pynicotine.spotifywatch import SPOTIFY_SCRAPER_AVAILABLE
 
 
 class ListSettingsDialog(Dialog):
@@ -536,8 +537,10 @@ class WishlistSettingsDialog(Dialog):
     def _add_spotify_watch_option(self):
         """A second, independent way to auto-populate a wishlist: watch a
         Spotify playlist instead of a local folder of exported song list
-        files. Requires the user's own Spotify Developer app (client ID/
-        secret) -- there's no way around that, only they can create it."""
+        files. Reads public playlist data anonymously (see
+        pynicotine/spotifywatch.py's module docstring) -- no Spotify
+        account, login, or Developer app needed, but a private playlist
+        can't be watched this way."""
 
         heading = Gtk.Label(label=_("Spotify playlist watcher"), wrap=True, xalign=0, visible=True)
         add_css_class(heading, "heading")
@@ -545,46 +548,13 @@ class WishlistSettingsDialog(Dialog):
 
         spotify = config.sections["spotify"]
 
-        client_id_label = Gtk.Label(label=_("Spotify Client ID:"), wrap=True, xalign=0, visible=True)
-        self._append(client_id_label)
-
-        self.spotify_client_id_entry = Gtk.Entry(
-            hexpand=True, visible=True, text=spotify["client_id"],
-            placeholder_text=_("From your app at developer.spotify.com/dashboard"))
-        client_id_label.set_mnemonic_widget(self.spotify_client_id_entry)
-        self._append(self.spotify_client_id_entry)
-
-        client_secret_label = Gtk.Label(label=_("Spotify Client Secret:"), wrap=True, xalign=0, visible=True)
-        self._append(client_secret_label)
-
-        self.spotify_client_secret_entry = Gtk.Entry(
-            hexpand=True, visible=True, text=spotify["client_secret"], visibility=False)
-        client_secret_label.set_mnemonic_widget(self.spotify_client_secret_entry)
-        self._append(self.spotify_client_secret_entry)
-
-        redirect_hint = Gtk.Label(
-            label=_("Add this exact Redirect URI in your Spotify app's settings: %s")
-            % core.spotify_watch.REDIRECT_URI,
-            wrap=True, xalign=0, selectable=True, visible=True)
-        add_css_class(redirect_hint, "dim-label")
-        self._append(redirect_hint)
-
-        connect_row = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER, visible=True)
-
-        connect_button = Gtk.Button(label=_("_Connect to Spotify…"), use_underline=True, visible=True)
-        connect_button.connect("clicked", self.on_connect_spotify)
-
-        self.spotify_status_label = Gtk.Label(
-            label=self._spotify_status_text(), hexpand=True, wrap=True, xalign=0, visible=True)
-
-        if GTK_API_VERSION >= 4:
-            connect_row.append(connect_button)              # pylint: disable=no-member
-            connect_row.append(self.spotify_status_label)    # pylint: disable=no-member
-        else:
-            connect_row.add(connect_button)                 # pylint: disable=no-member
-            connect_row.add(self.spotify_status_label)       # pylint: disable=no-member
-
-        self._append(connect_row)
+        if not SPOTIFY_SCRAPER_AVAILABLE:
+            unavailable_hint = Gtk.Label(
+                label=_("The optional \"spotifyscraper\" package isn't installed -- install it with "
+                        "\"pip install spotifyscraper\" to use this."),
+                wrap=True, xalign=0, visible=True)
+            add_css_class(unavailable_hint, "dim-label")
+            self._append(unavailable_hint)
 
         self.spotify_ignore_radio_edit_switch = Gtk.Switch(
             active=spotify["watch_ignore_radio_edit"], valign=Gtk.Align.CENTER, visible=True)
@@ -669,34 +639,6 @@ class WishlistSettingsDialog(Dialog):
         core.spotify_watch.remove_watched_playlist(playlist_id)
         self._populate_spotify_playlists()
 
-    def _spotify_status_text(self):
-
-        if core.spotify_watch.is_authorized():
-            return _("Connected")
-
-        return _("Not connected")
-
-    def on_connect_spotify(self, *_args):
-
-        core.spotify_watch.update_credentials(
-            self.spotify_client_id_entry.get_text(), self.spotify_client_secret_entry.get_text())
-
-        self.spotify_status_label.set_text(_("Waiting for Spotify login in your browser…"))
-        core.spotify_watch.begin_authorization(self.on_spotify_authorization_result)
-
-    def on_spotify_authorization_result(self, success, message):
-
-        if not self.is_visible():
-            # Dialog was closed while the login flow was still in progress
-            return
-
-        # On success, message includes which account actually got connected
-        # (e.g. "Connected to Spotify. Connected as Alice.") -- worth
-        # keeping visible rather than collapsing to the generic status text,
-        # since connecting under an unexpected account is a common cause of
-        # playlists failing to load afterwards
-        self.spotify_status_label.set_text(message)
-
     def on_cancel(self, *_args):
         self.close()
 
@@ -718,20 +660,21 @@ class WishlistSettingsDialog(Dialog):
             stall_timeout=self.stall_timeout_spinner.get_value_as_int(),
             min_speed_kib=self.min_speed_spinner.get_value_as_int(),
             max_concurrent=self.max_concurrent_spinner.get_value_as_int(),
-            spotify_client_id=self.spotify_client_id_entry.get_text().strip(),
-            spotify_client_secret=self.spotify_client_secret_entry.get_text().strip(),
             spotify_ignore_radio_edit=self.spotify_ignore_radio_edit_switch.get_active()
         )
         self.close()
 
 
 class SpotifyPlaylistPickerDialog(Dialog):
-    """Pick a Spotify playlist to watch -- either by browsing the connected
-    account's own playlists (fetched live), or by pasting the URL/ID of any
-    playlist, including one that isn't the user's own. Used both from
-    Wishlist Settings ("Add Playlist to Watch…") and from Add List ("Add
-    from Spotify Playlist…") -- in both places, picking a playlist starts
-    watching it and creates a wishlist named after it, identically."""
+    """Pick a Spotify playlist to watch -- either by pasting the URL/ID of
+    any public playlist, or by searching Spotify for one by name (both work
+    for anyone's playlist, not just any particular account's -- see
+    pynicotine/spotifywatch.py's module docstring for why no login is
+    needed, and why that means a PRIVATE playlist can't be read this way).
+    Used both from Wishlist Settings ("Add Playlist to Watch…") and from
+    Add List ("Add from Spotify Playlist…") -- in both places, picking a
+    playlist starts watching it and creates a wishlist named after it,
+    identically."""
 
     def __init__(self, application, on_playlist_added):
 
@@ -756,7 +699,7 @@ class SpotifyPlaylistPickerDialog(Dialog):
         )
 
         url_label = Gtk.Label(
-            label=_("Playlist URL or ID (any playlist, not just your own):"),
+            label=_("Playlist URL or ID (any public playlist):"),
             wrap=True, xalign=0, visible=True)
         self._append(url_label)
 
@@ -783,17 +726,14 @@ class SpotifyPlaylistPickerDialog(Dialog):
 
         self._append(Gtk.Separator(visible=True))
 
-        own_label = Gtk.Label(label=_("Or pick one of your own playlists:"), wrap=True, xalign=0, visible=True)
-        self._append(own_label)
+        search_label = Gtk.Label(label=_("Or search Spotify for a playlist:"), wrap=True, xalign=0, visible=True)
+        self._append(search_label)
 
         self.playlist_search_entry = Gtk.SearchEntry(
-            placeholder_text=_("Search your playlists…"), visible=True)
+            placeholder_text=_("e.g. a mood, genre, artist, or playlist name…"), visible=True)
         self.playlist_search_entry.connect("search-changed", self.on_playlist_search_changed)
-        own_label.set_mnemonic_widget(self.playlist_search_entry)
+        search_label.set_mnemonic_widget(self.playlist_search_entry)
         self._append(self.playlist_search_entry)
-
-        self._own_playlists = []
-        self._own_playlists_loaded = False
 
         self.playlists_container = Gtk.ScrolledWindow(
             hexpand=True, vexpand=True, visible=True,
@@ -820,7 +760,11 @@ class SpotifyPlaylistPickerDialog(Dialog):
             activate_row_callback=self.on_playlist_row_activated
         )
 
-        self._load_own_playlists()
+        if not SPOTIFY_SCRAPER_AVAILABLE:
+            self._set_status(core.spotify_watch.unavailable_message())
+            self.url_entry.set_sensitive(False)
+            watch_button.set_sensitive(False)
+            self.playlist_search_entry.set_sensitive(False)
 
     def destroy(self):
         self.playlists_view.destroy()
@@ -836,16 +780,21 @@ class SpotifyPlaylistPickerDialog(Dialog):
         self.status_label.set_text(text)
         self.status_label.set_visible(bool(text))
 
-    def _load_own_playlists(self):
+    def on_playlist_search_changed(self, entry, *_args):
 
-        if not core.spotify_watch.is_authorized():
-            self._set_status(_("Connect to Spotify in Wishlist Settings first to browse your own playlists."))
+        query = entry.get_text().strip()
+
+        if not query:
+            self.playlists_view.freeze()
+            self.playlists_view.clear()
+            self.playlists_view.unfreeze()
+            self._set_status("")
             return
 
-        self._set_status(_("Loading your playlists…"))
-        core.spotify_watch.fetch_own_playlists(self.on_own_playlists_fetched)
+        self._set_status(_("Searching…"))
+        core.spotify_watch.search_playlists(query, self.on_search_results)
 
-    def on_own_playlists_fetched(self, playlists, error):
+    def on_search_results(self, playlists, error):
 
         if not self.is_visible():
             return
@@ -854,52 +803,16 @@ class SpotifyPlaylistPickerDialog(Dialog):
             self._set_status(error)
             return
 
-        self._set_status("")
-        self._own_playlists = playlists
-        self._own_playlists_loaded = True
-        self._apply_playlist_filter()
-
-        if not playlists:
-            self._set_status(_("No playlists found in your Spotify account."))
-
-    def _apply_playlist_filter(self):
-        """Repopulates the treeview with whatever's currently in
-        _own_playlists that matches the search entry (name or owner,
-        case-insensitive substring) -- called after a fresh fetch, and
-        again every time the search text changes."""
-
-        query = self.playlist_search_entry.get_text().strip().lower()
-
-        if query:
-            visible_playlists = [
-                playlist for playlist in self._own_playlists
-                if query in playlist["name"].lower() or query in playlist["owner"].lower()
-            ]
-        else:
-            visible_playlists = self._own_playlists
-
         self.playlists_view.freeze()
         self.playlists_view.clear()
 
-        for playlist in visible_playlists:
+        for playlist in playlists:
             self.playlists_view.add_row(
                 [playlist["id"], playlist["name"], playlist["owner"]], select_row=False)
 
         self.playlists_view.unfreeze()
 
-        if self._own_playlists and not visible_playlists:
-            self._set_status(_("No playlists match your search."))
-        else:
-            self._set_status("")
-
-    def on_playlist_search_changed(self, *_args):
-
-        if not self._own_playlists_loaded:
-            # Nothing fetched yet (not connected, or still loading) --
-            # leave whatever status message is already showing alone
-            return
-
-        self._apply_playlist_filter()
+        self._set_status(_("No playlists found.") if not playlists else "")
 
     def _watch_playlist(self, playlist_url_or_id):
 
@@ -1796,15 +1709,13 @@ class Wishlists:
     def on_wishlist_settings_saved(self, watch_enabled, watch_folder_path, quality, prefer_longer,
                                    prefer_lossless, preferred_keywords, fuzzy_match_threshold,
                                    auto_download, use_name_subfolder, apply_to_existing_lists,
-                                   stall_timeout, min_speed_kib, max_concurrent,
-                                   spotify_client_id, spotify_client_secret, spotify_ignore_radio_edit):
+                                   stall_timeout, min_speed_kib, max_concurrent, spotify_ignore_radio_edit):
         core.download_lists.update_watch_folder_settings(watch_enabled, watch_folder_path)
         core.download_lists.update_wishlist_default_settings(
             quality, prefer_longer, prefer_lossless, preferred_keywords, fuzzy_match_threshold,
             auto_download, use_name_subfolder, apply_to_existing_lists=apply_to_existing_lists)
         core.download_lists.update_stall_settings(stall_timeout, min_speed_kib)
         core.download_lists.update_max_concurrent_downloads(max_concurrent)
-        core.spotify_watch.update_credentials(spotify_client_id, spotify_client_secret)
         core.spotify_watch.update_ignore_radio_edit(spotify_ignore_radio_edit)
 
     def on_wishlist_settings(self, *_args):

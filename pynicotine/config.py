@@ -457,13 +457,6 @@ class Config:
                 "uploaded_size": 0
             },
             "spotify": {
-                # From the user's own Spotify Developer app (developer.spotify.com/dashboard) --
-                # required to watch a playlist at all
-                "client_id": "",
-                "client_secret": "",
-                # Obtained via the one-time OAuth login (SpotifyWatch.begin_authorization);
-                # used afterwards to silently mint fresh access tokens without logging in again
-                "refresh_token": "",
                 # Prefer the Extended/Original version over a track's Radio Edit -- strips
                 # "(Radio Edit)"-style qualifiers from the search term built for each new track
                 "watch_ignore_radio_edit": True,
@@ -471,7 +464,9 @@ class Config:
                 # "seen_track_ids"}, ...]. seen_track_ids is per playlist (not just
                 # in-memory like Watch Folder's snapshot) since tracks stay in a
                 # playlist forever instead of being moved out after import, so
-                # restart-safety requires remembering what's already been handled
+                # restart-safety requires remembering what's already been handled.
+                # No credentials needed here -- SpotifyWatch reads public playlist
+                # data anonymously (see pynicotine/spotifywatch.py's module docstring)
                 "watched_playlists": []
             }
         }

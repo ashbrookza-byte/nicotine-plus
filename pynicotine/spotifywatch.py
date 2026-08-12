@@ -5,97 +5,47 @@
 wishlist each, the same way Watch Folder adds songs from exported .txt
 files -- just sourced from Spotify playlists instead.
 
-Requires the user's own Spotify Developer app (client ID/secret from
-https://developer.spotify.com/dashboard) -- there's no way around that,
-since only the user can create that app and log into their own Spotify
-account. Reading a private or collaborative playlist additionally requires
-a one-time OAuth login (see begin_authorization): the user's browser opens
-Spotify's own login/consent page (Nicotine+ never sees their Spotify
-password), and a short-lived local HTTP server catches the resulting
-redirect so the login flow can complete without a browser extension or
-manual copy-pasting. Once connected, any playlist can be watched -- the
-user's own (browsable via fetch_own_playlists) or someone else's, by URL."""
+Uses the third-party "spotifyscraper" package (optional dependency --
+`pip install nicotine-plus[spotify]`) to read PUBLIC playlist data
+anonymously, the same way Spotify's own web player embed widgets do --
+no Spotify Developer app, no Client ID/Secret, no OAuth login, and no
+Spotify account of any kind required. This deliberately trades away two
+things the official Web API would otherwise offer: reading a PRIVATE
+playlist (not possible without logging in as its owner), and any
+guarantee of stability (spotifyscraper reads endpoints Spotify hasn't
+published or versioned for third-party use, and can break without
+warning whenever Spotify changes something internal -- see
+https://github.com/AliAkhtari78/SpotifyScraper). In exchange, it sidesteps
+entirely the official API's Development Mode restriction that blocks
+reading the contents of any playlist the connected account doesn't own or
+collaborate on -- confirmed live, the exact playlists that 403'd (or hung)
+through the official OAuth-based flow read back correctly and quickly
+through this one instead."""
 
-import base64
-import json
 import re
-import socket
 import threading
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import webbrowser
-
-from http.server import BaseHTTPRequestHandler
-from http.server import HTTPServer
 
 from pynicotine.config import config
 from pynicotine.events import events
 from pynicotine.logfacility import log
 
+try:
+    from spotify_scraper import NotFoundError as SpotifyNotFoundError
+    from spotify_scraper import SpotifyClient
+    from spotify_scraper import SpotifyScraperError
+    SPOTIFY_SCRAPER_AVAILABLE = True
 
-class _AuthorizationCallbackHandler(BaseHTTPRequestHandler):
-    """Handles exactly one GET request: the redirect Spotify sends back to
-    our temporary local server after the user logs in and approves access
-    in their own browser."""
-
-    def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler's own naming convention)
-
-        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-
-        self.server.auth_code = query.get("code", [None])[0]
-        self.server.auth_state = query.get("state", [None])[0]
-        self.server.auth_error = query.get("error", [None])[0]
-
-        if self.server.auth_error:
-            body = _("Spotify authorization failed: %s. You can close this window.") % self.server.auth_error
-        else:
-            body = _("Spotify authorization complete. You can close this window and return to Nicotine+.")
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(body.encode("utf-8"))
-
-    def log_message(self, _format, *_args):
-        """Silence BaseHTTPRequestHandler's default per-request console log."""
-
-
-class SpotifyAPIError(Exception):
-    """A Spotify API request failed. message is already formatted for
-    display; status is the HTTP status code, or None for a connection-level
-    failure (DNS, timeout, offline, ...) that never got a response at all."""
-
-    def __init__(self, message, status=None):
-        super().__init__(message)
-        self.message = message
-        self.status = status
+except ImportError:
+    SpotifyNotFoundError = None
+    SpotifyClient = None
+    SpotifyScraperError = None
+    SPOTIFY_SCRAPER_AVAILABLE = False
 
 
 class SpotifyWatch:
 
-    AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
-    TOKEN_URL = "https://accounts.spotify.com/api/token"
-    API_BASE_URL = "https://api.spotify.com/v1"
-    SCOPES = "playlist-read-private playlist-read-collaborative"
-
-    # Must be added to the Spotify app's own "Redirect URIs" setting
-    # (developer.spotify.com/dashboard) for authorization to work at all
-    REDIRECT_PORT = 8888
-    REDIRECT_URI = f"http://127.0.0.1:{REDIRECT_PORT}/callback"
-
-    AUTH_CALLBACK_TIMEOUT = 120  # seconds to wait for the user to finish logging in
     POLL_INTERVAL = 120  # seconds between playlist checks
-
-    # Hard backstop on paginated fetches (playlist items, own-playlists list)
-    # -- at 50 per page this is 12,500 items, comfortably above Spotify's own
-    # 10,000-track playlist limit, so it only ever kicks in for a genuinely
-    # malformed/non-terminating "next" pointer, not a real large playlist.
-    # Runs on a background thread already, so this isn't about keeping the
-    # GUI responsive -- it's about not hammering Spotify's API forever on a
-    # response that never actually finishes
-    MAX_FETCH_PAGES = 250
+    REQUEST_TIMEOUT = 15  # seconds, per HTTP request spotifyscraper makes
 
     # Qualifiers meaning "shortened for radio play", e.g. "Song (Radio Edit)" or
     # "Song - Radio Edit" -- stripped from the search term when watch_ignore_radio_edit
@@ -106,24 +56,11 @@ class SpotifyWatch:
         re.IGNORECASE
     )
 
-    __slots__ = (
-        "_poll_timer_id", "_access_token", "_access_token_expires_at", "_pending_server",
-        "_diagnosed_403_playlist_ids"
-    )
+    __slots__ = ("_poll_timer_id",)
 
     def __init__(self):
 
         self._poll_timer_id = None
-        self._access_token = None
-        self._access_token_expires_at = 0
-        self._pending_server = None
-
-        # Playlist IDs the 403 diagnostic (_diagnose_403) has already run the
-        # extra GET /me + owner-check requests for this session -- a
-        # playlist that keeps failing every POLL_INTERVAL shouldn't repeat
-        # those extra requests every single time; the answer isn't going to
-        # change until something is actually done about it
-        self._diagnosed_403_playlist_ids = set()
 
         for event_name, callback in (
             ("quit", self._quit),
@@ -144,7 +81,6 @@ class SpotifyWatch:
 
     def _quit(self):
         events.cancel_scheduled(self._poll_timer_id)
-        self._shutdown_pending_server()
 
     def _ensure_polling(self):
         """(Re)start the periodic poll timer if there's now at least one
@@ -157,20 +93,15 @@ class SpotifyWatch:
         self._poll_timer_id = events.schedule(
             delay=self.POLL_INTERVAL, callback=self._poll_playlists, repeat=True)
 
-    # Credentials #
-
     @staticmethod
-    def has_credentials():
-        section = config.sections["spotify"]
-        return bool(section["client_id"] and section["client_secret"])
+    def unavailable_message():
+        return _(
+            "The optional \"spotifyscraper\" package isn't installed -- Spotify Watch needs it "
+            "to read playlist data. Install it with: pip install spotifyscraper"
+        )
 
-    @staticmethod
-    def is_authorized():
-        return bool(config.sections["spotify"]["refresh_token"])
-
-    def update_credentials(self, client_id, client_secret):
-        config.sections["spotify"]["client_id"] = client_id.strip()
-        config.sections["spotify"]["client_secret"] = client_secret.strip()
+    def update_ignore_radio_edit(self, ignore_radio_edit):
+        config.sections["spotify"]["watch_ignore_radio_edit"] = bool(ignore_radio_edit)
         config.write_configuration()
 
     # Watched playlists #
@@ -189,10 +120,6 @@ class SpotifyWatch:
             {"playlist_id": entry["playlist_id"], "list_name": entry["list_name"]}
             for entry in config.sections["spotify"]["watched_playlists"]
         ]
-
-    def update_ignore_radio_edit(self, ignore_radio_edit):
-        config.sections["spotify"]["watch_ignore_radio_edit"] = bool(ignore_radio_edit)
-        config.write_configuration()
 
     def remove_watched_playlist(self, playlist_id):
 
@@ -217,16 +144,17 @@ class SpotifyWatch:
         events.emit("update-download-list", removed_entry["list_name"])
 
     def add_watched_playlist(self, playlist_url_or_id, result_callback):
-        """Starts watching a playlist -- the user's own, or anyone else's, as
-        long as it's readable with the scopes this app requested. Creates a
+        """Starts watching a playlist -- public, anyone's, by URL or ID; no
+        login of any kind required (see this module's docstring for why
+        that also means a PRIVATE playlist can't be read). Creates a
         wishlist named after the playlist (if one by that name doesn't
         already exist) and does an immediate poll to import its current
         contents. result_callback(success, message_or_list_name) is invoked
         on the main thread once the playlist's name has been looked up (or
         the attempt has failed) -- safe to update GTK widgets from directly."""
 
-        if not self.is_authorized():
-            result_callback(False, _("Connect to Spotify first."))
+        if not SPOTIFY_SCRAPER_AVAILABLE:
+            result_callback(False, self.unavailable_message())
             return
 
         playlist_id = self._extract_playlist_id(playlist_url_or_id)
@@ -247,18 +175,24 @@ class SpotifyWatch:
     def _add_watched_playlist_thread(self, playlist_id, result_callback):
 
         try:
-            playlist = self._api_get(f"/playlists/{playlist_id}", params={"fields": "name"})
+            with SpotifyClient(timeout=self.REQUEST_TIMEOUT) as client:
+                playlist = client.get_playlist(playlist_id, max_tracks=1)
 
-        except SpotifyAPIError as error:
-            message = error.message
-
-            if error.status == 403:
-                message += self._diagnose_403(playlist_id)
-
-            events.invoke_main_thread(result_callback, False, message)
+        except SpotifyNotFoundError:
+            events.invoke_main_thread(
+                result_callback, False,
+                _("Couldn't find that playlist -- double check the link, and that it's public "
+                  "(a private playlist can't be read without logging in as its owner)."))
             return
 
-        list_name = self._unique_list_name((playlist.get("name") or playlist_id).strip())
+        except SpotifyScraperError as error:
+            log.add(_('Spotify: looking up playlist "%(id)s" failed: %(error)s'), {
+                "id": playlist_id, "error": error
+            })
+            events.invoke_main_thread(result_callback, False, _("Couldn't reach Spotify: %s") % error)
+            return
+
+        list_name = self._unique_list_name((playlist.name or playlist_id).strip())
 
         entry = {
             "playlist_id": playlist_id,
@@ -271,13 +205,9 @@ class SpotifyWatch:
         events.invoke_main_thread(self._ensure_polling)
 
         # Create the wishlist immediately, even if this playlist turns out
-        # to have zero importable tracks right now (confirmed live: an
-        # owned, successfully-watched playlist with no current tracks polls
-        # cleanly but silently, since _apply_new_tracks only runs when
-        # there's something new to add) -- without this, watching it gives
-        # no visible confirmation at all that anything happened, and it
-        # never appears in the sidebar until its first track shows up,
-        # indistinguishable from watching having silently failed
+        # to have zero importable tracks right now -- without this, watching
+        # an empty (or momentarily all-already-seen) playlist gives no
+        # visible confirmation at all that anything happened
         events.invoke_main_thread(self._ensure_list_exists, list_name)
         events.invoke_main_thread(result_callback, True, list_name)
 
@@ -308,6 +238,25 @@ class SpotifyWatch:
             core.download_lists.add_list(list_name)
 
     @staticmethod
+    def _unique_list_name(base_name):
+        """Avoid silently merging a newly watched playlist into an unrelated
+        pre-existing list that just happens to share its name -- each
+        watched playlist gets its own list, disambiguated with a numbered
+        suffix if the plain name is already taken by anything else."""
+
+        from pynicotine.core import core
+
+        existing_lists = core.download_lists.lists if core.download_lists is not None else {}
+        name = base_name
+        suffix = 2
+
+        while name in existing_lists:
+            name = f"{base_name} ({suffix})"
+            suffix += 1
+
+        return name
+
+    @staticmethod
     def _extract_playlist_id(playlist_url_or_id):
         """Accepts a bare playlist ID, a spotify:playlist:<id> URI, or an
         open.spotify.com/playlist/<id> URL, and returns just the ID."""
@@ -330,499 +279,50 @@ class SpotifyWatch:
 
         return None
 
-    @staticmethod
-    def _unique_list_name(base_name):
-        """Avoid silently merging a newly watched playlist into an unrelated
-        pre-existing list that just happens to share its name -- without
-        this, watching a playlist named e.g. "Chill Vibes" when a manually
-        created (or Watch Folder) list is already called that would dump
-        the playlist's tracks straight into it and make the GUI sidebar
-        miscategorize that whole list as Spotify-sourced, since
-        categorization there is name-based (see Wishlists._is_spotify_list
-        in gtkgui/wishlists.py). Each watched playlist gets its own list
-        instead, disambiguated with a numbered suffix if the plain name is
-        already taken by anything -- another list, or even another watched
-        playlist that happens to share a title."""
+    # Searching Spotify for a playlist #
 
-        from pynicotine.core import core
+    def search_playlists(self, query, result_callback):
+        """Anonymous, public search across all of Spotify (not just any
+        particular account's library) -- the picker UI's alternative to
+        pasting a URL directly, for finding a playlist by name. No login
+        required, same as everything else in this module.
+        result_callback(playlists, error_message) is invoked on the main
+        thread; exactly one of the two arguments is None. playlists is
+        [{"id", "name", "owner"}, ...]."""
 
-        existing_lists = core.download_lists.lists if core.download_lists is not None else {}
-        name = base_name
-        suffix = 2
-
-        while name in existing_lists:
-            name = f"{base_name} ({suffix})"
-            suffix += 1
-
-        return name
-
-    # Browsing the user's own playlists #
-
-    def fetch_own_playlists(self, result_callback):
-        """Fetches every playlist in the connected account's own library
-        (owned or followed), for a picker UI to choose from -- a lower-
-        friction alternative to pasting a URL for the common case of
-        watching one of the user's own playlists. result_callback(playlists,
-        error_message) is invoked on the main thread; exactly one of the two
-        arguments is None. playlists is [{"id", "name", "owner"}, ...]."""
-
-        if not self.is_authorized():
-            result_callback(None, _("Connect to Spotify first."))
+        if not SPOTIFY_SCRAPER_AVAILABLE:
+            result_callback(None, self.unavailable_message())
             return
 
-        thread = threading.Thread(target=self._fetch_own_playlists_thread, args=(result_callback,), daemon=True)
+        query = query.strip()
+
+        if not query:
+            result_callback([], None)
+            return
+
+        thread = threading.Thread(target=self._search_playlists_thread, args=(query, result_callback), daemon=True)
         thread.start()
 
-    def _fetch_own_playlists_thread(self, result_callback):
-
-        playlists = []
-        path = "/me/playlists"
-        params = {"limit": 50}
-        pages_fetched = 0
+    def _search_playlists_thread(self, query, result_callback):
 
         try:
-            # A hard cap, not just a performance nicety -- this loop runs on
-            # a background thread so it can't freeze the GUI directly, but
-            # an account with an unusually large library (or a malformed
-            # response whose "next" never actually advances) would otherwise
-            # keep it making blocking network requests indefinitely with no
-            # way for the user to know it's still working or cancel it
-            while path is not None and pages_fetched < self.MAX_FETCH_PAGES:
-                page = self._api_get(path, params=params)
-                pages_fetched += 1
+            with SpotifyClient(timeout=self.REQUEST_TIMEOUT) as client:
+                results = client.search(query, types=("playlist",), limit=20)
 
-                for item in page.get("items", []):
-                    if not item or not item.get("id"):
-                        continue
-
-                    owner = (item.get("owner") or {}).get("display_name") or ""
-                    playlists.append({"id": item["id"], "name": item.get("name") or item["id"], "owner": owner})
-
-                path = page.get("next")
-                params = None
-
-        except SpotifyAPIError as error:
-            events.invoke_main_thread(result_callback, None, error.message)
+        except SpotifyScraperError as error:
+            log.add(_('Spotify: searching for "%(query)s" failed: %(error)s'), {"query": query, "error": error})
+            events.invoke_main_thread(result_callback, None, _("Couldn't reach Spotify: %s") % error)
             return
 
-        playlists.sort(key=lambda playlist: playlist["name"].lower())
-        events.invoke_main_thread(result_callback, playlists, None)
-
-    # OAuth #
-
-    def begin_authorization(self, result_callback):
-        """Opens the user's browser to Spotify's own login/consent page, and
-        starts a short-lived local HTTP server to catch the redirect
-        afterwards. result_callback(success, message) is always invoked back
-        on the main thread (see events.invoke_main_thread) once the flow
-        finishes, times out, or fails -- safe to update GTK widgets from
-        directly."""
-
-        if not self.has_credentials():
-            result_callback(False, _("Enter a Client ID and Client Secret first."))
-            return
-
-        state = format(int(time.time() * 1000), "x")
-        authorize_url = self.AUTHORIZE_URL + "?" + urllib.parse.urlencode({
-            "client_id": config.sections["spotify"]["client_id"],
-            "response_type": "code",
-            "redirect_uri": self.REDIRECT_URI,
-            "scope": self.SCOPES,
-            "state": state
-        })
-
-        try:
-            server = HTTPServer(("127.0.0.1", self.REDIRECT_PORT), _AuthorizationCallbackHandler)
-
-        except OSError as error:
-            result_callback(False, _("Couldn't start local server on port %(port)s: %(error)s") % {
-                "port": self.REDIRECT_PORT, "error": error
-            })
-            return
-
-        server.auth_code = None
-        server.auth_state = None
-        server.auth_error = None
-        server.timeout = self.AUTH_CALLBACK_TIMEOUT
-        self._shutdown_pending_server()  # Supersede any still-pending previous attempt
-        self._pending_server = server
-
-        webbrowser.open(authorize_url)
-
-        thread = threading.Thread(
-            target=self._wait_for_authorization, args=(server, state, result_callback), daemon=True)
-        thread.start()
-
-    def _wait_for_authorization(self, server, expected_state, result_callback):
-
-        try:
-            # Blocks this (background) thread until the redirect request arrives, or times out
-            server.handle_request()
-
-            if self._pending_server is not server:
-                return  # Superseded by a newer attempt; that one owns the result callback now
-
-            if server.auth_error:
-                message = _("Spotify denied access: %s") % server.auth_error
-                events.invoke_main_thread(result_callback, False, message)
-                return
-
-            if not server.auth_code:
-                events.invoke_main_thread(
-                    result_callback, False, _("Timed out waiting for Spotify login. Please try again."))
-                return
-
-            if server.auth_state != expected_state:
-                events.invoke_main_thread(
-                    result_callback, False,
-                    _("Authorization response didn't match this request. Please try again."))
-                return
-
-            self._exchange_code_for_tokens(server.auth_code, result_callback)
-
-        finally:
-            self._shutdown_pending_server(server)
-
-    def _shutdown_pending_server(self, server=None):
-
-        target = server or self._pending_server
-
-        if target is None:
-            return
-
-        try:
-            target.server_close()
-
-        except OSError:
-            pass
-
-        if self._pending_server is target:
-            self._pending_server = None
-
-    def _exchange_code_for_tokens(self, code, result_callback):
-
-        data = urllib.parse.urlencode({
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": self.REDIRECT_URI
-        }).encode("utf-8")
-
-        try:
-            response = self._token_request(data)
-
-        except SpotifyAPIError as error:
-            events.invoke_main_thread(
-                result_callback, False, _("Couldn't complete Spotify login: %s") % error.message)
-            return
-
-        refresh_token = response.get("refresh_token")
-
-        if not refresh_token:
-            events.invoke_main_thread(result_callback, False, _("Spotify didn't return a refresh token."))
-            return
-
-        config.sections["spotify"]["refresh_token"] = refresh_token
-        config.write_configuration()
-
-        self._access_token = response.get("access_token")
-        self._access_token_expires_at = time.time() + response.get("expires_in", 3600) - 30
-
-        granted_scope = response.get("scope", "")
-        missing_scopes = [scope for scope in self.SCOPES.split() if scope not in granted_scope.split()]
-
-        log.add(_("Spotify: granted scopes: %s"), granted_scope or "(Spotify didn't report any)")
-
-        if missing_scopes:
-            log.add(
-                _("Spotify: requested scope(s) not granted: %s -- playlist reads will likely fail "
-                  "with 403 until this is resolved"),
-                ", ".join(missing_scopes)
-            )
-
-        message = _("Connected to Spotify.") + " " + self._describe_connected_identity()
-
-        events.invoke_main_thread(result_callback, True, message.strip())
-        events.invoke_main_thread(self._ensure_polling)
-
-    def _describe_connected_identity(self):
-        """Best-effort "Connected as <name>" suffix, fetched right after
-        login via GET /me -- confirms which Spotify account actually got
-        linked (easy to get wrong if a browser has multiple Spotify
-        accounts logged in when the consent page opens), and doubles as an
-        immediate smoke test: if even /me fails, the problem is account- or
-        token-wide, not specific to any one playlist. Every detail Spotify
-        gives back (or the failure, if /me itself doesn't work) is logged
-        in full either way -- see the log window."""
-
-        try:
-            me = self._api_get("/me")
-
-        except SpotifyAPIError as error:
-            log.add(_("Spotify: identity check (GET /me) failed right after connecting: %s"), error.message)
-            return _("Couldn't verify the connected account (see log for GET /me failure) -- "
-                     "expect playlist reads to fail too.")
-
-        display_name = me.get("display_name") or me.get("id") or "?"
-        log.add(_("Spotify: connected as %(name)s (id: %(id)s, product: %(product)s)"), {
-            "name": display_name, "id": me.get("id", "?"), "product": me.get("product", "?")
-        })
-        return _("Connected as %s.") % display_name
-
-    def _diagnose_403(self, playlist_id=None):
-        """Appended to a playlist-specific 403's own message. Spotify's own
-        error body for this one is maximally unhelpful -- literally just
-        {"error": {"status": 403, "message": "Forbidden"}}, confirmed live,
-        no WWW-Authenticate detail either -- so there's nothing more to
-        extract from the failed request itself. Two follow-up checks fill
-        that gap instead:
-
-        1. GET /me, to tell apart the whole connection being broken (a bad/
-           under-scoped token -- reconnecting fixes it) from this one
-           playlist specifically being off-limits. It uses the exact same
-           token, so if /me works, the token itself is fine.
-
-        2. If /me works and a playlist_id was given, GET that playlist's
-           owner and compare it against the connected account's own ID --
-           Spotify's Feb 2026 Development Mode changes restrict
-           /playlists/{id}/items to playlists the connected account owns
-           or collaborates on (https://developer.spotify.com/documentation/
-           web-api/tutorials/february-2026-migration-guide), so an owner
-           mismatch is the single most likely explanation once the token
-           itself checks out -- including for a playlist that looks like
-           "yours" in the Spotify app (e.g. one you followed/duplicated
-           rather than created).
-
-        Only runs its extra requests once per playlist per session -- the
-        periodic poll retries every playlist that's still failing on its
-        own regular schedule (POLL_INTERVAL), and there's no point re-asking
-        the same two questions every single time; the answer won't change
-        until something about the playlist, account, or app actually does."""
-
-        if playlist_id is not None and playlist_id in self._diagnosed_403_playlist_ids:
-            return _(" (Already diagnosed earlier this session -- see the log window above for the "
-                     "GET /me and ownership check results from the first time this playlist failed.)")
-
-        if playlist_id is not None:
-            self._diagnosed_403_playlist_ids.add(playlist_id)
-
-        try:
-            me = self._api_get("/me")
-
-        except SpotifyAPIError as error:
-            log.add(_("Spotify: GET /me also failed after a playlist 403 -- connection-wide problem: %s"),
-                    error.message)
-            return _(" Your Spotify connection itself is also failing (GET /me: %s) -- "
-                     "try reconnecting in Wishlist Settings.") % error.message
-
-        log.add(_("Spotify: GET /me succeeded after a playlist 403 (connected as %s) -- "
-                   "checking playlist ownership next"), me.get("id", "?"))
-
-        if playlist_id is not None:
-            try:
-                playlist = self._api_get(
-                    f"/playlists/{playlist_id}", params={"fields": "owner.id,owner.display_name,collaborative"})
-
-            except SpotifyAPIError as error:
-                log.add(_("Spotify: couldn't fetch playlist owner for the 403 diagnostic: %s"), error.message)
-                playlist = None
-
-            if playlist is not None:
-                owner = playlist.get("owner") or {}
-                owner_id = owner.get("id")
-                is_own_or_collab = (owner_id == me.get("id")) or playlist.get("collaborative")
-
-                log.add(
-                    _("Spotify: playlist owner is %(owner)s (id: %(owner_id)s), connected account is "
-                      "%(me)s -- %(verdict)s"), {
-                        "owner": owner.get("display_name") or "?", "owner_id": owner_id or "?",
-                        "me": me.get("id", "?"),
-                        "verdict": "owned/collaborative, matches" if is_own_or_collab else "MISMATCH"
-                    }
-                )
-
-                if not is_own_or_collab:
-                    return _(
-                        " This playlist is owned by %(owner)s, not the connected Spotify account "
-                        "(%(me)s) -- as of Spotify's February 2026 Web API changes, Development Mode "
-                        "apps can only read the contents of a playlist the connected account owns or "
-                        "collaborates on, even if the playlist is public or shows up as one of \"your\" "
-                        "playlists in the Spotify app (e.g. one you followed or duplicated, rather than "
-                        "created). Reconnecting won't fix this -- it's specific to this playlist."
-                    ) % {
-                        "owner": owner.get("display_name") or owner_id or "?",
-                        "me": me.get("display_name") or me.get("id", "?")
-                    }
-
-        return _(" Your Spotify connection itself works fine (GET /me succeeded), and this playlist "
-                 "appears to belong to the connected account -- Spotify is still refusing to hand over "
-                 "its contents to this app for some other reason, with no further detail in its own "
-                 "response (see the log window for the exact request/response). This isn't something "
-                 "Nicotine+ can work around from here -- it likely needs Extended Quota Mode approval "
-                 "for this app via the Spotify Developer Dashboard.")
-
-    def _token_request(self, data):
-        """Raises SpotifyAPIError on any failure -- never returns None, so
-        callers don't need a None-check on top of the except clause."""
-
-        client_id = config.sections["spotify"]["client_id"]
-        client_secret = config.sections["spotify"]["client_secret"]
-        credentials = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
-
-        request = urllib.request.Request(
-            self.TOKEN_URL, data=data, method="POST",
-            headers={
-                "Authorization": f"Basic {credentials}",
-                "Content-Type": "application/x-www-form-urlencoded"
+        playlists = [
+            {
+                "id": playlist.id,
+                "name": playlist.name or playlist.id,
+                "owner": playlist.owner.name if playlist.owner else ""
             }
-        )
-
-        return self._send_request(request)
-
-    def _ensure_access_token(self):
-
-        if self._access_token and time.time() < self._access_token_expires_at:
-            return self._access_token
-
-        refresh_token = config.sections["spotify"]["refresh_token"]
-
-        if not refresh_token or not self.has_credentials():
-            return None
-
-        data = urllib.parse.urlencode({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token
-        }).encode("utf-8")
-
-        try:
-            response = self._token_request(data)
-
-        except SpotifyAPIError as error:
-            log.add(_("Spotify: couldn't refresh access token: %s"), error.message)
-            return None
-
-        self._access_token = response.get("access_token")
-        self._access_token_expires_at = time.time() + response.get("expires_in", 3600) - 30
-
-        # Spotify occasionally rotates the refresh token itself when refreshing
-        if response.get("refresh_token"):
-            config.sections["spotify"]["refresh_token"] = response["refresh_token"]
-            config.write_configuration()
-
-        return self._access_token
-
-    @staticmethod
-    def _send_request(request):
-        """Performs an HTTP request and returns the parsed JSON body, or
-        raises SpotifyAPIError with a message built from everything Spotify
-        told us about the failure, not just the bare HTTP status. Two
-        distinct pieces get combined here, because either one alone can be
-        useless: the JSON body's "message" is very often just a generic
-        word like "Forbidden" (Spotify Web API errors: {"error": {"status",
-        "message"}}), while the actual reason -- e.g. a missing/expired
-        scope, a bad token, rate limiting -- usually shows up in the
-        WWW-Authenticate response header instead (standard OAuth2 Bearer
-        challenge format: error="...", error_description="..."), which
-        Spotify's docs don't advertise but does populate on 401/403s. Every
-        failure is also always logged in full (method, URL, status, raw
-        body, that header) via log.add, regardless of what ends up in the
-        exception message shown in the GUI -- check the log window for the
-        complete picture if something still looks wrong.
-
-        Confirmed live: urlopen's own timeout= can still hang far longer
-        than requested -- it covers socket connect/read, but DNS resolution
-        (socket.getaddrinfo, called internally before any socket even
-        exists) only honors socket.setdefaulttimeout(), not per-call
-        timeouts, and can stall independently of them on some networks/DNS
-        configurations. That default is set once, globally, the first time
-        this runs (see _ensure_dns_timeout_set below) rather than saved and
-        restored around each call -- now that playlists poll concurrently
-        (one thread per playlist, see _poll_playlists_thread), a
-        save/restore here would race: one thread's "restore to whatever it
-        was before" could reset the default back to unbounded while another
-        thread's request is still relying on it. Nothing else in this
-        codebase reads or relies on Python's global socket default (the
-        Soulseek network thread manages its own non-blocking sockets with
-        their own explicit timeouts), so tightening it once, permanently,
-        for the life of the process is safe."""
-
-        method = request.get_method()
-        url = request.full_url
-        SpotifyWatch._ensure_dns_timeout_set()
-
-        try:
-            with urllib.request.urlopen(request, timeout=15) as handle:  # noqa: S310 (fixed https:// URLs only)
-                return json.loads(handle.read().decode("utf-8"))
-
-        except urllib.error.HTTPError as error:
-            body = error.read().decode("utf-8", "replace")
-            www_authenticate = (error.headers.get("WWW-Authenticate") if error.headers else None) or ""
-
-            detail = body
-
-            try:
-                parsed = json.loads(body)
-                detail = (
-                    parsed.get("error", {}).get("message")
-                    or parsed.get("error_description")
-                    or parsed.get("error")
-                    or body
-                )
-            except (ValueError, AttributeError):
-                pass
-
-            log.add(
-                _("Spotify: %(method)s %(url)s failed (%(status)s): %(body)s%(auth)s"), {
-                    "method": method,
-                    "url": url,
-                    "status": error.code,
-                    "body": body or "(empty response body)",
-                    "auth": (_(" | WWW-Authenticate: %s") % www_authenticate) if www_authenticate else ""
-                }
-            )
-
-            message = _("Spotify error %(status)s: %(detail)s") % {"status": error.code, "detail": detail}
-
-            if www_authenticate:
-                message += " (%s)" % www_authenticate
-
-            raise SpotifyAPIError(message, status=error.code) from error
-
-        except (urllib.error.URLError, OSError, ValueError) as error:
-            log.add(_("Spotify: %(method)s %(url)s failed to connect: %(error)s"), {
-                "method": method, "url": url, "error": error
-            })
-            raise SpotifyAPIError(_("Couldn't reach Spotify: %s") % error) from error
-
-    @staticmethod
-    def _ensure_dns_timeout_set():
-        """Only ever raises Python's global socket default timeout from
-        unbounded to 15s, never lowers or restores it -- see _send_request
-        for why a plain module-level socket.setdefaulttimeout(15) call
-        isn't used instead: import order isn't guaranteed to run before
-        anything else might have already set a smaller default on purpose,
-        and this way a concurrent caller can never observe it as unset."""
-
-        if socket.getdefaulttimeout() is None:
-            socket.setdefaulttimeout(15)
-
-    def _api_get(self, path, params=None):
-        """Raises SpotifyAPIError on any failure, including "not logged in"
-        (no access token available) -- callers that loop over multiple
-        playlists catch this per-playlist so one failure doesn't abort the
-        rest; callers doing a single lookup let it propagate."""
-
-        access_token = self._ensure_access_token()
-
-        if access_token is None:
-            raise SpotifyAPIError(_("Not connected to Spotify."))
-
-        url = path if path.startswith("http") else self.API_BASE_URL + path
-
-        if params:
-            url += "?" + urllib.parse.urlencode(params)
-
-        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
-        return self._send_request(request)
+            for playlist in results.playlists
+        ]
+        events.invoke_main_thread(result_callback, playlists, None)
 
     # Playlist polling #
 
@@ -831,12 +331,12 @@ class SpotifyWatch:
         main thread (events.schedule -> invoke_main_thread), but the actual
         polling below makes blocking network calls -- doing that here would
         freeze the whole UI for however long Spotify takes to respond, once
-        per playlist, every POLL_INTERVAL. Hand the real work off to a
-        background thread instead; _poll_single_playlist marshals back to
+        per playlist, every POLL_INTERVAL. Hand the real work off to
+        background threads instead; _poll_single_playlist marshals back to
         the main thread only for the one part that actually needs it
         (updating a wishlist, which touches GTK via events)."""
 
-        if not self.is_authorized():
+        if not SPOTIFY_SCRAPER_AVAILABLE:
             return
 
         thread = threading.Thread(target=self._poll_playlists_thread, daemon=True)
@@ -844,16 +344,12 @@ class SpotifyWatch:
 
     def _poll_playlists_thread(self):
         """Dispatches one independent thread per watched playlist, rather
-        than checking them one after another on this single thread --
-        confirmed live: a single playlist's request can hang far past
-        _send_request's own 15-second timeout (name resolution stalls are a
-        known, hard-to-fully-prevent cause, platform-dependent and outside
-        this code's control), and polling sequentially meant that one
-        playlist getting stuck silently starved every other watched
-        playlist forever -- no further polling, no new tracks, no error,
-        nothing -- until the app was restarted. Each playlist's poll is
-        already fully self-contained (_poll_single_playlist only touches
-        its own entry dict), so running them concurrently is safe."""
+        than checking them one after another on this single thread -- a
+        single playlist's request hanging or being unusually slow must
+        never be able to starve every other watched playlist of ever being
+        checked again. Each playlist's poll is already fully self-contained
+        (_poll_single_playlist only touches its own entry dict), so running
+        them concurrently is safe."""
 
         for entry in list(config.sections["spotify"]["watched_playlists"]):
             threading.Thread(target=self._poll_single_playlist, args=(entry,), daemon=True).start()
@@ -865,51 +361,35 @@ class SpotifyWatch:
         playlist_id = entry["playlist_id"]
         list_name = entry["list_name"]
         seen_track_ids = set(entry.get("seen_track_ids", []))
+
+        try:
+            with SpotifyClient(timeout=self.REQUEST_TIMEOUT) as client:
+                playlist = client.get_playlist(playlist_id, max_tracks=None)
+
+        except SpotifyScraperError as error:
+            log.add(_('Spotify: checking playlist "%(playlist)s" failed: %(error)s'), {
+                "playlist": list_name, "error": error
+            })
+            return
+
         new_terms = []
         current_track_ids = []
 
-        # "/playlists/{id}/tracks" was Spotify's endpoint for this until their
-        # March 2026 Web API migration, which retired it in favor of
-        # "/playlists/{id}/items" (same shape, but /tracks now returns a flat
-        # 403 for every playlist, including your own, on Development Mode
-        # apps -- see https://developer.spotify.com/documentation/web-api/reference/get-playlists-items)
-        path = f"/playlists/{playlist_id}/items"
-        params = {"fields": "items(track(id,name,artists(name))),next", "limit": 50}
-        pages_fetched = 0
+        for playlist_track in playlist.tracks:
+            track = playlist_track.track
 
-        try:
-            # See MAX_FETCH_PAGES -- a backstop against a non-terminating
-            # "next" pointer, not a real limit on playlist size
-            while path is not None and pages_fetched < self.MAX_FETCH_PAGES:
-                page = self._api_get(path, params=params)
-                pages_fetched += 1
+            if not track or not track.id:
+                continue
 
-                for item in page.get("items", []):
-                    track = item.get("track")
+            current_track_ids.append(track.id)
 
-                    if not track or not track.get("id"):
-                        continue
+            if track.id in seen_track_ids:
+                continue
 
-                    current_track_ids.append(track["id"])
+            term = self._build_search_term(track)
 
-                    if track["id"] in seen_track_ids:
-                        continue
-
-                    term = self._build_search_term(track)
-
-                    if term:
-                        new_terms.append(term)
-
-                # "next" is already a complete URL for the following page, or None if done
-                path = page.get("next")
-                params = None
-
-        except SpotifyAPIError as error:
-            diagnostic = self._diagnose_403(playlist_id) if error.status == 403 else ""
-            log.add(_('Spotify: checking playlist "%(playlist)s" failed: %(error)s%(diagnostic)s'), {
-                "playlist": list_name, "error": error.message, "diagnostic": diagnostic
-            })
-            return
+            if term:
+                new_terms.append(term)
 
         entry["seen_track_ids"] = current_track_ids
         config.write_configuration()
@@ -947,8 +427,8 @@ class SpotifyWatch:
 
     def _build_search_term(self, track):
 
-        artist_names = ", ".join(artist["name"] for artist in track.get("artists", []) if artist.get("name"))
-        title = track.get("name") or ""
+        artist_names = ", ".join(artist.name for artist in track.artists if artist.name)
+        title = track.name or ""
 
         if not artist_names or not title:
             return None
