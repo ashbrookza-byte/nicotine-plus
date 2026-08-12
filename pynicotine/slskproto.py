@@ -387,7 +387,15 @@ class NetworkThread(Thread):
 
     def __init__(self):
 
-        super().__init__(name="NetworkThread")
+        # daemon=True: confirmed live -- a quit sequence can print its own
+        # completion log line ("Quit Nicotine+ ...!", from Core._quit) and
+        # still never actually let the process exit, because Py_Finalize
+        # waits for every non-daemon thread to finish first, and this
+        # thread's own run() loop doesn't necessarily return promptly (or
+        # at all) just because "quit" fired -- the process was left
+        # permanently alive but doing nothing, with no way to recover short
+        # of a hard kill. Same fix, same reasoning as Events._scheduler_thread.
+        super().__init__(name="NetworkThread", daemon=True)
 
         self._message_queue = SimpleQueue()
         self._pending_peer_conns = {}
