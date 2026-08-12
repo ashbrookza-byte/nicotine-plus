@@ -1115,19 +1115,21 @@ class Wishlists:
 
         self.folders_lists_view = TreeView(
             window, parent=self.folders_lists_container, select_row_callback=self.on_select_list_row,
-            reorder_callback=self.on_folders_lists_view_reordered, columns=_active_columns()
+            reorder_callback=self.on_folders_lists_view_reordered, multi_select=True,
+            delete_accelerator_callback=self.on_remove_list, columns=_active_columns()
         )
         self.folders_completed_lists_view = TreeView(
             window, parent=self.folders_completed_lists_container, select_row_callback=self.on_select_list_row,
-            columns=_completed_columns()
+            multi_select=True, delete_accelerator_callback=self.on_remove_list, columns=_completed_columns()
         )
         self.spotify_lists_view = TreeView(
             window, parent=self.spotify_lists_container, select_row_callback=self.on_select_list_row,
-            reorder_callback=self.on_spotify_lists_view_reordered, columns=_active_columns()
+            reorder_callback=self.on_spotify_lists_view_reordered, multi_select=True,
+            delete_accelerator_callback=self.on_remove_list, columns=_active_columns()
         )
         self.spotify_completed_lists_view = TreeView(
             window, parent=self.spotify_completed_lists_container, select_row_callback=self.on_select_list_row,
-            columns=_completed_columns()
+            multi_select=True, delete_accelerator_callback=self.on_remove_list, columns=_completed_columns()
         )
 
         self.items_view = TreeView(
@@ -1277,6 +1279,18 @@ class Wishlists:
             self.folders_lists_view, self.folders_completed_lists_view,
             self.spotify_lists_view, self.spotify_completed_lists_view
         )
+
+    def _selected_list_names(self):
+        """Names of every currently selected list, in visual (top-to-bottom)
+        order -- selection is exclusive across the four category/status
+        views (see on_select_list_row), so at most one of them ever has a
+        non-empty selection at a time."""
+
+        for view in self._all_lists_views():
+            if not view.is_selection_empty():
+                return [view.get_row_value(iterator, "name") for iterator in view.get_selected_rows()]
+
+        return []
 
     def on_select_list_row(self, list_view, iterator):
 
@@ -1735,27 +1749,39 @@ class Wishlists:
         )
 
     def on_pin_unpin_list(self, *_args):
+        """Pins/unpins every selected list at once. Mixed selections (some
+        pinned, some not) all follow the first selected list's own state --
+        e.g. selecting one pinned and two unpinned lists and pinning
+        unpins all three, matching what the popup menu's Pin/Unpin label
+        (set from that same first list, see on_popup_lists_menu) promises."""
 
-        name = self.current_list_name
-        download_list = core.download_lists.lists.get(name)
+        names = self._selected_list_names()
 
-        if download_list is not None:
-            core.download_lists.set_list_pinned(name, not download_list.pinned)
-
-    def _move_list_priority(self, direction):
-        """Swap the current list with its neighbor within its own category
-        (Folders or Spotify Playlists) -- mirrors DownloadLists.
-        _swap_list_priority's own pinned/unpinned tier restriction, but
-        scoped further to the category, since the two categories are now
-        displayed in fully separate sidebar sections: swapping against a
-        list in the other category wouldn't move anything visibly, even
-        though it would still change the underlying global priority order
-        DownloadLists.move_list_up/down operates on directly."""
-
-        name = self.current_list_name
-
-        if name is None:
+        if not names:
             return
+
+        first_list = core.download_lists.lists.get(names[0])
+
+        if first_list is None:
+            return
+
+        target_pinned = not first_list.pinned
+
+        for name in names:
+            download_list = core.download_lists.lists.get(name)
+
+            if download_list is not None and download_list.pinned != target_pinned:
+                core.download_lists.set_list_pinned(name, target_pinned)
+
+    def _move_single_list_priority(self, name, direction):
+        """Swap one list with its neighbor within its own category (Folders
+        or Spotify Playlists) -- mirrors DownloadLists._swap_list_priority's
+        own pinned/unpinned tier restriction, but scoped further to the
+        category, since the two categories are now displayed in fully
+        separate sidebar sections: swapping against a list in the other
+        category wouldn't move anything visibly, even though it would
+        still change the underlying global priority order DownloadLists.
+        move_list_up/down operates on directly."""
 
         download_list = core.download_lists.lists.get(name)
 
@@ -1781,6 +1807,24 @@ class Wishlists:
 
         self._apply_category_reorder(category_names, is_spotify)
 
+    def _move_list_priority(self, direction):
+        """Moves every selected list by one position, as a block. Processed
+        top-to-bottom for "up" and bottom-to-top for "down" -- the standard
+        multi-select reorder order, so an earlier move in the pass never
+        gets bumped right back by a later one cascading past it (each
+        individual swap re-reads the list order fresh, so this stays
+        correct even as earlier moves in the same pass change it)."""
+
+        names = self._selected_list_names()
+
+        if not names:
+            return
+
+        ordered_names = names if direction < 0 else list(reversed(names))
+
+        for name in ordered_names:
+            self._move_single_list_priority(name, direction)
+
     def on_move_list_up(self, *_args):
         self._move_list_priority(-1)
 
@@ -1788,19 +1832,33 @@ class Wishlists:
         self._move_list_priority(1)
 
     def on_pause_resume_list(self, *_args):
+        """Pauses/resumes every selected list at once, all following the
+        first selected list's own state -- same "first list decides" rule
+        as on_pin_unpin_list, matching the popup menu's Pause/Resume label."""
 
-        if self.current_list_name is None:
+        names = self._selected_list_names()
+
+        if not names:
             return
 
-        download_list = core.download_lists.lists.get(self.current_list_name)
+        first_list = core.download_lists.lists.get(names[0])
 
-        if download_list is None:
+        if first_list is None:
             return
 
-        if download_list.effective_auto_download:
-            core.download_lists.pause_list(self.current_list_name)
-        else:
-            core.download_lists.resume_list(self.current_list_name)
+        pause = first_list.effective_auto_download
+
+        for name in names:
+            download_list = core.download_lists.lists.get(name)
+
+            if download_list is None:
+                continue
+
+            if pause:
+                if download_list.effective_auto_download:
+                    core.download_lists.pause_list(name)
+            elif not download_list.effective_auto_download:
+                core.download_lists.resume_list(name)
 
     def on_list_settings(self, *_args):
 
@@ -1840,28 +1898,37 @@ class Wishlists:
             callback_data=old_name
         ).present()
 
-    def on_remove_list_response(self, _dialog, _response_id, name):
-        core.download_lists.remove_list(name)
+    def on_remove_list_response(self, _dialog, _response_id, names):
+        for name in names:
+            core.download_lists.remove_list(name)
 
     def on_remove_list(self, *_args):
 
-        name = self.current_list_name
+        names = self._selected_list_names()
 
-        if name is None:
+        if not names:
             return
+
+        if len(names) == 1:
+            message = _('Do you want to remove "%s"? Files already downloaded are not deleted, '
+                        "only the list itself and its history.") % names[0]
+        else:
+            message = _(
+                "Do you want to remove these %(count)s lists? Files already downloaded are not "
+                "deleted, only the lists themselves and their history.\n\n%(names)s"
+            ) % {"count": len(names), "names": "\n".join(names)}
 
         OptionDialog(
             application=self.window.application,
-            title=_("Remove List?"),
-            message=_('Do you want to remove "%s"? Files already downloaded are not deleted, '
-                      "only the list itself and its history.") % name,
+            title=_("Remove List?") if len(names) == 1 else _("Remove Lists?"),
+            message=message,
             buttons=[
                 ("cancel", _("_Cancel")),
                 ("ok", _("Remove"))
             ],
             destructive_response_id="ok",
             callback=self.on_remove_list_response,
-            callback_data=name
+            callback_data=names
         ).present()
 
     def on_search_item(self, *_args):
