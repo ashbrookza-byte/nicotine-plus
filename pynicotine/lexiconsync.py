@@ -60,6 +60,11 @@ from pynicotine.utils import safe_path_join
 
 LOSSLESS_EXTENSIONS = {".flac", ".wav", ".aiff", ".aif", ".ape"}
 
+# Files considered when backfilling a list folder's existing downloads
+AUDIO_EXTENSIONS = {
+    ".mp3", ".flac", ".wav", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".wma", ".ape", ".aiff", ".aif", ".mp4"
+}
+
 # A duplicate this much longer than the other is a different (extended) cut,
 # which outranks any quality difference when dedupe_prefer_longer is on
 SIGNIFICANT_LENGTH_SECONDS = 30
@@ -311,6 +316,17 @@ def is_same_song(track_a, track_b):
             == str(track_b.get("artist") or "").strip().casefold())
 
 
+def is_same_audio(track_a, track_b):
+    """Two library entries that are, for all practical purposes, the same
+    recording: same duration (within a second) and same quality. Used to
+    treat a re-downloaded copy as a relocation rather than a version choice
+    -- and since the audio matches, cue points transfer safely."""
+
+    return (abs(_duration(track_a) - _duration(track_b)) <= 1
+            and _bitrate(track_a) == _bitrate(track_b)
+            and is_lossless(track_a.get("location")) == is_lossless(track_b.get("location")))
+
+
 def preferred_track(new_track, old_track, prefer_longer=True, prefer_lossless=True):
     """Which of two duplicate tracks to keep. Ties keep the OLD track: it may
     carry cues, play history and playlist placements worth preserving."""
@@ -426,10 +442,11 @@ def sync_smartlists(client, jobs, playlist_ids, parent_folder_name):
     return synced
 
 
-def _replace_duplicate(client, winner, loser, copy_metadata):
+def _replace_duplicate(client, winner, loser, copy_metadata, copy_cues=False):
     """Move the loser's normal-playlist memberships over to the winner, copy
-    its user metadata across if requested (rating/energy/color/tags -- not
-    cues, see module docstring), then remove the loser from the library."""
+    its user metadata across if requested (rating/energy/color/tags -- plus
+    cue points and beatgrid when copy_cues says the audio is identical, see
+    is_same_audio), then remove the loser from the library."""
 
     winner_id = winner.get("id")
     loser_id = loser.get("id")
@@ -459,6 +476,13 @@ def _replace_duplicate(client, winner, loser, copy_metadata):
 
         if isinstance(tags, list) and tags:
             edits["tags"] = [tag["id"] if isinstance(tag, dict) else tag for tag in tags]
+
+        if copy_cues:
+            for field in ("cuepoints", "tempomarkers"):
+                value = loser.get(field)
+
+                if isinstance(value, list) and value:
+                    edits[field] = value
 
         if edits:
             client.update_track(winner_id, edits)
@@ -499,6 +523,14 @@ def import_finished_file(client, file_path, dedupe_enabled, prefer_longer, prefe
         return "imported"
 
     for old_track in duplicates:
+        if is_same_audio(new_track, old_track):
+            # Same recording in a new place (e.g. re-downloaded into a list's
+            # folder): the new copy wins so location-based smartlists see it,
+            # and since the audio is identical, cues/beatgrid come along too
+            _replace_duplicate(
+                client, winner=new_track, loser=old_track, copy_metadata=True, copy_cues=True)
+            continue
+
         winner = preferred_track(
             new_track, old_track, prefer_longer=prefer_longer, prefer_lossless=prefer_lossless)
 
@@ -607,11 +639,44 @@ class LexiconSync:
 
     def sync_now(self):
         """Queue every list for a fresh reconcile and kick off a pass right
-        away (pending file imports ride along automatically). Used by the
-        "Sync Now" button in the API Integrations tab."""
+        away. With auto-import on, this also backfills: every audio file
+        already sitting in a list's folder is queued for import, catching
+        downloads that finished before this feature existed (or while it was
+        off). Re-importing a file Lexicon already has just returns its
+        existing track, so pressing the button repeatedly is safe. Used by
+        the "Sync Now" button in the API Integrations tab."""
+
+        from pynicotine.core import core
 
         with self._lock:
             self._pending_lists.update(self._known_list_names())
+
+        if config.sections["lexicon"]["auto_import"] and core.download_lists is not None:
+            queued = 0
+
+            for name, download_list in core.download_lists.lists.items():
+                folder_path = download_list.effective_download_folder_path
+
+                if not os.path.isdir(folder_path):
+                    continue
+
+                for root, _folders, files in os.walk(folder_path):
+                    for basename in files:
+                        _stem, extension = os.path.splitext(basename)
+
+                        if extension.lower() not in AUDIO_EXTENSIONS:
+                            continue
+
+                        entry = (name, os.path.join(root, basename))
+
+                        with self._lock:
+                            if entry not in self._pending_files:
+                                self._pending_files.append(entry)
+                                queued += 1
+
+            if queued:
+                self._save_state()
+                log.add(_("Lexicon: queued %(num)s existing file(s) for import"), {"num": queued})
 
         events.schedule(delay=1, callback=self._poll)
 

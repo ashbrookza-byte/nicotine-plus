@@ -323,6 +323,31 @@ class ImportDedupeTest(TestCase):
         # Only the old track remains in the library
         self.assertEqual(list(client.tracks), [1])
 
+    def test_identical_audio_relocates_and_copies_cues(self):
+
+        old_track = {
+            "id": 1, "artist": "Artist", "title": "Song",
+            "duration": 200, "bitrate": 320,
+            "location": "/music/old/Artist - Song.mp3",
+            "locationUnique": "/music/old/artist - song.mp3",
+            "rating": 5,
+            "cuepoints": [{"position": 0, "startTime": 12.5, "type": "1"}]
+        }
+        client = FakeLexiconClient(tracks=[old_track])
+
+        # The fake importer assigns duration 200 / bitrate 320: same audio,
+        # so the new in-folder copy wins even though it's a quality tie
+        outcome = import_finished_file(
+            client, "/music/House/Artist - Song.mp3",
+            dedupe_enabled=True, prefer_longer=True, prefer_lossless=True)
+
+        self.assertIn("replaced older version", outcome)
+        self.assertNotIn(1, client.tracks)
+
+        new_track = client.tracks[next(iter(client.tracks))]
+        self.assertEqual(new_track.get("rating"), 5)
+        self.assertEqual(new_track.get("cuepoints"), old_track["cuepoints"])
+
     def test_dedupe_disabled_keeps_both(self):
 
         old_track = {
