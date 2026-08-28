@@ -129,12 +129,19 @@ class ApiIntegrations:
         test_button = Gtk.Button(label=_("_Test Connection"), use_underline=True, visible=True)
         test_button.connect("clicked", self.on_test_connection)
 
+        # Same action as the title-bar button, where it's easy to miss
+        inline_sync_button = Gtk.Button(label=_("_Sync Now"), use_underline=True, visible=True)
+        inline_sync_button.set_tooltip_text(self.sync_now_button.get_tooltip_text())
+        inline_sync_button.connect("clicked", self.on_sync_now)
+
         if GTK_API_VERSION >= 4:
             status_row.append(self.lexicon_status_label)  # pylint: disable=no-member
             status_row.append(test_button)                # pylint: disable=no-member
+            status_row.append(inline_sync_button)         # pylint: disable=no-member
         else:
             status_row.add(self.lexicon_status_label)     # pylint: disable=no-member
             status_row.add(test_button)                   # pylint: disable=no-member
+            status_row.add(inline_sync_button)            # pylint: disable=no-member
 
         self._append(status_row)
 
