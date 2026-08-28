@@ -575,6 +575,66 @@
       </object>
     </child>
   </object>
+  <object class="GtkBox" id="apiintegrations_page">
+    <property name="visible">False</property>
+    <property name="width-request">480</property>
+    <child>
+      <object class="GtkBox">
+        <property name="hexpand">True</property>
+        <property name="orientation">vertical</property>
+        <property name="visible">False</property>
+        <child>
+          <object class="GtkBox" id="apiintegrations_toolbar">
+            <property name="visible">False</property>
+            <child>
+              <object class="GtkBox">
+                <property name="hexpand">True</property>
+                <property name="margin-bottom">6</property>
+                <property name="margin-end">6</property>
+                <property name="margin-start">6</property>
+                <property name="margin-top">6</property>
+                <property name="spacing">6</property>
+                <property name="visible">True</property>
+                <child>
+                  <object class="GtkBox" id="apiintegrations_title">
+                    <property name="halign">start</property>
+                    <property name="hexpand">True</property>
+                    <property name="spacing">6</property>
+                    <property name="valign">center</property>
+                    <property name="visible">True</property>
+                    <child>
+                      <object class="GtkLabel">
+                        <property name="label" translatable="yes">API Integrations</property>
+                        <property name="visible">True</property>
+                        <style>
+                          <class name="heading"/>
+                        </style>
+                      </object>
+                    </child>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkBox" id="apiintegrations_end">
+                    <property name="spacing">6</property>
+                    <property name="valign">center</property>
+                    <property name="visible">True</property>
+                  </object>
+                </child>
+              </object>
+            </child>
+            <style>
+              <class name="border-bottom"/>
+            </style>
+          </object>
+        </child>
+        <child>
+          <object class="GtkBox" id="apiintegrations_content">
+            <property name="visible">False</property>
+          </object>
+        </child>
+      </object>
+    </child>
+  </object>
   <object class="GtkBox" id="uploads_page">
     <property name="visible">False</property>
     <property name="width-request">580</property>

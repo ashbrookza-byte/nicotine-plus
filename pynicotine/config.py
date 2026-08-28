@@ -382,6 +382,7 @@ class Config:
                     "search": True,
                     "downloads": True,
                     "wishlists": True,
+                    "apiintegrations": True,
                     "uploads": True,
                     "userbrowse": True,
                     "userinfo": True,
@@ -393,6 +394,7 @@ class Config:
                     "search",
                     "downloads",
                     "wishlists",
+                    "apiintegrations",
                     "uploads",
                     "userbrowse",
                     "userinfo",
@@ -658,6 +660,15 @@ class Config:
             self._parser.read_file(file_handle)
 
     def _migrate_config(self):
+
+        # Slot the API Integrations tab in next to Wishlists for configs saved
+        # before it existed (an id missing from a saved modes_order would
+        # otherwise end up as the last tab)
+        modes_order = self.sections["ui"]["modes_order"]
+
+        if "apiintegrations" not in modes_order:
+            anchor = (modes_order.index("wishlists") + 1) if "wishlists" in modes_order else len(modes_order)
+            modes_order.insert(anchor, "apiintegrations")
 
         # Map legacy folder/user grouping modes (3.1.0)
         for section, option in (

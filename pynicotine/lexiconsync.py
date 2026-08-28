@@ -605,6 +605,34 @@ class LexiconSync:
             events.cancel_scheduled(self._poll_timer_id)
             self._poll_timer_id = None
 
+    def sync_now(self):
+        """Queue every list for a fresh reconcile and kick off a pass right
+        away (pending file imports ride along automatically). Used by the
+        "Sync Now" button in the API Integrations tab."""
+
+        with self._lock:
+            self._pending_lists.update(self._known_list_names())
+
+        events.schedule(delay=1, callback=self._poll)
+
+    def check_connection(self, callback):
+        """Probe the Lexicon API from a worker thread and report back via
+        callback(reachable, detail) on the main thread."""
+
+        api_url = config.sections["lexicon"]["api_url"]
+
+        def probe():
+            try:
+                LexiconClient(api_url).get_playlist_tree()
+
+            except LexiconAPIError as error:
+                events.invoke_main_thread(callback, False, str(error))
+                return
+
+            events.invoke_main_thread(callback, True, api_url)
+
+        threading.Thread(target=probe, name="LexiconProbeThread", daemon=True).start()
+
     def update_settings(self, sync_enabled=None, api_url=None, parent_folder=None, auto_import=None,
                         dedupe_enabled=None, dedupe_prefer_longer=None, dedupe_prefer_lossless=None):
         """Apply settings from the GUI. Anything affecting where/whether

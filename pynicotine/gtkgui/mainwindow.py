@@ -20,6 +20,7 @@ import pynicotine
 from pynicotine.config import config
 from pynicotine.core import core
 from pynicotine.events import events
+from pynicotine.gtkgui.apiintegrations import ApiIntegrations
 from pynicotine.gtkgui.application import GTK_API_VERSION
 from pynicotine.gtkgui.application import GTK_MINOR_VERSION
 from pynicotine.gtkgui.buddies import Buddies
@@ -68,6 +69,11 @@ class MainWindow(Window):
 
         (
             self.add_buddy_entry,
+            self.apiintegrations_content,
+            self.apiintegrations_end,
+            self.apiintegrations_page,
+            self.apiintegrations_title,
+            self.apiintegrations_toolbar,
             self.buddy_list_container,
             self.chatrooms_buddy_list_container,
             self.chatrooms_container,
@@ -265,6 +271,7 @@ class MainWindow(Window):
         self.search = Searches(self)
         self.downloads = Downloads(self)
         self.wishlists = Wishlists(self)
+        self.api_integrations = ApiIntegrations(self)
         self.uploads = Uploads(self)
         self.buddies = Buddies(self)
         self.privatechat = PrivateChats(self)
@@ -272,6 +279,7 @@ class MainWindow(Window):
         self.userbrowse = UserBrowses(self)
 
         self.tabs = {
+            "apiintegrations": self.api_integrations,
             "chatrooms": self.chatrooms,
             "downloads": self.downloads,
             "interests": self.interests,
@@ -784,6 +792,7 @@ class MainWindow(Window):
             ("search", _("Search Files"), "system-search-symbolic"),
             ("downloads", _("Downloads"), "folder-download-symbolic"),
             ("wishlists", _("Wishlists"), "starred-symbolic"),
+            ("apiintegrations", _("API Integrations"), "network-transmit-receive-symbolic"),
             ("uploads", _("Uploads"), "emblem-shared-symbolic"),
             ("userbrowse", _("Browse Shares"), "folder-symbolic"),
             ("userinfo", _("User Profiles"), "avatar-default-symbolic"),
