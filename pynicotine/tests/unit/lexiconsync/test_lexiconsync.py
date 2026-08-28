@@ -13,6 +13,7 @@ from pynicotine.lexiconsync import preferred_track
 from pynicotine.lexiconsync import process_pending_files
 from pynicotine.lexiconsync import find_library_match
 from pynicotine.lexiconsync import sync_playlists
+from pynicotine.lexiconsync import version_signature
 
 
 class FakeLexiconClient:
@@ -143,6 +144,39 @@ class DuplicateLogicTest(TestCase):
         self.assertFalse(is_same_song(original, other_song))
         self.assertFalse(is_same_song(original, other_artist))
         self.assertFalse(is_same_song(original, untitled))
+
+    def test_version_signature(self):
+
+        # Cuts of the same version all collapse to the same (empty) signature
+        self.assertEqual(version_signature("Amman"), "")
+        self.assertEqual(version_signature("Amman (Extended Version)"), "")
+        self.assertEqual(version_signature("Amman (Radio Edit)"), "")
+        self.assertEqual(version_signature("Amman - Radio Edit"), "")
+        self.assertEqual(version_signature("Song (feat. Somebody)"), "")
+
+        # Remixes carry their identity, bracketed or Spotify dash style
+        self.assertEqual(version_signature("Amman (Nils Hoffmann Remix)"),
+                         version_signature("Amman - Nils Hoffmann Remix"))
+        self.assertNotEqual(version_signature("Amman (Nils Hoffmann Remix)"), "")
+
+        # "Extended" inside a remix qualifier doesn't hide the remix identity
+        self.assertEqual(version_signature("Ophelia (Arlane Extended Bootleg)"),
+                         version_signature("Ophelia (Arlane Bootleg)"))
+
+        # Different remixes are different versions
+        self.assertNotEqual(version_signature("Song (A Remix)"), version_signature("Song (B Remix)"))
+
+    def test_remix_is_not_a_duplicate_of_the_original(self):
+
+        original = {"artist": "Röyksopp", "title": "Impossible"}
+        remix = {"artist": "Röyksopp", "title": "Impossible (&ME Remix)"}
+        extended = {"artist": "Röyksopp", "title": "Impossible (Extended Mix)"}
+
+        self.assertFalse(is_same_song(original, remix))
+        self.assertFalse(is_same_song(remix, original))
+        self.assertTrue(is_same_song(original, extended))
+        self.assertTrue(is_same_song(remix, {"artist": "Röyksopp",
+                                             "title": "Impossible - &ME Remix"}))
 
     def test_significantly_longer_version_wins(self):
 
@@ -310,6 +344,29 @@ class LibraryMatchTest(TestCase):
 
     def test_different_artist_does_not_match(self):
         self.assertIsNone(find_library_match(self._library(), "Ben Bohmer - Amman"))
+
+    def test_wanting_a_remix_does_not_match_the_original(self):
+        # Library has the (neutral) extended version; asking for a remix of
+        # the song must NOT be satisfied by it
+        self.assertIsNone(find_library_match(self._library(), "Emmit Fenn - Amman (Nils Hoffmann Remix)"))
+        self.assertIsNone(find_library_match(self._library(), "Amman - Nils Hoffmann Remix - Emmit Fenn"))
+
+    def test_owning_a_remix_does_not_match_the_original(self):
+
+        client = FakeLexiconClient(tracks=[{
+            "id": 2, "artist": "Röyksopp", "title": "Impossible (&ME Remix)",
+            "duration": 300, "bitrate": 320,
+            "location": "/music/library/impossible remix.mp3",
+            "locationUnique": "/music/library/impossible remix.mp3"
+        }])
+
+        # Asking for the plain original must not be satisfied by the remix...
+        self.assertIsNone(find_library_match(client, "Röyksopp - Impossible"))
+
+        # ...but asking for that exact remix (Spotify dash-title style) is
+        match = find_library_match(client, "Impossible - &ME Remix - Röyksopp")
+        self.assertIsNotNone(match)
+        self.assertEqual(match["id"], 2)
 
 
 class ImportDedupeTest(TestCase):

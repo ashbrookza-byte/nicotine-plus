@@ -85,6 +85,54 @@ SIGNIFICANT_LENGTH_RATIO = 1.10
 
 BRACKETED_CONTENT_PATTERN = re.compile(r"[(\[][^)\]]*[)\]]")
 WHITESPACE_PATTERN = re.compile(r"\s+")
+NON_WORD_PATTERN = re.compile(r"[^\w]+")
+
+# Qualifier words that do NOT make a different version of a song: an
+# extended mix, radio edit and original mix are all the same recording for
+# matching purposes (which one to *keep* is the prefer-longer/lossless
+# preferences' job). Anything else left in a bracketed qualifier -- a
+# remixer's name, "remix", "bootleg", "acoustic", "live" -- marks a
+# genuinely different version that must only match itself.
+NEUTRAL_QUALIFIER_WORDS = {
+    "original", "mix", "extended", "version", "radio", "edit", "club", "album", "single",
+    "remaster", "remastered", "clean", "dirty", "explicit", "intro", "outro", "official",
+    "full", "length", "mono", "stereo", "bonus", "deluxe", "digital", "audio", "hq", "hd"
+}
+
+FEATURING_QUALIFIER_PATTERN = re.compile(r"^(feat|ft|featuring|with|w)\b", re.IGNORECASE)
+
+# Words that, appearing in a qualifier, mark a distinct version outright --
+# used to recognize Spotify's bracket-less "Song - Artist Remix" style
+STRONG_VERSION_WORDS = {
+    "remix", "rmx", "bootleg", "rework", "reworked", "flip", "vip", "mashup", "cover",
+    "acoustic", "live", "instrumental", "acapella", "dub", "unofficial"
+}
+
+
+def _split_dash_qualifiers(title):
+    """Split "Song - Artist Remix" / "Song - Radio Edit" style titles into
+    (base text, [qualifier chunks]). A trailing " - X" segment counts as a
+    qualifier when it names a version (contains a strong version word) or is
+    made up purely of neutral words like "Radio Edit"."""
+
+    segments = (title or "").split(" - ")
+    qualifiers = []
+
+    while len(segments) > 1:
+        tokens = [word for word in NON_WORD_PATTERN.split(segments[-1].casefold()) if word]
+
+        if not tokens:
+            segments.pop()
+            continue
+
+        if (any(word in STRONG_VERSION_WORDS for word in tokens)
+                or all(word in NEUTRAL_QUALIFIER_WORDS for word in tokens)):
+            qualifiers.append(segments.pop())
+            continue
+
+        break
+
+    return " - ".join(segments), qualifiers
 
 
 class LexiconAPIError(Exception):
@@ -124,6 +172,16 @@ class LexiconClient:
         try:
             with urlopen(request, timeout=self.REQUEST_TIMEOUT) as response:
                 body = response.read()
+
+        except HTTPError as error:
+            # Lexicon answered with an error: surface its own message, it's
+            # far more diagnosable than "400: Bad Request"
+            try:
+                detail = error.read().decode("utf-8", "replace")[:200]
+            except OSError:
+                detail = ""
+
+            raise LexiconAPIError(f"{error}{' — ' + detail if detail else ''}") from error
 
         except (OSError, URLError) as error:
             # Includes connection refused, i.e. Lexicon not running
@@ -293,11 +351,38 @@ def effective_list_folder(name, download_folder_path=None, use_name_subfolder=No
 # Duplicate comparison #
 
 def base_title(title):
-    """Title with "(Extended Mix)"/"[Remaster]"-style qualifiers stripped, for
-    matching different cuts of the same song against each other."""
+    """Title with "(Extended Mix)"/"[Remaster]"-style qualifiers stripped --
+    bracketed or in Spotify's trailing "- Radio Edit"/"- Artist Remix" dash
+    style -- for matching versions of the same song against each other.
+    Which version a qualifier names is version_signature's job."""
 
-    stripped = BRACKETED_CONTENT_PATTERN.sub(" ", title or "")
+    base, _qualifiers = _split_dash_qualifiers(title)
+    stripped = BRACKETED_CONTENT_PATTERN.sub(" ", base)
     return WHITESPACE_PATTERN.sub(" ", stripped).strip().casefold()
+
+
+def version_signature(title):
+    """What VERSION of the song a title names, distilled from its bracketed
+    qualifiers: "Song", "Song (Extended Mix)" and "Song (Radio Edit)" all
+    give "" (same version, different cuts), while "Song (Arlane Extended
+    Bootleg)" gives "arlane bootleg" and only matches other Arlane bootlegs.
+    Featuring credits are ignored -- they name collaborators, not versions."""
+
+    base, chunks = _split_dash_qualifiers(title)
+    chunks += BRACKETED_CONTENT_PATTERN.findall(base)
+    words = []
+
+    for chunk in chunks:
+        chunk = chunk.strip("([)]").strip()
+
+        if FEATURING_QUALIFIER_PATTERN.match(chunk):
+            continue
+
+        for word in NON_WORD_PATTERN.split(chunk.casefold()):
+            if word and word not in NEUTRAL_QUALIFIER_WORDS:
+                words.append(word)
+
+    return " ".join(sorted(set(words)))
 
 
 def is_lossless(location):
@@ -320,14 +405,18 @@ def _bitrate(track):
 
 
 def is_same_song(track_a, track_b):
-    """Same song in a different (or identical) version: same artist and same
-    base title. Matching stays deliberately strict -- a false "duplicate"
-    removes a track from the library, a false negative just leaves both."""
+    """Same song in the same VERSION: same artist, same base title, and the
+    same version signature -- so a remix never counts as a duplicate of the
+    original (or of a different remix), while extended/radio/original cuts
+    of one version do. Matching stays deliberately strict: a false
+    "duplicate" removes a track from the library, a false negative just
+    leaves both."""
 
     if not base_title(track_a.get("title")) or not base_title(track_b.get("title")):
         return False
 
     return (base_title(track_a.get("title")) == base_title(track_b.get("title"))
+            and version_signature(track_a.get("title")) == version_signature(track_b.get("title"))
             and str(track_a.get("artist") or "").strip().casefold()
             == str(track_b.get("artist") or "").strip().casefold())
 
@@ -463,19 +552,36 @@ def sync_playlists(client, jobs, playlist_ids, parent_folder_name):
 
 def find_library_match(client, term):
     """Look up a download-list search term (usually "Artist - Title" or
-    "Title - Artist") in the Lexicon library. Any version of the song counts
-    (base title, "(Extended Mix)"-style qualifiers ignored), matching the
-    dedupe rules. Returns the matched track dict, or None."""
+    "Title - Artist") in the Lexicon library. Different CUTS of the wanted
+    version count (extended/radio/original mix), but a different VERSION
+    never does: asking for the original won't match a remix the user
+    happens to own, and asking for a remix won't match the original or a
+    different remix (see version_signature). Returns the matched track
+    dict, or None."""
 
-    parts = [part.strip() for part in term.split(" - ", 1)]
+    segments = [part.strip() for part in term.split(" - ") if part.strip()]
 
-    if len(parts) != 2:
-        parts = [term.strip()]
+    if len(segments) < 2:
+        orderings = [(None, term.strip())]
+    else:
+        # Try every dash as the title/artist divider, in both orders --
+        # Spotify terms are "Title - Artists" where the title itself can
+        # contain a dash qualifier ("Impossible - &ME Remix - Röyksopp")
+        orderings = []
 
-    # Try both readings of "A - B": (artist, title) and (title, artist)
-    orderings = [(parts[0], parts[1]), (parts[1], parts[0])] if len(parts) == 2 else [(None, parts[0])]
+        for index in range(1, len(segments)):
+            left = " - ".join(segments[:index])
+            right = " - ".join(segments[index:])
+            orderings += [(left, right), (right, left)]
 
     for artist_part, title_part in orderings:
+        if artist_part and any(
+                word in STRONG_VERSION_WORDS for word in NON_WORD_PATTERN.split(artist_part.casefold())):
+            # A "remix"/"bootleg"/... in the supposed artist half means this
+            # split put version info on the wrong side -- matching on it
+            # would let a remix request match the original
+            continue
+
         search_title = base_title(title_part)
 
         if not search_title:
@@ -483,6 +589,9 @@ def find_library_match(client, term):
 
         for track in client.search_tracks({"title": search_title[:80]}):
             if base_title(track.get("title")) != search_title:
+                continue
+
+            if version_signature(track.get("title")) != version_signature(title_part):
                 continue
 
             if artist_part is None:
@@ -607,18 +716,26 @@ def import_finished_file(client, file_path, dedupe_enabled, prefer_longer, prefe
 
 
 def process_pending_files(client, pending_files, playlist_ids, dedupe_enabled, prefer_longer,
-                          prefer_lossless):
+                          prefer_lossless, progress_callback=None):
     """Import queued finished downloads, adding each imported track to its
     list's Lexicon playlist. Mutates pending_files in place, keeping entries
     whose import failed on a (presumably transient) API error. Returns a list
-    of outcome strings for what got processed."""
+    of outcome strings for what got processed. progress_callback, if given,
+    is called as (done, total) after every entry."""
 
     outcomes = []
+    total = len(pending_files)
+    done = 0
 
     # playlist id -> set of track ids already in it, fetched lazily
     member_cache = {}
 
     for entry in list(pending_files):
+        done += 1
+
+        if progress_callback is not None:
+            progress_callback(done, total)
+
         list_name, file_path = entry
 
         if not os.path.exists(file_path):
@@ -634,16 +751,6 @@ def process_pending_files(client, pending_files, playlist_ids, dedupe_enabled, p
                 prefer_lossless=prefer_lossless
             )
 
-            playlist_id = playlist_ids.get(list_name)
-
-            if track_id is not None and playlist_id is not None:
-                if playlist_id not in member_cache:
-                    member_cache[playlist_id] = set(client.get_playlist(playlist_id).get("trackIds") or [])
-
-                if track_id not in member_cache[playlist_id]:
-                    client.add_playlist_tracks(playlist_id, [track_id])
-                    member_cache[playlist_id].add(track_id)
-
         except LexiconAPIError as error:
             if isinstance(error.__cause__, HTTPError):
                 # Lexicon answered and said no (e.g. an unreadable file):
@@ -656,6 +763,25 @@ def process_pending_files(client, pending_files, playlist_ids, dedupe_enabled, p
                 continue
 
             log.add_debug("Lexicon: importing %s failed, will retry: %s", (file_path, error))
+            continue
+
+        # The import itself succeeded; a failure adding it to the playlist
+        # (e.g. a stale playlist ID) is NOT the file's fault -- keep the
+        # entry queued so the next pass, with the playlist re-ensured,
+        # finishes the job
+        try:
+            playlist_id = playlist_ids.get(list_name)
+
+            if track_id is not None and playlist_id is not None:
+                if playlist_id not in member_cache:
+                    member_cache[playlist_id] = set(client.get_playlist(playlist_id).get("trackIds") or [])
+
+                if track_id not in member_cache[playlist_id]:
+                    client.add_playlist_tracks(playlist_id, [track_id])
+                    member_cache[playlist_id].add(track_id)
+
+        except LexiconAPIError as error:
+            log.add_debug("Lexicon: adding %s to playlist failed, will retry: %s", (file_path, error))
             continue
 
         pending_files.remove(entry)
@@ -688,6 +814,12 @@ class LexiconSync:
         self._pending_files = []
 
         self._lock = threading.Lock()
+
+        # Serializes all Lexicon WRITE traffic: the sync worker and the
+        # library-check worker both ensure playlists exist, and running those
+        # concurrently once raced the smartlist conversion into stale IDs
+        self._api_mutex = threading.Lock()
+
         self._sync_thread = None
         self._check_thread = None
         self._poll_timer_id = None
@@ -994,6 +1126,10 @@ class LexiconSync:
         self._check_thread.start()
 
     def _run_library_check_thread(self, waiting):
+        with self._api_mutex:
+            self._run_library_check(waiting)
+
+    def _run_library_check(self, waiting):
 
         from pynicotine.core import core
 
@@ -1063,6 +1199,16 @@ class LexiconSync:
             log.add(_("Lexicon: found %(num)s song(s) already in the library, skipping their "
                       "downloads"), {"num": num_found})
 
+        # Anything that arrived while this batch ran gets its own batch right
+        # away instead of waiting for the next event or poll. Only genuinely
+        # NEW items count -- items from this batch may still show as waiting
+        # until the main thread applies their resolutions, and rescheduling
+        # for those would spin
+        processed = set(waiting)
+
+        if any(entry not in processed for entry in self._waiting_library_check_items()):
+            events.schedule(delay=2, callback=self._library_check_poll)
+
     # Syncing #
 
     def _poll(self):
@@ -1085,6 +1231,11 @@ class LexiconSync:
         with self._lock:
             pending_lists = set(self._pending_lists)
             has_pending_files = bool(self._pending_files)
+
+            # Also (re-)ensure the playlist of every list with files waiting
+            # to import, so their playlist IDs are fresh before members are
+            # added -- a list can have queued files without itself pending
+            pending_lists.update(list_name for list_name, _file_path in self._pending_files)
 
         # Resolve each pending list's desired name/folder on this side, so the
         # worker thread never touches core state
@@ -1109,6 +1260,10 @@ class LexiconSync:
         self._sync_thread.start()
 
     def _run_sync_thread(self, jobs):
+        with self._api_mutex:
+            self._run_sync(jobs)
+
+    def _run_sync(self, jobs):
 
         section = config.sections["lexicon"]
         client = LexiconClient(section["api_url"])
@@ -1131,12 +1286,21 @@ class LexiconSync:
         # handled entry apart from one that arrived while this pass ran
         remaining = list(snapshot)
 
+        def report_progress(done, total):
+            events.invoke_main_thread(events.emit, "lexicon-import-progress", done, total)
+
         outcomes = process_pending_files(
             client, remaining, self._playlist_ids,
             dedupe_enabled=section["dedupe_enabled"],
             prefer_longer=section["dedupe_prefer_longer"],
-            prefer_lossless=section["dedupe_prefer_lossless"]
+            prefer_lossless=section["dedupe_prefer_lossless"],
+            progress_callback=report_progress
         )
+
+        if snapshot:
+            # Whatever is left failed transiently and stays queued; tell the
+            # bar this pass is over either way
+            events.invoke_main_thread(events.emit, "lexicon-import-progress", len(snapshot), len(snapshot))
 
         with self._lock:
             arrivals = [entry for entry in self._pending_files if entry not in snapshot]

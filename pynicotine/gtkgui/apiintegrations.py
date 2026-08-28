@@ -72,6 +72,7 @@ class ApiIntegrations:
         events.connect("add-download-list", self._on_lists_changed)
         events.connect("remove-download-list", self._on_lists_changed)
         events.connect("lexicon-unreachable", self.on_lexicon_unreachable)
+        events.connect("lexicon-import-progress", self.on_lexicon_import_progress)
 
     # Layout helpers #
 
@@ -146,6 +147,11 @@ class ApiIntegrations:
             status_row.add(inline_sync_button)            # pylint: disable=no-member
 
         self._append(status_row)
+
+        # Import-queue progress, only visible while a pass is running
+        self.lexicon_progress_bar = Gtk.ProgressBar(
+            hexpand=True, show_text=True, visible=False, valign=Gtk.Align.CENTER)
+        self._append(self.lexicon_progress_bar)
 
         lexicon = config.sections["lexicon"]
 
@@ -384,6 +390,31 @@ class ApiIntegrations:
         playlist_id = self.spotify_playlists_view.get_row_value(iterator, "playlist_id")
         core.spotify_watch.remove_watched_playlist(playlist_id)
         self._populate_spotify_playlists()
+
+    def on_lexicon_import_progress(self, done, total):
+        """Live progress of the Lexicon import queue, from the sync worker."""
+
+        if total <= 0:
+            return
+
+        if done >= total:
+            self.lexicon_progress_bar.set_fraction(1.0)
+            self.lexicon_progress_bar.set_text(
+                _("Lexicon import finished (%(total)s file(s))") % {"total": total})
+
+            # Leave the finished state visible briefly, then tidy up --
+            # unless a new pass has started updating the bar again
+            def hide_if_done():
+                if self.lexicon_progress_bar.get_fraction() >= 1.0:
+                    self.lexicon_progress_bar.set_visible(False)
+
+            events.schedule(delay=5, callback=lambda: events.invoke_main_thread(hide_if_done))
+            return
+
+        self.lexicon_progress_bar.set_visible(True)
+        self.lexicon_progress_bar.set_fraction(done / total)
+        self.lexicon_progress_bar.set_text(
+            _("Importing into Lexicon: %(done)s / %(total)s") % {"done": done, "total": total})
 
     # Library-first prompt #
 
