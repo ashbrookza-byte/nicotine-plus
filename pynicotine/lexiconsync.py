@@ -60,6 +60,7 @@ import os
 import re
 import threading
 
+from urllib.error import HTTPError
 from urllib.error import URLError
 from urllib.parse import quote
 from urllib.request import Request
@@ -644,6 +645,16 @@ def process_pending_files(client, pending_files, playlist_ids, dedupe_enabled, p
                     member_cache[playlist_id].add(track_id)
 
         except LexiconAPIError as error:
+            if isinstance(error.__cause__, HTTPError):
+                # Lexicon answered and said no (e.g. an unreadable file):
+                # retrying won't change its mind, so drop it rather than
+                # hammering the API once a minute forever
+                log.add(_('Lexicon: could not import "%(file)s", skipping it: %(error)s'), {
+                    "file": file_path, "error": error
+                })
+                pending_files.remove(entry)
+                continue
+
             log.add_debug("Lexicon: importing %s failed, will retry: %s", (file_path, error))
             continue
 
@@ -1113,19 +1124,23 @@ class LexiconSync:
 
         with self._lock:
             self._pending_lists.difference_update(synced)
-            pending_files = list(self._pending_files)
+            snapshot = list(self._pending_files)
+
+        # process_pending_files mutates its argument, removing what it
+        # handled -- work on a copy so the untouched snapshot can tell a
+        # handled entry apart from one that arrived while this pass ran
+        remaining = list(snapshot)
 
         outcomes = process_pending_files(
-            client, pending_files, self._playlist_ids,
+            client, remaining, self._playlist_ids,
             dedupe_enabled=section["dedupe_enabled"],
             prefer_longer=section["dedupe_prefer_longer"],
             prefer_lossless=section["dedupe_prefer_lossless"]
         )
 
         with self._lock:
-            # Keep anything that arrived while this pass ran
-            newly_queued = [entry for entry in self._pending_files if entry not in pending_files]
-            self._pending_files = pending_files + newly_queued
+            arrivals = [entry for entry in self._pending_files if entry not in snapshot]
+            self._pending_files = remaining + arrivals
 
         self._save_state()
 
