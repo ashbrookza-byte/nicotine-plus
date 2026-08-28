@@ -303,6 +303,8 @@ class WishlistSettingsDialog(Dialog):
         self._append(Gtk.Separator(visible=True))
         self._add_spotify_watch_option()
         self._append(Gtk.Separator(visible=True))
+        self._add_lexicon_sync_options()
+        self._append(Gtk.Separator(visible=True))
         self._add_default_settings_options()
         self._append(Gtk.Separator(visible=True))
         self._add_stall_settings_options()
@@ -336,6 +338,87 @@ class WishlistSettingsDialog(Dialog):
 
         self._append(row)
         return row
+
+    def _add_lexicon_sync_options(self):
+        """Link to Lexicon DJ: mirror every list as a location-based smartlist,
+        auto-import finished downloads into the library, and optionally resolve
+        duplicates in favor of the preferred (longer/lossless) version. All
+        handled by pynicotine/lexiconsync.py via Lexicon's Local API."""
+
+        heading = Gtk.Label(label=_("Lexicon DJ sync"), wrap=True, xalign=0, visible=True)
+        add_css_class(heading, "heading")
+        self._append(heading)
+
+        lexicon = config.sections["lexicon"]
+
+        self.lexicon_enabled_switch = Gtk.Switch(
+            active=lexicon["sync_enabled"], valign=Gtk.Align.CENTER, visible=True)
+        self._labeled_row(
+            _("Mirror lists as smartlists in Lexicon"), self.lexicon_enabled_switch,
+            tooltip_text=_("Creates a smartlist in Lexicon for every list here, inside the playlist "
+                            'folder named below, with a "file location contains this list\'s download '
+                            'folder" rule. Needs the Local API enabled in Lexicon under Settings → '
+                            "Integrations. Lexicon doesn't have to be running: anything still to sync "
+                            "is retried until it is. Removing a list here never deletes its smartlist.")
+        )
+
+        folder_label = Gtk.Label(
+            label=_("Playlist folder in Lexicon:"), wrap=True, xalign=0, visible=True)
+        self._append(folder_label)
+
+        self.lexicon_folder_entry = Gtk.Entry(
+            hexpand=True, text=lexicon["parent_folder"], visible=True,
+            tooltip_text=_("All mirrored smartlists are kept inside this playlist folder in Lexicon, "
+                            "created automatically if it doesn't exist yet."))
+        folder_label.set_mnemonic_widget(self.lexicon_folder_entry)
+        self._append(self.lexicon_folder_entry)
+
+        url_label = Gtk.Label(label=_("Lexicon Local API address:"), wrap=True, xalign=0, visible=True)
+        self._append(url_label)
+
+        self.lexicon_url_entry = Gtk.Entry(
+            hexpand=True, text=lexicon["api_url"], visible=True,
+            tooltip_text=_("Leave as http://localhost:48624 unless Lexicon says otherwise."))
+        url_label.set_mnemonic_widget(self.lexicon_url_entry)
+        self._append(self.lexicon_url_entry)
+
+        self.lexicon_auto_import_switch = Gtk.Switch(
+            active=lexicon["auto_import"], valign=Gtk.Align.CENTER, visible=True)
+        self._labeled_row(
+            _("Add each finished download to the Lexicon library"), self.lexicon_auto_import_switch,
+            tooltip_text=_("Imports every completed song into Lexicon as soon as it lands, so the "
+                            "smartlists fill up without a manual import step in Lexicon.")
+        )
+
+        self.lexicon_dedupe_switch = Gtk.Switch(
+            active=lexicon["dedupe_enabled"], valign=Gtk.Align.CENTER, visible=True)
+        self._labeled_row(
+            _("Replace duplicates with the preferred version"), self.lexicon_dedupe_switch,
+            tooltip_text=_("After importing a song, checks the Lexicon library for another version of "
+                            "it (same artist and title, ignoring \"(Extended Mix)\"-style qualifiers). "
+                            "Only the preferred version is kept; the other is removed from the Lexicon "
+                            "library only — never deleted from disk — after its playlist placements "
+                            "are moved over and its rating/tags copied across. Cue points are not "
+                            "copied, since they wouldn't line up between different-length versions.")
+        )
+
+        self.lexicon_prefer_longer_switch = Gtk.Switch(
+            active=lexicon["dedupe_prefer_longer"], valign=Gtk.Align.CENTER, visible=True)
+        self._labeled_row(
+            _("Prefer the longer (Extended) version"), self.lexicon_prefer_longer_switch,
+            tooltip_text=_("A version that's meaningfully longer (30+ seconds) wins the duplicate "
+                            "check, even against a higher-quality shorter one — an extended mix beats "
+                            "a lossless radio edit.")
+        )
+
+        self.lexicon_prefer_lossless_switch = Gtk.Switch(
+            active=lexicon["dedupe_prefer_lossless"], valign=Gtk.Align.CENTER, visible=True)
+        self._labeled_row(
+            _("Prefer lossless / higher bitrate"), self.lexicon_prefer_lossless_switch,
+            tooltip_text=_("Between versions of similar length, a lossless file (FLAC/WAV/AIFF) beats "
+                            "a lossy one, and a higher bitrate beats a lower one — so a FLAC replaces "
+                            "an existing MP3 of the same song.")
+        )
 
     def _add_default_settings_options(self):
 
@@ -660,7 +743,14 @@ class WishlistSettingsDialog(Dialog):
             stall_timeout=self.stall_timeout_spinner.get_value_as_int(),
             min_speed_kib=self.min_speed_spinner.get_value_as_int(),
             max_concurrent=self.max_concurrent_spinner.get_value_as_int(),
-            spotify_ignore_radio_edit=self.spotify_ignore_radio_edit_switch.get_active()
+            spotify_ignore_radio_edit=self.spotify_ignore_radio_edit_switch.get_active(),
+            lexicon_sync_enabled=self.lexicon_enabled_switch.get_active(),
+            lexicon_parent_folder=self.lexicon_folder_entry.get_text().strip() or "nicotine",
+            lexicon_api_url=self.lexicon_url_entry.get_text().strip() or "http://localhost:48624",
+            lexicon_auto_import=self.lexicon_auto_import_switch.get_active(),
+            lexicon_dedupe_enabled=self.lexicon_dedupe_switch.get_active(),
+            lexicon_prefer_longer=self.lexicon_prefer_longer_switch.get_active(),
+            lexicon_prefer_lossless=self.lexicon_prefer_lossless_switch.get_active()
         )
         self.close()
 
@@ -1723,7 +1813,10 @@ class Wishlists:
     def on_wishlist_settings_saved(self, watch_enabled, watch_folder_path, quality, prefer_longer,
                                    prefer_lossless, preferred_keywords, fuzzy_match_threshold,
                                    auto_download, use_name_subfolder, apply_to_existing_lists,
-                                   stall_timeout, min_speed_kib, max_concurrent, spotify_ignore_radio_edit):
+                                   stall_timeout, min_speed_kib, max_concurrent, spotify_ignore_radio_edit,
+                                   lexicon_sync_enabled, lexicon_parent_folder, lexicon_api_url,
+                                   lexicon_auto_import, lexicon_dedupe_enabled, lexicon_prefer_longer,
+                                   lexicon_prefer_lossless):
         core.download_lists.update_watch_folder_settings(watch_enabled, watch_folder_path)
         core.download_lists.update_wishlist_default_settings(
             quality, prefer_longer, prefer_lossless, preferred_keywords, fuzzy_match_threshold,
@@ -1731,6 +1824,17 @@ class Wishlists:
         core.download_lists.update_stall_settings(stall_timeout, min_speed_kib)
         core.download_lists.update_max_concurrent_downloads(max_concurrent)
         core.spotify_watch.update_ignore_radio_edit(spotify_ignore_radio_edit)
+
+        if core.lexicon_sync is not None:
+            core.lexicon_sync.update_settings(
+                sync_enabled=lexicon_sync_enabled,
+                api_url=lexicon_api_url,
+                parent_folder=lexicon_parent_folder,
+                auto_import=lexicon_auto_import,
+                dedupe_enabled=lexicon_dedupe_enabled,
+                dedupe_prefer_longer=lexicon_prefer_longer,
+                dedupe_prefer_lossless=lexicon_prefer_lossless
+            )
 
     def on_wishlist_settings(self, *_args):
         WishlistSettingsDialog(self.window.application, self.on_wishlist_settings_saved).present()

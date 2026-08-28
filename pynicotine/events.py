@@ -136,6 +136,7 @@ EVENT_NAMES = {
     # Download lists
     "add-download-list",
     "download-list-completed",
+    "download-list-item-finished",
     "remove-download-list",
     "rename-download-list",
     "reorder-download-lists",

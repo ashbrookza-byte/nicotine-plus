@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from pynicotine.downloadlists import DownloadLists
     from pynicotine.downloads import Downloads
     from pynicotine.interests import Interests
+    from pynicotine.lexiconsync import LexiconSync
     from pynicotine.networkfilter import NetworkFilter
     from pynicotine.notifications import Notifications
     from pynicotine.nowplaying import NowPlaying
@@ -55,7 +56,8 @@ class Core:
     """
 
     __slots__ = ("shares", "users", "network_filter", "statistics", "search", "downloads",
-                 "download_lists", "spotify_watch", "uploads", "interests", "userbrowse", "userinfo", "buddies",
+                 "download_lists", "spotify_watch", "lexicon_sync", "uploads", "interests", "userbrowse",
+                 "userinfo", "buddies",
                  "privatechat", "chatrooms", "pluginhandler", "now_playing", "portmapper",
                  "notifications", "port_checker", "update_checker", "_network_thread",
                  "cli_interface_address", "cli_listen_port", "cli_rescanning", "enabled_components")
@@ -69,6 +71,7 @@ class Core:
         self.downloads: Downloads | None = None
         self.download_lists: DownloadLists | None = None
         self.spotify_watch: SpotifyWatch | None = None
+        self.lexicon_sync: LexiconSync | None = None
         self.uploads: Uploads | None = None
         self.interests: Interests | None = None
         self.userbrowse: UserBrowse | None = None
@@ -98,7 +101,8 @@ class Core:
             enabled_components = {
                 "error_handler", "signal_handler", "cli", "portmapper", "network_thread", "shares", "users",
                 "notifications", "network_filter", "now_playing", "statistics", "port_checker", "update_checker",
-                "search", "downloads", "download_lists", "spotify_watch", "uploads", "interests", "userbrowse",
+                "search", "downloads", "download_lists", "spotify_watch", "lexicon_sync", "uploads",
+                "interests", "userbrowse",
                 "userinfo", "buddies", "chatrooms", "privatechat", "pluginhandler"
             }
 
@@ -181,6 +185,10 @@ class Core:
         if "spotify_watch" in enabled_components:
             from pynicotine.spotifywatch import SpotifyWatch
             self.spotify_watch = SpotifyWatch()
+
+        if "lexicon_sync" in enabled_components:
+            from pynicotine.lexiconsync import LexiconSync
+            self.lexicon_sync = LexiconSync()
 
         if "uploads" in enabled_components:
             from pynicotine.uploads import Uploads

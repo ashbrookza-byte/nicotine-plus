@@ -1016,6 +1016,23 @@ class DownloadLists:
         events.emit("update-download-list", name)
         self._save()
 
+    def _emit_item_finished(self, list_name, item):
+        """Announce a completed item's on-disk file, for listeners that act on
+        the finished download itself (e.g. Lexicon sync importing it)."""
+
+        download_list = self.lists.get(list_name)
+
+        if download_list is None or not item.download_username or not item.download_virtual_path:
+            return
+
+        file_path, file_exists = core.downloads.get_complete_download_file_path(
+            item.download_username, item.download_virtual_path, item.download_size,
+            download_folder_path=download_list.effective_download_folder_path
+        )
+
+        if file_exists:
+            events.emit("download-list-item-finished", list_name, item.term, file_path)
+
     def _complete_item_from_transfer(self, name, term, item, transfer):
         """If the given transfer for a Downloading item has already finished,
         mark the item Completed directly from it — using only the transfer
@@ -1037,6 +1054,7 @@ class DownloadLists:
         self._forget_item(item)
 
         events.emit("update-download-list-item", name, term)
+        self._emit_item_finished(name, item)
         self._save()
         self._check_list_complete(name)
         return True
@@ -1901,6 +1919,7 @@ class DownloadLists:
         self._forget_item(item)
 
         events.emit("update-download-list-item", list_name, term)
+        self._emit_item_finished(list_name, item)
         self._save()
 
         self._check_list_complete(list_name)

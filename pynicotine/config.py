@@ -468,6 +468,24 @@ class Config:
                 # No credentials needed here -- SpotifyWatch reads public playlist
                 # data anonymously (see pynicotine/spotifywatch.py's module docstring)
                 "watched_playlists": []
+            },
+            "lexicon": {
+                # Mirror every download list as a smartlist in Lexicon DJ, via its
+                # Local API (enable it in Lexicon under Settings > Integrations)
+                "sync_enabled": True,
+                "api_url": "http://localhost:48624",
+                # Playlist folder in Lexicon that all mirrored smartlists live under
+                "parent_folder": "nicotine",
+                # Import each finished download into the Lexicon library right away,
+                # so smartlists fill up without a manual import in Lexicon
+                "auto_import": True,
+                # After importing, look for an existing library track that's the same
+                # song and keep only the preferred version (see lexiconsync.py)
+                "dedupe_enabled": True,
+                # Which version wins a duplicate: longer/extended first...
+                "dedupe_prefer_longer": True,
+                # ...and lossless (or otherwise higher bitrate) over lossy
+                "dedupe_prefer_lossless": True
             }
         }
 
