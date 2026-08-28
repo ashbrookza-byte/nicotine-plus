@@ -9,12 +9,19 @@ Everything applies immediately: switches save on toggle, text fields save
 when you press Enter (or when Test Connection / Sync Now is clicked, which
 read the current field values first). There is no Save button."""
 
+import json
+import os
+import time
+
+from collections import deque
+
 from gi.repository import Gtk
 
 from pynicotine.config import config
 from pynicotine.core import core
 from pynicotine.events import events
 from pynicotine.gtkgui.application import GTK_API_VERSION
+from pynicotine.gtkgui.widgets import clipboard
 from pynicotine.gtkgui.widgets.dialogs import OptionDialog
 from pynicotine.gtkgui.widgets.theme import add_css_class
 from pynicotine.gtkgui.widgets.treeview import TreeView
@@ -73,6 +80,13 @@ class ApiIntegrations:
         events.connect("remove-download-list", self._on_lists_changed)
         events.connect("lexicon-unreachable", self.on_lexicon_unreachable)
         events.connect("lexicon-import-progress", self.on_lexicon_import_progress)
+
+        # Rolling capture of log activity for the Copy Debug Report button:
+        # every Lexicon line, plus a shorter tail of everything else for
+        # context. Lexicon lines are also mirrored to the debug folder.
+        self._lexicon_log_lines = deque(maxlen=400)
+        self._other_log_lines = deque(maxlen=100)
+        events.connect("log-message", self.on_log_message)
 
     # Layout helpers #
 
@@ -137,14 +151,23 @@ class ApiIntegrations:
         inline_sync_button.set_tooltip_text(self.sync_now_button.get_tooltip_text())
         inline_sync_button.connect("clicked", self.on_sync_now)
 
+        debug_button = Gtk.Button(label=_("Copy _Debug Report"), use_underline=True, visible=True)
+        debug_button.set_tooltip_text(
+            _("Copies a full debug report to the clipboard — settings, sync state and every Lexicon "
+              "log line from this session — ready to paste into a chat. Also saved as a file in the "
+              "debug folder, where Lexicon activity is mirrored continuously as lexicon-debug.log."))
+        debug_button.connect("clicked", self.on_copy_debug_report)
+
         if GTK_API_VERSION >= 4:
             status_row.append(self.lexicon_status_label)  # pylint: disable=no-member
             status_row.append(test_button)                # pylint: disable=no-member
             status_row.append(inline_sync_button)         # pylint: disable=no-member
+            status_row.append(debug_button)               # pylint: disable=no-member
         else:
             status_row.add(self.lexicon_status_label)     # pylint: disable=no-member
             status_row.add(test_button)                   # pylint: disable=no-member
             status_row.add(inline_sync_button)            # pylint: disable=no-member
+            status_row.add(debug_button)                  # pylint: disable=no-member
 
         self._append(status_row)
 
@@ -415,6 +438,81 @@ class ApiIntegrations:
         self.lexicon_progress_bar.set_fraction(done / total)
         self.lexicon_progress_bar.set_text(
             _("Importing into Lexicon: %(done)s / %(total)s") % {"done": done, "total": total})
+
+    # Debugging #
+
+    def on_log_message(self, _timestamp_format, msg, _title, _level):
+
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+
+        if "Lexicon" not in msg:
+            self._other_log_lines.append(line)
+            return
+
+        self._lexicon_log_lines.append(line)
+
+        debug_folder = config.sections["lexicon"]["debug_folder"]
+
+        if not debug_folder:
+            return
+
+        try:
+            os.makedirs(debug_folder, exist_ok=True)
+            debug_file_path = os.path.join(debug_folder, "lexicon-debug.log")
+
+            # Rotate so the log can't grow without bound
+            if os.path.exists(debug_file_path) and os.path.getsize(debug_file_path) > 5 * 1024 * 1024:
+                os.replace(debug_file_path, debug_file_path + ".old")
+
+            with open(debug_file_path, "a", encoding="utf-8") as file_handle:
+                file_handle.write(line + "\n")
+
+        except OSError:
+            # Debug mirroring must never break the app
+            pass
+
+    def _build_debug_report(self):
+
+        sections = [f"Nicotine+ / Lexicon sync debug report — {time.strftime('%Y-%m-%d %H:%M:%S')}"]
+
+        if core.lexicon_sync is not None:
+            sections.append("== State ==\n" + json.dumps(core.lexicon_sync.debug_snapshot(),
+                                                         indent=2, ensure_ascii=False, default=str))
+
+        sections.append("== Connection status shown in UI ==\n" + self.lexicon_status_label.get_label())
+
+        lexicon_lines = "\n".join(self._lexicon_log_lines) or "(none this session)"
+        sections.append("== Lexicon log lines (this session, most recent last) ==\n" + lexicon_lines)
+
+        other_lines = "\n".join(self._other_log_lines) or "(none)"
+        sections.append("== Other recent log lines (context) ==\n" + other_lines)
+
+        return "\n\n".join(sections) + "\n"
+
+    def on_copy_debug_report(self, *_args):
+
+        report = self._build_debug_report()
+        clipboard.copy_text(report)
+
+        debug_folder = config.sections["lexicon"]["debug_folder"]
+
+        if debug_folder:
+            try:
+                os.makedirs(debug_folder, exist_ok=True)
+                report_path = os.path.join(
+                    debug_folder, f"lexicon-debug-report-{time.strftime('%Y%m%d-%H%M%S')}.txt")
+
+                with open(report_path, "w", encoding="utf-8") as file_handle:
+                    file_handle.write(report)
+
+                self.lexicon_status_label.set_label(
+                    _("Debug report copied to clipboard and saved to %s") % report_path)
+                return
+
+            except OSError:
+                pass
+
+        self.lexicon_status_label.set_label(_("Debug report copied to clipboard"))
 
     # Library-first prompt #
 

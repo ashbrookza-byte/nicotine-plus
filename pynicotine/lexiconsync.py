@@ -862,6 +862,27 @@ class LexiconSync:
             events.cancel_scheduled(self._poll_timer_id)
             self._poll_timer_id = None
 
+    def debug_snapshot(self):
+        """Current internal state, for the Copy Debug Report button."""
+
+        with self._lock:
+            pending_files = list(self._pending_files)
+            pending_lists = sorted(self._pending_lists)
+            playlist_ids = dict(self._playlist_ids)
+
+        return {
+            "settings": dict(config.sections["lexicon"]),
+            "playlist_ids": playlist_ids,
+            "pending_lists": pending_lists,
+            "pending_files_count": len(pending_files),
+            "pending_files_sample": [file_path for _list_name, file_path in pending_files[:10]],
+            "waiting_library_checks": self._waiting_library_check_items(),
+            "unreachable_notified": self._unreachable_notified,
+            "sync_thread_alive": bool(self._sync_thread is not None and self._sync_thread.is_alive()),
+            "check_thread_alive": bool(self._check_thread is not None and self._check_thread.is_alive()),
+            "state_file": self.state_file_path
+        }
+
     def sync_now(self):
         """Queue every list for a fresh reconcile and kick off a pass right
         away. With auto-import on, this also backfills: every audio file

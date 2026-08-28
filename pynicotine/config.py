@@ -484,6 +484,9 @@ class Config:
                 # After importing, look for an existing library track that's the same
                 # song and keep only the preferred version (see lexiconsync.py)
                 "dedupe_enabled": True,
+                # Folder that Lexicon sync activity/errors are mirrored into
+                # (lexicon-debug.log + one-click debug reports); empty disables
+                "debug_folder": "/Users/ashbrook/Documents/repos/nicotine-plus/Debug errors",
                 # Before searching Soulseek for a newly added song, look it up
                 # in the Lexicon library and use the existing track instead of
                 # downloading a copy the user already owns
