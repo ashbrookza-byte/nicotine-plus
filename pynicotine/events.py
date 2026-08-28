@@ -137,6 +137,7 @@ EVENT_NAMES = {
     "add-download-list",
     "download-list-completed",
     "download-list-item-finished",
+    "lexicon-unreachable",
     "remove-download-list",
     "rename-download-list",
     "reorder-download-lists",

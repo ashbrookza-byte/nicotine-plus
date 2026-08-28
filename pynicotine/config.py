@@ -484,6 +484,10 @@ class Config:
                 # After importing, look for an existing library track that's the same
                 # song and keep only the preferred version (see lexiconsync.py)
                 "dedupe_enabled": True,
+                # Before searching Soulseek for a newly added song, look it up
+                # in the Lexicon library and use the existing track instead of
+                # downloading a copy the user already owns
+                "library_first": True,
                 # Which version wins a duplicate: longer/extended first...
                 "dedupe_prefer_longer": True,
                 # ...and lossless (or otherwise higher bitrate) over lossy

@@ -6,22 +6,32 @@ Links Nicotine+ Download Lists to [Lexicon DJ](https://www.lexicondj.com/) via i
 
 ## What it does
 
-1. **Smartlist mirroring** — every download list (including ones auto-created by the
-   Spotify playlist watcher) gets a matching smartlist in Lexicon, inside a playlist
-   folder (default: `nicotine`), with the rule *file location contains the list's
-   download folder*. Lexicon keeps the smartlist's contents current on its own.
+1. **Playlist mirroring** — every download list (including ones auto-created by the
+   Spotify playlist watcher) gets a matching regular playlist in Lexicon, inside a
+   playlist folder (default: `nicotine`), managed track-by-track by the sync.
+   (Earlier versions used location-based smartlists; those are converted in place,
+   keeping their tracks.)
 2. **Auto-import** — every finished download is added to the Lexicon library
-   immediately, so the smartlists actually fill up without a manual import.
-3. **Duplicate replacement** — after each import, the library is checked for another
+   immediately and appended to its list's playlist, no manual import needed.
+3. **Library-first** — a song newly added to a list is looked up in the Lexicon
+   library *before* any Soulseek search. If any version is already there, the
+   existing track goes straight into the list's playlist and the item shows as
+   **In Library** instead of re-downloading. While Lexicon is unreachable, new songs
+   wait as **Checking Library…** and a prompt (once per outage) offers **Retry** or
+   **Continue and Download**.
+4. **Duplicate replacement** — after each import, the library is checked for another
    version of the same song (same artist + title, ignoring `(Extended Mix)`-style
    qualifiers). The preferred version is kept:
    - a **significantly longer** version wins first (extended mix beats radio edit),
    - then **lossless / higher bitrate** wins (FLAC replaces an MP3 of the same song).
+   - a duplicate that is the **same recording** (same length and quality) is treated
+     as a relocation: the new copy wins and **cue points/beatgrid are copied over**.
 
    The losing version is removed from the Lexicon *library only* — never deleted from
    disk — after its playlist placements are moved to the winner and its
-   rating/energy/color/tags are copied across. Cue points are not copied (they would
-   not line up between different-length versions). Ties keep the existing track.
+   rating/energy/color/tags are copied across. Cue points are otherwise not copied
+   (they would not line up between different-length versions). Ties keep the
+   existing track.
 
 Each behavior has its own toggle in Wishlist Settings.
 

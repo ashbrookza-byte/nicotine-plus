@@ -53,6 +53,8 @@ _UNSET = object()
 
 class DownloadListItemStatus:
     PENDING = "pending"
+    LIBRARY_CHECK = "library_check"
+    IN_LIBRARY = "in_library"
     SEARCHING = "searching"
     DOWNLOADING = "downloading"
     COMPLETED = "completed"
@@ -64,12 +66,14 @@ class DownloadListItem:
         "term", "list_name", "time_added", "status", "searched_term", "token",
         "download_username", "download_virtual_path", "download_size", "download_attributes",
         "download_match_percentage", "download_candidates", "variant_index", "collect_timer_id",
-        "escalation_timer_id", "download_percent", "stall_timer_id", "dispatch_time"
+        "escalation_timer_id", "download_percent", "stall_timer_id", "dispatch_time",
+        "library_location"
     )
 
     def __init__(self, term, list_name, time_added=None, status=DownloadListItemStatus.PENDING,
                  searched_term=None, download_username=None, download_virtual_path=None,
-                 download_size=0, download_attributes=None, download_match_percentage=None):
+                 download_size=0, download_attributes=None, download_match_percentage=None,
+                 library_location=None):
 
         self.term = term
         self.list_name = list_name
@@ -82,6 +86,7 @@ class DownloadListItem:
             status = DownloadListItemStatus.PENDING
 
         self.status = status
+        self.library_location = library_location
         self.download_username = download_username
         self.download_virtual_path = download_virtual_path
         self.download_size = download_size
@@ -122,6 +127,11 @@ class DownloadListItem:
     def download_filename(self):
 
         if not self.download_virtual_path:
+            # An In Library item has no download, but showing which library
+            # file satisfied it is just as useful in the same column
+            if self.library_location:
+                return self.library_location.replace("\\", "/").rsplit("/", 1)[-1]
+
             return ""
 
         return self.download_virtual_path.replace("\\", "/").rsplit("/", 1)[-1]
@@ -138,6 +148,7 @@ class DownloadListItem:
             "term": self.term,
             "time_added": self.time_added,
             "status": self.status,
+            "library_location": self.library_location,
             "searched_term": self.searched_term,
             "download_username": self.download_username,
             "download_virtual_path": self.download_virtual_path,
@@ -245,6 +256,10 @@ class DownloadList:
         return sum(1 for item in self.items.values() if item.status == DownloadListItemStatus.COMPLETED)
 
     @property
+    def num_in_library(self):
+        return sum(1 for item in self.items.values() if item.status == DownloadListItemStatus.IN_LIBRARY)
+
+    @property
     def num_not_found(self):
         return sum(1 for item in self.items.values() if item.status == DownloadListItemStatus.NOT_FOUND)
 
@@ -253,8 +268,8 @@ class DownloadList:
         return sum(
             1 for item in self.items.values()
             if item.status in (
-                DownloadListItemStatus.PENDING, DownloadListItemStatus.SEARCHING,
-                DownloadListItemStatus.DOWNLOADING
+                DownloadListItemStatus.PENDING, DownloadListItemStatus.LIBRARY_CHECK,
+                DownloadListItemStatus.SEARCHING, DownloadListItemStatus.DOWNLOADING
             )
         )
 
@@ -351,6 +366,8 @@ class DownloadLists:
 
     STATUS_LABELS = {
         DownloadListItemStatus.PENDING: _("Pending"),
+        DownloadListItemStatus.LIBRARY_CHECK: _("Checking Library…"),
+        DownloadListItemStatus.IN_LIBRARY: _("In Library"),
         DownloadListItemStatus.SEARCHING: _("Searching…"),
         DownloadListItemStatus.DOWNLOADING: _("Downloading…"),
         DownloadListItemStatus.COMPLETED: _("Completed"),
@@ -493,7 +510,8 @@ class DownloadLists:
                     download_virtual_path=item_data.get("download_virtual_path"),
                     download_size=item_data.get("download_size", 0),
                     download_attributes=attributes,
-                    download_match_percentage=item_data.get("download_match_percentage")
+                    download_match_percentage=item_data.get("download_match_percentage"),
+                    library_location=item_data.get("library_location")
                 )
 
             self.lists[name] = DownloadList(
@@ -972,6 +990,17 @@ class DownloadLists:
         if download_list is None:
             return
 
+        # With library-first Lexicon sync on, new items first wait for a
+        # library lookup (LexiconSync picks them up off the update event
+        # below) instead of going straight to the search queue -- a song the
+        # user already owns shouldn't be re-downloaded. LexiconSync releases
+        # each item back to Pending if the library doesn't have it.
+        library_first = (
+            core.lexicon_sync is not None
+            and config.sections["lexicon"]["sync_enabled"]
+            and config.sections["lexicon"]["library_first"]
+        )
+
         added_any = False
 
         for term in terms:
@@ -980,10 +1009,16 @@ class DownloadLists:
             if not term or term in download_list.items:
                 continue
 
-            download_list.items[term] = DownloadListItem(term=term, list_name=name)
+            item = DownloadListItem(term=term, list_name=name)
+            download_list.items[term] = item
             added_any = True
 
-            if download_list.effective_auto_download:
+            if not download_list.effective_auto_download:
+                continue
+
+            if library_first:
+                item.status = DownloadListItemStatus.LIBRARY_CHECK
+            else:
                 self._queue.append((name, term))
 
         if not added_any:
@@ -993,6 +1028,63 @@ class DownloadLists:
         self._save()
 
         if download_list.effective_auto_download:
+            self._kick_queue()
+
+    def resolve_library_check(self, name, term, found, library_location=None):
+        """Outcome of a Lexicon library lookup for a waiting item: found means
+        the user already owns the song (mark In Library, no download); not
+        found releases the item into the normal search queue."""
+
+        download_list = self.lists.get(name)
+        item = download_list.items.get(term) if download_list is not None else None
+
+        if item is None or item.status != DownloadListItemStatus.LIBRARY_CHECK:
+            return
+
+        if found:
+            item.status = DownloadListItemStatus.IN_LIBRARY
+            item.library_location = library_location
+            item.download_percent = 100
+
+            events.emit("update-download-list-item", name, term)
+            self._save()
+            self._check_list_complete(name)
+            return
+
+        item.status = DownloadListItemStatus.PENDING
+
+        if download_list.effective_auto_download:
+            self._queue.append((name, term))
+            self._kick_queue()
+
+        events.emit("update-download-list-item", name, term)
+        self._save()
+
+    def release_library_check_items(self, name=None):
+        """Give up waiting for a Lexicon library check ("continue and
+        download" on the unreachable prompt, or the feature being turned
+        off): send every waiting item to the normal search queue."""
+
+        released_any = False
+
+        for download_list in self.lists.values():
+            if name is not None and download_list.name != name:
+                continue
+
+            for term, item in download_list.items.items():
+                if item.status != DownloadListItemStatus.LIBRARY_CHECK:
+                    continue
+
+                item.status = DownloadListItemStatus.PENDING
+                released_any = True
+
+                if download_list.effective_auto_download:
+                    self._queue.append((download_list.name, term))
+
+                events.emit("update-download-list-item", download_list.name, term)
+
+        if released_any:
+            self._save()
             self._kick_queue()
 
     def remove_list_item(self, name, term):

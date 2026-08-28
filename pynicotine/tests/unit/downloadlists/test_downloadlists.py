@@ -80,6 +80,49 @@ class DownloadListsTest(TestCase):
         for item in download_list.items.values():
             self.assertEqual(item.status, DownloadListItemStatus.PENDING)
 
+    def test_resolve_library_check(self):
+        """A waiting library-check item either becomes In Library (found, no
+        download) or is released into the search queue (not found)."""
+
+        download_list = core.download_lists.add_list("Library List", auto_download=True)
+        core.download_lists.add_list_items("Library List", ["Owned Song", "New Song"])
+
+        for item in download_list.items.values():
+            item.status = DownloadListItemStatus.LIBRARY_CHECK
+
+        core.download_lists.resolve_library_check(
+            "Library List", "Owned Song", True, "/music/library/Owned Song.flac")
+        owned_item = download_list.items["Owned Song"]
+
+        self.assertEqual(owned_item.status, DownloadListItemStatus.IN_LIBRARY)
+        self.assertEqual(owned_item.download_filename, "Owned Song.flac")
+        self.assertEqual(download_list.num_in_library, 1)
+
+        core.download_lists.resolve_library_check("Library List", "New Song", False)
+        new_item = download_list.items["New Song"]
+
+        self.assertEqual(new_item.status, DownloadListItemStatus.PENDING)
+        self.assertIn(("Library List", "New Song"), core.download_lists._queue)
+
+        # In Library counts as a terminal state for completion
+        new_item.status = DownloadListItemStatus.COMPLETED
+        self.assertTrue(download_list.is_complete)
+
+    def test_release_library_check_items(self):
+        """"Continue and download" releases every waiting item to the queue."""
+
+        download_list = core.download_lists.add_list("Release List", auto_download=True)
+        core.download_lists.add_list_items("Release List", ["Song A", "Song B"])
+
+        for item in download_list.items.values():
+            item.status = DownloadListItemStatus.LIBRARY_CHECK
+
+        core.download_lists.release_library_check_items()
+
+        for term, item in download_list.items.items():
+            self.assertEqual(item.status, DownloadListItemStatus.PENDING)
+            self.assertIn(("Release List", term), core.download_lists._queue)
+
     def test_pump_queue_respects_max_concurrent_downloads(self):
         """Only up to max_concurrent_downloads items are dispatched (moved out
         of Pending) at once, even with a much bigger backlog waiting; the rest

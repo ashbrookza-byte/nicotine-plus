@@ -15,6 +15,7 @@ from pynicotine.config import config
 from pynicotine.core import core
 from pynicotine.events import events
 from pynicotine.gtkgui.application import GTK_API_VERSION
+from pynicotine.gtkgui.widgets.dialogs import OptionDialog
 from pynicotine.gtkgui.widgets.theme import add_css_class
 from pynicotine.gtkgui.widgets.treeview import TreeView
 from pynicotine.spotifywatch import SPOTIFY_SCRAPER_AVAILABLE
@@ -70,6 +71,7 @@ class ApiIntegrations:
 
         events.connect("add-download-list", self._on_lists_changed)
         events.connect("remove-download-list", self._on_lists_changed)
+        events.connect("lexicon-unreachable", self.on_lexicon_unreachable)
 
     # Layout helpers #
 
@@ -157,8 +159,20 @@ class ApiIntegrations:
         self.lexicon_auto_import_switch = self._switch(lexicon["auto_import"], self.on_lexicon_setting_changed)
         self._labeled_row(
             _("Add each finished download to the Lexicon library"), self.lexicon_auto_import_switch,
-            tooltip_text=_("Imports every completed song into Lexicon as soon as it lands, so the "
-                            "smartlists fill up without a manual import step in Lexicon."))
+            tooltip_text=_("Imports every completed song into Lexicon as soon as it lands and adds it "
+                            "to its list's playlist, with no manual import step in Lexicon."))
+
+        self.lexicon_library_first_switch = self._switch(
+            lexicon["library_first"], self.on_lexicon_setting_changed)
+        self._labeled_row(
+            _("Use songs already in the Lexicon library instead of downloading"),
+            self.lexicon_library_first_switch,
+            tooltip_text=_("A song newly added to a list is looked up in your Lexicon library before "
+                            "any Soulseek search. If any version of it is already there, that track "
+                            "goes straight into the list's Lexicon playlist and the item is marked "
+                            '"In Library" — nothing is re-downloaded. While Lexicon is unreachable, '
+                            "new songs wait as \"Checking Library…\" and you'll be asked whether to "
+                            "keep waiting or download without the check."))
 
         self.lexicon_dedupe_switch = self._switch(lexicon["dedupe_enabled"], self.on_lexicon_setting_changed)
         self._labeled_row(
@@ -219,6 +233,7 @@ class ApiIntegrations:
             api_url=self.lexicon_url_entry.get_text().strip() or "http://localhost:48624",
             parent_folder=self.lexicon_folder_entry.get_text().strip() or "nicotine",
             auto_import=self.lexicon_auto_import_switch.get_active(),
+            library_first=self.lexicon_library_first_switch.get_active(),
             dedupe_enabled=self.lexicon_dedupe_switch.get_active(),
             dedupe_prefer_longer=self.lexicon_prefer_longer_switch.get_active(),
             dedupe_prefer_lossless=self.lexicon_prefer_lossless_switch.get_active()
@@ -369,6 +384,40 @@ class ApiIntegrations:
         playlist_id = self.spotify_playlists_view.get_row_value(iterator, "playlist_id")
         core.spotify_watch.remove_watched_playlist(playlist_id)
         self._populate_spotify_playlists()
+
+    # Library-first prompt #
+
+    def on_lexicon_unreachable_response(self, dialog, response_id, _data):
+
+        if core.lexicon_sync is None or core.download_lists is None:
+            return
+
+        if response_id == "retry":
+            core.lexicon_sync.retry_library_check()
+            return
+
+        if response_id == "download":
+            core.download_lists.release_library_check_items()
+
+    def on_lexicon_unreachable(self, num_waiting):
+        """LexiconSync wants a library check but Lexicon isn't reachable:
+        shown once per outage. Retry re-probes (reopening Lexicon first is on
+        the user); downloading without the check releases the waiting songs."""
+
+        OptionDialog(
+            application=self.window.application,
+            title=_("Lexicon Not Reachable"),
+            message=_("%(num)s song(s) are waiting to be checked against your Lexicon library "
+                      "before downloading, but Lexicon isn't reachable.\n\nOpen Lexicon (with its "
+                      "Local API enabled under Settings → Integrations) and retry, or download "
+                      "without the check — songs you already own may be re-downloaded.") % {
+                "num": num_waiting},
+            buttons=[
+                ("retry", _("_Retry")),
+                ("download", _("Continue and _Download"))
+            ],
+            callback=self.on_lexicon_unreachable_response
+        ).present()
 
     # Page callbacks #
 

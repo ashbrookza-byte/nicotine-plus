@@ -11,7 +11,8 @@ from pynicotine.lexiconsync import import_finished_file
 from pynicotine.lexiconsync import is_same_song
 from pynicotine.lexiconsync import preferred_track
 from pynicotine.lexiconsync import process_pending_files
-from pynicotine.lexiconsync import sync_smartlists
+from pynicotine.lexiconsync import find_library_match
+from pynicotine.lexiconsync import sync_playlists
 
 
 class FakeLexiconClient:
@@ -112,6 +113,10 @@ class FakeLexiconClient:
         self.track_edits.append((track_id, edits))
         self.tracks[track_id].update(edits)
 
+    def delete_playlists(self, playlist_ids):
+        for playlist_id in playlist_ids:
+            self.playlists.pop(playlist_id, None)
+
     def delete_tracks(self, track_ids):
         for track_id in track_ids:
             self.tracks.pop(track_id, None)
@@ -185,14 +190,14 @@ class DuplicateLogicTest(TestCase):
             short_flac)
 
 
-class SmartlistSyncTest(TestCase):
+class PlaylistSyncTest(TestCase):
 
-    def test_creates_parent_folder_and_smartlists(self):
+    def test_creates_parent_folder_and_playlists(self):
 
         client = FakeLexiconClient()
         playlist_ids = {}
 
-        synced = sync_smartlists(
+        synced = sync_playlists(
             client,
             jobs=[("House", "/music/House"), ("Techno", "/music/Techno")],
             playlist_ids=playlist_ids,
@@ -207,16 +212,12 @@ class SmartlistSyncTest(TestCase):
         self.assertEqual(len(folders), 1)
         self.assertEqual(folders[0]["name"], "nicotine")
 
-        smartlists = [node for node in client.playlists.values()
-                      if node["type"] == client.TYPE_SMARTLIST]
-        self.assertEqual(len(smartlists), 2)
+        playlists = [node for node in client.playlists.values()
+                     if node["type"] == client.TYPE_PLAYLIST]
+        self.assertEqual(len(playlists), 2)
 
-        for node in smartlists:
+        for node in playlists:
             self.assertEqual(node["parentId"], folders[0]["id"])
-            rule = node["smartlist"]["rules"][0]
-            self.assertEqual(rule["field"], "location")
-            self.assertEqual(rule["operator"], "StringContains")
-            self.assertTrue(rule["values"][0].endswith(os.sep))
 
     def test_second_pass_is_idempotent(self):
 
@@ -224,41 +225,91 @@ class SmartlistSyncTest(TestCase):
         playlist_ids = {}
         jobs = [("House", "/music/House")]
 
-        sync_smartlists(client, jobs, playlist_ids, "nicotine")
+        sync_playlists(client, jobs, playlist_ids, "nicotine")
         count_after_first = len(client.playlists)
 
-        sync_smartlists(client, jobs, playlist_ids, "nicotine")
+        sync_playlists(client, jobs, playlist_ids, "nicotine")
         self.assertEqual(len(client.playlists), count_after_first)
 
-    def test_adopts_existing_smartlist_without_state(self):
+    def test_adopts_existing_playlist_without_state(self):
 
         client = FakeLexiconClient()
         first_ids = {}
-        sync_smartlists(client, [("House", "/music/House")], first_ids, "nicotine")
+        sync_playlists(client, [("House", "/music/House")], first_ids, "nicotine")
 
         # Same situation but with a lost state file: no duplicate is created
         recovered_ids = {}
-        sync_smartlists(client, [("House", "/music/House")], recovered_ids, "nicotine")
+        sync_playlists(client, [("House", "/music/House")], recovered_ids, "nicotine")
 
         self.assertEqual(recovered_ids, first_ids)
 
-    def test_rename_updates_existing_smartlist(self):
+    def test_rename_updates_existing_playlist(self):
 
         client = FakeLexiconClient()
         playlist_ids = {}
-        sync_smartlists(client, [("House", "/music/House")], playlist_ids, "nicotine")
+        sync_playlists(client, [("House", "/music/House")], playlist_ids, "nicotine")
 
         # Same Lexicon playlist ID carried over under the new list name
         playlist_ids["Deep House"] = playlist_ids.pop("House")
-        sync_smartlists(client, [("Deep House", "/music/Deep House")], playlist_ids, "nicotine")
+        sync_playlists(client, [("Deep House", "/music/Deep House")], playlist_ids, "nicotine")
 
         node = client.playlists[playlist_ids["Deep House"]]
         self.assertEqual(node["name"], "Deep House")
-        self.assertIn("/music/Deep House" + os.sep, node["smartlist"]["rules"][0]["values"][0])
 
-        smartlists = [candidate for candidate in client.playlists.values()
-                      if candidate["type"] == client.TYPE_SMARTLIST]
-        self.assertEqual(len(smartlists), 1)
+        playlists = [candidate for candidate in client.playlists.values()
+                     if candidate["type"] == client.TYPE_PLAYLIST]
+        self.assertEqual(len(playlists), 1)
+
+    def test_converts_leftover_smartlist_keeping_tracks(self):
+
+        folder = {"id": 10, "name": "nicotine", "type": FakeLexiconClient.TYPE_FOLDER,
+                  "parentId": None, "trackIds": []}
+        smartlist = {"id": 11, "name": "House", "type": FakeLexiconClient.TYPE_SMARTLIST,
+                     "parentId": 10, "trackIds": [4, 5, 6],
+                     "smartlist": {"matchAll": True, "rules": []}}
+        client = FakeLexiconClient(playlists=[folder, smartlist])
+        playlist_ids = {"House": 11}
+
+        sync_playlists(client, [("House", "/music/House")], playlist_ids, "nicotine")
+
+        # The smartlist is gone; a regular playlist with its tracks replaced it
+        self.assertNotIn(11, client.playlists)
+        node = client.playlists[playlist_ids["House"]]
+        self.assertEqual(node["type"], client.TYPE_PLAYLIST)
+        self.assertEqual(node["name"], "House")
+        self.assertEqual(node["trackIds"], [4, 5, 6])
+
+
+class LibraryMatchTest(TestCase):
+
+    def _library(self):
+        return FakeLexiconClient(tracks=[{
+            "id": 1, "artist": "Emmit Fenn", "title": "Amman (Extended Version)",
+            "duration": 300, "bitrate": 1411,
+            "location": "/music/library/Emmit Fenn - Amman.flac",
+            "locationUnique": "/music/library/emmit fenn - amman.flac"
+        }])
+
+    def test_matches_artist_title_order(self):
+        match = find_library_match(self._library(), "Emmit Fenn - Amman")
+        self.assertIsNotNone(match)
+        self.assertEqual(match["id"], 1)
+
+    def test_matches_title_artist_order(self):
+        # Spotify-watch terms are often "Title - Artist"
+        match = find_library_match(self._library(), "Amman - Emmit Fenn")
+        self.assertIsNotNone(match)
+
+    def test_any_version_counts(self):
+        # Asking for the radio edit still matches the extended version
+        match = find_library_match(self._library(), "Emmit Fenn - Amman (Radio Edit)")
+        self.assertIsNotNone(match)
+
+    def test_different_song_does_not_match(self):
+        self.assertIsNone(find_library_match(self._library(), "Emmit Fenn - Painting Greys"))
+
+    def test_different_artist_does_not_match(self):
+        self.assertIsNone(find_library_match(self._library(), "Ben Bohmer - Amman"))
 
 
 class ImportDedupeTest(TestCase):
@@ -266,11 +317,12 @@ class ImportDedupeTest(TestCase):
     def test_import_without_duplicate(self):
 
         client = FakeLexiconClient()
-        outcome = import_finished_file(
+        outcome, track_id = import_finished_file(
             client, "/music/House/Artist - New Song.mp3",
             dedupe_enabled=True, prefer_longer=True, prefer_lossless=True)
 
         self.assertEqual(outcome, "imported")
+        self.assertIsNotNone(track_id)
         self.assertEqual(len(client.tracks), 1)
 
     def test_new_better_version_replaces_old(self):
@@ -290,7 +342,7 @@ class ImportDedupeTest(TestCase):
 
         # The fake importer parses "Artist - Song (Extended Mix).flac" and
         # gives it duration 200 -- lossless wins at similar length
-        outcome = import_finished_file(
+        outcome, _track_id = import_finished_file(
             client, "/music/House/Artist - Song (Extended Mix).flac",
             dedupe_enabled=True, prefer_longer=True, prefer_lossless=True)
 
@@ -314,11 +366,12 @@ class ImportDedupeTest(TestCase):
         }
         client = FakeLexiconClient(tracks=[old_track])
 
-        outcome = import_finished_file(
+        outcome, track_id = import_finished_file(
             client, "/music/House/Artist - Song.mp3",
             dedupe_enabled=True, prefer_longer=True, prefer_lossless=True)
 
         self.assertIn("kept existing version", outcome)
+        self.assertEqual(track_id, 1)
 
         # Only the old track remains in the library
         self.assertEqual(list(client.tracks), [1])
@@ -337,7 +390,7 @@ class ImportDedupeTest(TestCase):
 
         # The fake importer assigns duration 200 / bitrate 320: same audio,
         # so the new in-folder copy wins even though it's a quality tie
-        outcome = import_finished_file(
+        outcome, _track_id = import_finished_file(
             client, "/music/House/Artist - Song.mp3",
             dedupe_enabled=True, prefer_longer=True, prefer_lossless=True)
 
@@ -358,7 +411,7 @@ class ImportDedupeTest(TestCase):
         }
         client = FakeLexiconClient(tracks=[old_track])
 
-        outcome = import_finished_file(
+        outcome, _track_id = import_finished_file(
             client, "/music/House/Artist - Song.flac",
             dedupe_enabled=False, prefer_longer=True, prefer_lossless=True)
 
@@ -372,7 +425,7 @@ class ImportDedupeTest(TestCase):
 
         import_finished_file(
             client, location, dedupe_enabled=True, prefer_longer=True, prefer_lossless=True)
-        outcome = import_finished_file(
+        outcome, _track_id = import_finished_file(
             client, location, dedupe_enabled=True, prefer_longer=True, prefer_lossless=True)
 
         self.assertEqual(outcome, "imported")
@@ -387,7 +440,7 @@ class PendingFilesTest(TestCase):
         pending_files = [("House", "/definitely/not/a/real/file.mp3")]
 
         outcomes = process_pending_files(
-            client, pending_files,
+            client, pending_files, {},
             dedupe_enabled=False, prefer_longer=True, prefer_lossless=True)
 
         self.assertEqual(pending_files, [])

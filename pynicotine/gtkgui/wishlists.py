@@ -1441,7 +1441,9 @@ class Wishlists:
     def _list_summary_text(self, download_list):
 
         total = len(download_list.items)
-        completed = download_list.num_completed
+        # A song matched from the Lexicon library is just as "done" as one
+        # that downloaded -- the user has it either way
+        completed = download_list.num_completed + download_list.num_in_library
         not_found = download_list.num_not_found
 
         if not download_list.effective_auto_download:
