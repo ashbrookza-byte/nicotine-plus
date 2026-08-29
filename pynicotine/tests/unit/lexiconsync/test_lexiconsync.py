@@ -104,6 +104,9 @@ class FakeLexiconClient:
 
         return added
 
+    def get_all_tracks(self, fields):
+        return [{field: track.get(field) for field in fields} for track in self.tracks.values()]
+
     def search_tracks(self, filters):
 
         title_filter = filters.get("title", "").casefold()
@@ -490,6 +493,37 @@ class ImportDedupeTest(TestCase):
 
 
 class PendingFilesTest(TestCase):
+
+    def test_bulk_prefilter_recognizes_known_files_without_reimport(self):
+
+        from unittest.mock import patch
+
+        playlist = {"id": 10, "name": "House", "type": FakeLexiconClient.TYPE_PLAYLIST,
+                    "parentId": None, "trackIds": []}
+        old_track = {
+            "id": 1, "artist": "Artist", "title": "Song",
+            "duration": 200, "bitrate": 320,
+            "location": "/Users/me/Music/House/Artist - Song.mp3",
+            "locationUnique": "/volumes/macintosh hd/users/me/music/house/artist - song.mp3"
+        }
+        client = FakeLexiconClient(playlists=[playlist], tracks=[old_track])
+
+        add_calls = []
+        original_add_tracks = client.add_tracks
+        client.add_tracks = lambda locations: add_calls.append(locations) or original_add_tracks(locations)
+
+        pending_files = [("House", "/Users/me/Music/House/Artist - Song.mp3")]
+
+        with patch("pynicotine.lexiconsync.BULK_PREFILTER_THRESHOLD", 0):
+            outcomes = process_pending_files(
+                client, pending_files, {"House": 10},
+                dedupe_enabled=True, prefer_longer=True, prefer_lossless=True)
+
+        # Recognized by location: no import call, queue drained, playlist filled
+        self.assertEqual(add_calls, [])
+        self.assertEqual(pending_files, [])
+        self.assertEqual(client.playlists[10]["trackIds"], [1])
+        self.assertTrue(any("recognized 1" in outcome for outcome in outcomes))
 
     def test_missing_files_are_dropped_and_existing_are_imported(self):
 

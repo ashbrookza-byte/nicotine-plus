@@ -59,6 +59,7 @@ import json
 import os
 import re
 import threading
+import unicodedata
 
 from urllib.error import HTTPError
 from urllib.error import URLError
@@ -270,6 +271,30 @@ class LexiconClient:
 
     # Tracks #
 
+    def get_all_tracks(self, fields):
+        """Every track in the library, restricted to the given fields.
+        Paginated at the API's 1000-track cap; one bulk sweep like this is
+        FAR cheaper than hundreds of per-file requests."""
+
+        tracks = []
+        offset = 0
+        limit = 1000
+
+        for _page in range(200):  # hard stop far above any real library
+            response = self._request("GET", "/tracks", {"limit": limit, "offset": offset,
+                                                        "fields": fields})
+            data = response.get("data", {})
+            page_tracks = [track for track in data.get("tracks", []) if isinstance(track, dict)]
+            tracks += page_tracks
+            offset += len(page_tracks)
+
+            total = data.get("total")
+
+            if not page_tracks or (isinstance(total, int) and offset >= total):
+                break
+
+        return tracks
+
     def add_tracks(self, locations):
         """Import files into the Lexicon library. Returns the created/existing
         track dicts (shape observed: data.tracks is one track or a list)."""
@@ -329,6 +354,23 @@ class LexiconClient:
                 "or": False
             }]
         }
+
+
+# With this many files queued, one bulk sweep of the library's locations is
+# cheaper than checking files one by one
+BULK_PREFILTER_THRESHOLD = 20
+
+
+def unique_location_suffix(path):
+    """A file path in the comparable form of Lexicon's locationUnique field
+    (unicode-normalized, lowercased, macOS drive prefix like "/Volumes/
+    Macintosh HD" included on their side) -- cut down to the "/users/..."
+    suffix both sides share, so local paths and library entries can be
+    matched with a plain dict lookup."""
+
+    normalized = unicodedata.normalize("NFC", str(path or "")).casefold()
+    index = normalized.find("/users/")
+    return normalized[index:] if index >= 0 else normalized
 
 
 def effective_list_folder(name, download_folder_path=None, use_name_subfolder=None):
@@ -729,6 +771,54 @@ def process_pending_files(client, pending_files, playlist_ids, dedupe_enabled, p
 
     # playlist id -> set of track ids already in it, fetched lazily
     member_cache = {}
+
+    if total > BULK_PREFILTER_THRESHOLD:
+        # Fast path for big queues (e.g. a Sync Now backfill): fetch the
+        # library's locations once, instantly recognize every file already
+        # imported, and only ensure its playlist membership -- one bulk add
+        # per playlist. Skipping this on failure just means the per-file
+        # path below does the same work the slow way.
+        try:
+            known_locations = {
+                unique_location_suffix(track.get("locationUnique")): track.get("id")
+                for track in client.get_all_tracks(["id", "locationUnique"])
+                if track.get("locationUnique") and track.get("id") is not None
+            }
+
+            new_members = {}  # playlist id -> track ids to ensure
+
+            for entry in list(pending_files):
+                list_name, file_path = entry
+                track_id = known_locations.get(unique_location_suffix(file_path))
+
+                if track_id is None:
+                    continue  # genuinely new: full import below
+
+                playlist_id = playlist_ids.get(list_name)
+
+                if playlist_id is not None:
+                    new_members.setdefault(playlist_id, set()).add(track_id)
+
+                pending_files.remove(entry)
+                done += 1
+
+                if progress_callback is not None:
+                    progress_callback(done, total)
+
+            for playlist_id, track_ids in new_members.items():
+                existing = set(client.get_playlist(playlist_id).get("trackIds") or [])
+                missing = sorted(track_ids - existing)
+
+                if missing:
+                    client.add_playlist_tracks(playlist_id, missing)
+
+                member_cache[playlist_id] = existing | track_ids
+
+            if done:
+                outcomes.append(f"recognized {done} already-imported file(s) without re-importing")
+
+        except LexiconAPIError as error:
+            log.add_debug("Lexicon: bulk pre-check failed, falling back to per-file imports: %s", error)
 
     for entry in list(pending_files):
         done += 1
