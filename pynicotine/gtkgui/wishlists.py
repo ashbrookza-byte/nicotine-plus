@@ -2,9 +2,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import os
+import shutil
+import subprocess
+import sys
 
 from gi.repository import Gtk
 
+from pynicotine import audioquality
 from pynicotine.config import config
 from pynicotine.core import core
 from pynicotine.downloadlists import DownloadLists
@@ -24,6 +28,7 @@ from pynicotine.gtkgui.widgets.theme import add_css_class
 from pynicotine.gtkgui.widgets.treeview import TreeView
 from pynicotine.logfacility import log
 from pynicotine.spotifywatch import SPOTIFY_SCRAPER_AVAILABLE
+from pynicotine.utils import open_file_path
 
 
 class ListSettingsDialog(Dialog):
@@ -440,6 +445,22 @@ class WishlistSettingsDialog(Dialog):
                             "send you as many files at once as they allow.")
         )
 
+        self.quality_check_switch = Gtk.Switch(
+            active=transfers["downloadlistqualitycheck"], valign=Gtk.Align.CENTER, visible=True)
+        self._labeled_row(
+            _("Check the real quality of finished downloads (spectrum analysis):"),
+            self.quality_check_switch,
+            tooltip_text=_("Measures where a finished file's audio content stops, the way Spek shows "
+                            "it. A \"320 kbps\" or lossless file that was made from a 128 kbps encode "
+                            "stops around 16 kHz instead of 19-20 kHz: it is moved to a \"Rejected "
+                            "Quality\" folder and the song is searched for again from another "
+                            "source. Needs ffmpeg (or afconvert on macOS).")
+        )
+
+        if not audioquality.decoder_available():
+            self.quality_check_switch.set_sensitive(False)
+            self.quality_check_switch.set_tooltip_text(_("ffmpeg was not found, so downloads can't be analyzed"))
+
         heading = Gtk.Label(
             label=_("Stalled downloads"), wrap=True, xalign=0, visible=True)
         add_css_class(heading, "heading")
@@ -661,6 +682,7 @@ class WishlistSettingsDialog(Dialog):
             stall_timeout=self.stall_timeout_spinner.get_value_as_int(),
             min_speed_kib=self.min_speed_spinner.get_value_as_int(),
             max_concurrent=self.max_concurrent_spinner.get_value_as_int(),
+            quality_check=self.quality_check_switch.get_active(),
             spotify_ignore_radio_edit=self.spotify_ignore_radio_edit_switch.get_active()
         )
         self.close()
@@ -1180,7 +1202,8 @@ class Wishlists:
                 "quality": {
                     "column_type": "text",
                     "title": _("Quality"),
-                    "width": 90
+                    "width": 90,
+                    "tooltip_callback": self.on_quality_tooltip
                 },
                 "length": {
                     "column_type": "text",
@@ -1237,6 +1260,8 @@ class Wishlists:
             ("#" + _("Start _Next"), self.on_start_next_item),
             ("#" + _("_Reset"), self.on_reset_item),
             (">" + _("Search _Instead For"), self.similar_results_menu),
+            ("", None),
+            ("#" + _("Open in Spe_k"), self.on_open_in_spek),
             ("", None),
             ("#" + _("_Remove"), self.on_remove_item)
         )
@@ -1733,8 +1758,10 @@ class Wishlists:
     def on_wishlist_settings_saved(self, watch_enabled, watch_folder_path, quality, prefer_longer,
                                    prefer_lossless, preferred_keywords, fuzzy_match_threshold,
                                    auto_download, use_name_subfolder, apply_to_existing_lists,
-                                   stall_timeout, min_speed_kib, max_concurrent, spotify_ignore_radio_edit):
+                                   stall_timeout, min_speed_kib, max_concurrent, quality_check,
+                                   spotify_ignore_radio_edit):
         core.download_lists.update_watch_folder_settings(watch_enabled, watch_folder_path)
+        core.download_lists.update_quality_check_setting(quality_check)
         core.download_lists.update_wishlist_default_settings(
             quality, prefer_longer, prefer_lossless, preferred_keywords, fuzzy_match_threshold,
             auto_download, use_name_subfolder, apply_to_existing_lists=apply_to_existing_lists)
@@ -2026,6 +2053,51 @@ class Wishlists:
         new_term = core.download_lists.suggestion_term(suggestion["filename"])
         log.add(_('Searching for "%(new)s" instead of "%(old)s"'), {"new": new_term, "old": term})
         core.download_lists.retarget_list_item(self.current_list_name, term, new_term)
+
+    def on_quality_tooltip(self, treeview, iterator):
+        """The claimed quality next to what the spectrum check measured."""
+
+        download_list = core.download_lists.lists.get(self.current_list_name)
+        term = treeview.get_row_value(iterator, "term")
+        item = download_list.items.get(term) if download_list is not None else None
+
+        if item is None or not item.h_quality:
+            return None
+
+        lines = [_("Claimed: %(quality)s") % {"quality": item.h_quality}]
+
+        if item.quality_cutoff_hz is not None:
+            report = audioquality.QualityReport(item.quality_cutoff_hz)
+            lines.append(_("Measured: %(result)s") % {"result": report.describe()})
+
+        if item.num_quality_rejections:
+            lines.append(_("%(num)s earlier download(s) failed the quality check") % {
+                "num": item.num_quality_rejections})
+
+        return "\n".join(lines)
+
+    def on_open_in_spek(self, *_args):
+        """Show the selected item's downloaded file in Spek, for a look at
+        its spectrogram by eye."""
+
+        item = self._selected_item()
+        file_path = core.download_lists._item_file_path(self.current_list_name, item) if item else None
+
+        if file_path is None:
+            log.add(_("This song has no finished download to open"))
+            return
+
+        if sys.platform == "darwin" and os.path.exists("/Applications/Spek.app"):
+            subprocess.Popen(["open", "-a", "Spek", file_path])  # pylint: disable=consider-using-with
+            return
+
+        spek_path = shutil.which("spek")
+
+        if spek_path is not None:
+            subprocess.Popen([spek_path, file_path])  # pylint: disable=consider-using-with
+            return
+
+        open_file_path(file_path)
 
     def on_status_tooltip(self, treeview, iterator):
         """A Not Found row's status tooltip lists what its searches did see,

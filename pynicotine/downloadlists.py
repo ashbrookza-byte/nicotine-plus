@@ -22,12 +22,14 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 import unicodedata
 
 from collections import deque
 from operator import itemgetter
 
+from pynicotine import audioquality
 from pynicotine.config import config
 from pynicotine.core import core
 from pynicotine.events import events
@@ -58,6 +60,7 @@ class DownloadListItemStatus:
     IN_LIBRARY = "in_library"
     SEARCHING = "searching"
     DOWNLOADING = "downloading"
+    QUALITY_CHECK = "quality_check"
     COMPLETED = "completed"
     NOT_FOUND = "not_found"
 
@@ -68,20 +71,23 @@ class DownloadListItem:
         "download_username", "download_virtual_path", "download_size", "download_attributes",
         "download_match_percentage", "download_candidates", "variant_index", "collect_timer_id",
         "escalation_timer_id", "download_percent", "stall_timer_id", "dispatch_time",
-        "download_start_time", "library_location", "suggestions", "near_misses"
+        "download_start_time", "library_location", "suggestions", "near_misses",
+        "rejected_files", "num_quality_rejections", "quality_cutoff_hz"
     )
 
     def __init__(self, term, list_name, time_added=None, status=DownloadListItemStatus.PENDING,
                  searched_term=None, download_username=None, download_virtual_path=None,
                  download_size=0, download_attributes=None, download_match_percentage=None,
-                 library_location=None, suggestions=None):
+                 library_location=None, suggestions=None, rejected_files=None, num_quality_rejections=0,
+                 quality_cutoff_hz=None):
 
         self.term = term
         self.list_name = list_name
         self.time_added = time_added if time_added is not None else int(time.time())
         self.searched_term = searched_term
 
-        if status in (DownloadListItemStatus.SEARCHING, DownloadListItemStatus.DOWNLOADING):
+        if status in (DownloadListItemStatus.SEARCHING, DownloadListItemStatus.DOWNLOADING,
+                      DownloadListItemStatus.QUALITY_CHECK):
             # In-flight state can't resume across restarts (its bookkeeping isn't
             # persisted), so pick up as pending instead
             status = DownloadListItemStatus.PENDING
@@ -99,6 +105,13 @@ class DownloadListItem:
         # tell a mistyped term from a track that's genuinely not shared, and
         # pick one of them to search for instead
         self.suggestions = suggestions or []
+
+        # Sources ("username" + virtual path) whose file failed the quality
+        # check, never to be picked for this item again; and the measured
+        # spectral cutoff of the current download, once checked
+        self.rejected_files = set(rejected_files or [])
+        self.num_quality_rejections = num_quality_rejections
+        self.quality_cutoff_hz = quality_cutoff_hz
 
         # Transient, session-only state
         self.token = None
@@ -166,6 +179,9 @@ class DownloadListItem:
             "download_size": self.download_size,
             "download_match_percentage": self.download_match_percentage,
             "suggestions": self.suggestions,
+            "rejected_files": sorted(self.rejected_files),
+            "num_quality_rejections": self.num_quality_rejections,
+            "quality_cutoff_hz": self.quality_cutoff_hz,
             "download_bitrate": attributes.bitrate if attributes else None,
             "download_length": attributes.length if attributes else None,
             "download_vbr": attributes.vbr if attributes else None,
@@ -388,6 +404,12 @@ class DownloadLists:
     NEAR_MISS_MIN_PERCENT = 34
     MAX_SUGGESTIONS = 5
 
+    # A finished download whose spectrum shows it was made from a worse
+    # encode than it claims is set aside in this subfolder of the list's
+    # download folder and searched for again, up to this many times
+    REJECTED_QUALITY_FOLDER_NAME = "Rejected Quality"
+    MAX_QUALITY_REJECTIONS = 3
+
     # Filler words in a term that a filename can't be expected to contain
     IGNORED_TERM_WORDS = {"feat", "ft", "featuring"}
 
@@ -407,6 +429,7 @@ class DownloadLists:
         DownloadListItemStatus.IN_LIBRARY: _("In Library"),
         DownloadListItemStatus.SEARCHING: _("Searching…"),
         DownloadListItemStatus.DOWNLOADING: _("Downloading…"),
+        DownloadListItemStatus.QUALITY_CHECK: _("Checking Quality…"),
         DownloadListItemStatus.COMPLETED: _("Completed"),
         DownloadListItemStatus.NOT_FOUND: _("Not Found")
     }
@@ -547,6 +570,9 @@ class DownloadLists:
                     status=item_data.get("status", DownloadListItemStatus.PENDING),
                     searched_term=item_data.get("searched_term"),
                     suggestions=item_data.get("suggestions"),
+                    rejected_files=item_data.get("rejected_files"),
+                    num_quality_rejections=item_data.get("num_quality_rejections", 0),
+                    quality_cutoff_hz=item_data.get("quality_cutoff_hz"),
                     download_username=item_data.get("download_username"),
                     download_virtual_path=item_data.get("download_virtual_path"),
                     download_size=item_data.get("download_size", 0),
@@ -773,6 +799,14 @@ class DownloadLists:
         config.sections["transfers"]["downloadliststalltimeout"] = max(1, int(stall_timeout))
         config.sections["transfers"]["downloadlistminspeed"] = max(0, int(min_speed_kib))
 
+        config.write_configuration()
+
+    @property
+    def quality_check_enabled(self):
+        return config.sections["transfers"]["downloadlistqualitycheck"] and audioquality.decoder_available()
+
+    def update_quality_check_setting(self, enabled):
+        config.sections["transfers"]["downloadlistqualitycheck"] = bool(enabled)
         config.write_configuration()
 
     def update_max_concurrent_downloads(self, max_concurrent):
@@ -1261,6 +1295,7 @@ class DownloadLists:
         item.download_attributes = None
         item.download_match_percentage = None
         item.download_percent = 0
+        item.quality_cutoff_hz = None
         item.suggestions = []
         item.near_misses = {}
 
@@ -2139,6 +2174,10 @@ class DownloadLists:
             if extension not in self.AUDIO_EXTENSIONS:
                 continue
 
+            if username + virtual_path in item.rejected_files:
+                # Already downloaded once and failed the quality check
+                continue
+
             path_lower = self._fold_text(virtual_path)
             filename_lower = path_lower.replace("\\", "/").rsplit("/", 1)[-1]
             term_words = self._effective_term_words(item.term, path_lower)
@@ -2338,15 +2377,129 @@ class DownloadLists:
 
         del self._transfer_map[transfer_key]
 
-        item.status = DownloadListItemStatus.COMPLETED
         item.download_percent = 100
         self._forget_item(item)
 
-        events.emit("update-download-list-item", list_name, term)
+        file_path = self._item_file_path(list_name, item)
+
+        if (file_path is not None and self.quality_check_enabled
+                and audioquality.REQUIRED_CUTOFF_HZ.get(download_list.effective_quality, 0) > 0):
+            item.status = DownloadListItemStatus.QUALITY_CHECK
+            events.emit("update-download-list-item", list_name, term)
+            threading.Thread(
+                target=self._run_quality_check, args=(list_name, term, file_path),
+                name="DownloadListQualityCheck", daemon=True
+            ).start()
+            return
+
+        self._complete_item(list_name, item)
+
+    def _item_file_path(self, list_name, item):
+        """Where an item's finished download is on disk, or None if it isn't there."""
+
+        download_list = self.lists.get(list_name)
+
+        if download_list is None or not item.download_username or not item.download_virtual_path:
+            return None
+
+        file_path, file_exists = core.downloads.get_complete_download_file_path(
+            item.download_username, item.download_virtual_path, item.download_size,
+            download_folder_path=download_list.effective_download_folder_path
+        )
+        return file_path if file_exists else None
+
+    def _complete_item(self, list_name, item):
+
+        item.status = DownloadListItemStatus.COMPLETED
+        item.download_percent = 100
+
+        events.emit("update-download-list-item", list_name, item.term)
         self._emit_item_finished(list_name, item)
         self._save()
 
         self._check_list_complete(list_name)
+
+    def _run_quality_check(self, list_name, term, file_path):
+        """Background thread: measure the file's spectral cutoff."""
+
+        report = audioquality.analyze_file(file_path)
+        events.invoke_main_thread(self._resolve_quality_check, list_name, term, file_path, report)
+
+    def _resolve_quality_check(self, list_name, term, file_path, report):
+        """Back on the main thread with the measured quality: keep the file,
+        or set it aside and look for another source."""
+
+        download_list = self.lists.get(list_name)
+        item = download_list.items.get(term) if download_list is not None else None
+
+        if item is None or item.status != DownloadListItemStatus.QUALITY_CHECK:
+            return
+
+        if report is None:
+            # Couldn't be judged (unreadable, silent, too short): keep it
+            self._complete_item(list_name, item)
+            return
+
+        item.quality_cutoff_hz = report.cutoff_hz
+
+        if report.meets(download_list.effective_quality):
+            log.add_search(
+                _('Quality check passed for "%(term)s": %(result)s'),
+                {"term": term, "result": report.describe()}
+            )
+            self._complete_item(list_name, item)
+            return
+
+        rejected_path = self._set_aside_rejected_file(download_list, file_path)
+        item.rejected_files.add(item.download_username + item.download_virtual_path)
+        item.num_quality_rejections += 1
+
+        log.add(
+            _('Quality check failed for "%(term)s" from %(user)s: %(result)s, moved to "%(path)s"'),
+            {"term": term, "user": item.download_username, "result": report.describe(),
+             "path": rejected_path or file_path}
+        )
+
+        if item.num_quality_rejections >= self.MAX_QUALITY_REJECTIONS:
+            # Every source tried so far was a fake: give up rather than
+            # collect more of them. The files are kept in the rejected folder
+            item.status = DownloadListItemStatus.NOT_FOUND
+            events.emit("update-download-list-item", list_name, term)
+            self._save()
+            self._check_list_complete(list_name)
+            return
+
+        rejected_files = item.rejected_files
+        num_rejections = item.num_quality_rejections
+        self._clear_item_progress(item)
+        item.rejected_files = rejected_files
+        item.num_quality_rejections = num_rejections
+
+        if download_list.effective_auto_download:
+            self._queue.appendleft((list_name, term))
+            self._kick_queue()
+
+        events.emit("update-download-list-item", list_name, term)
+        self._save()
+
+    def _set_aside_rejected_file(self, download_list, file_path):
+        """Move a failed download out of the way (never delete: the user may
+        still want it if nothing better turns up). Returns the new path."""
+
+        folder_path = os.path.join(
+            download_list.effective_download_folder_path or os.path.dirname(file_path),
+            self.REJECTED_QUALITY_FOLDER_NAME)
+        target_path = os.path.join(folder_path, os.path.basename(file_path))
+
+        try:
+            os.makedirs(encode_path(folder_path), exist_ok=True)
+            os.replace(encode_path(file_path), encode_path(target_path))
+
+        except OSError as error:
+            log.add(_("Cannot move rejected download %(path)s: %(error)s"), {"path": file_path, "error": error})
+            return None
+
+        return target_path
 
     def _check_list_complete(self, list_name):
 

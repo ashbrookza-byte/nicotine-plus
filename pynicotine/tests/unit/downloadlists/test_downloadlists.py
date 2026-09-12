@@ -1418,6 +1418,144 @@ class DownloadListsTest(TestCase):
         core.download_lists.retarget_list_item("Retarget List", "third", "first")
         self.assertEqual(list(download_list.items), ["first", "Bicep Opal Four Tet Rmx"])
 
+    def _finish_download_with_file(self, list_name, term, username="qualityuser"):
+        """Dispatch, match and finish a download for the item, with an actual
+        (dummy) file at the finished download's path. Returns item, file path."""
+
+        from pynicotine.transfers import TransferStatus
+
+        download_list = core.download_lists.lists[list_name]
+        item = download_list.items[term]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, f"@@abc\\{term}.mp3", 1000, "mp3", attributes)]
+        core.download_lists._file_search_response(self._make_response(item.token, username, files))
+        core.download_lists._finalize_item(list_name, term)
+
+        transfer = core.downloads.transfers.get(username + item.download_virtual_path)
+        self.assertIsNotNone(transfer)
+
+        file_path, _exists = core.downloads.get_complete_download_file_path(
+            username, item.download_virtual_path, item.download_size,
+            download_folder_path=download_list.effective_download_folder_path)
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+        # The finished-file lookup matches on size, so write exactly that many bytes
+        with open(file_path, "wb") as handle:
+            handle.write(b"\0" * item.download_size)
+
+        transfer.status = TransferStatus.FINISHED
+        core.download_lists._update_download(transfer, True)
+        return item, file_path
+
+    def test_finished_download_waits_for_quality_check(self):
+        """With the check on and a file on disk, a finished download is
+        "Checking Quality" until the analysis resolves it, and a passing
+        report completes it (with the measured cutoff kept)."""
+
+        from pynicotine import audioquality
+
+        config.sections["transfers"]["downloadlistqualitycheck"] = True
+
+        if not audioquality.decoder_available():
+            self.skipTest("no audio decoder installed")
+
+        download_list = core.download_lists.add_list(
+            "Quality List", download_folder_path=DATA_FOLDER_PATH, quality="high",
+            fuzzy_match_threshold=50, auto_download=True)
+        core.download_lists.add_list_items("Quality List", ["Real Artist - Real Song"])
+
+        item, file_path = self._finish_download_with_file("Quality List", "Real Artist - Real Song")
+        self.assertEqual(item.status, DownloadListItemStatus.QUALITY_CHECK)
+
+        core.download_lists._resolve_quality_check(
+            "Quality List", "Real Artist - Real Song", file_path, audioquality.QualityReport(19600))
+
+        self.assertEqual(item.status, DownloadListItemStatus.COMPLETED)
+        self.assertEqual(item.quality_cutoff_hz, 19600)
+        self.assertTrue(os.path.exists(file_path))
+        self.assertEqual(item.as_dict()["quality_cutoff_hz"], 19600)
+
+    def test_failed_quality_check_sets_file_aside_and_searches_again(self):
+        """A file whose spectrum falls short of the list's quality is moved to
+        the Rejected Quality folder, its source is never picked again, and the
+        item goes back to searching; after enough fakes it gives up."""
+
+        from pynicotine import audioquality
+
+        config.sections["transfers"]["downloadlistqualitycheck"] = True
+
+        if not audioquality.decoder_available():
+            self.skipTest("no audio decoder installed")
+
+        download_list = core.download_lists.add_list(
+            "Fake List", download_folder_path=DATA_FOLDER_PATH, quality="high",
+            fuzzy_match_threshold=50, auto_download=True)
+        core.download_lists.add_list_items("Fake List", ["Fake Artist - Fake Song"])
+
+        item, file_path = self._finish_download_with_file("Fake List", "Fake Artist - Fake Song")
+        rejected_source = item.download_username + item.download_virtual_path
+
+        core.download_lists._resolve_quality_check(
+            "Fake List", "Fake Artist - Fake Song", file_path, audioquality.QualityReport(16100))
+
+        self.assertIn(item.status, (DownloadListItemStatus.PENDING, DownloadListItemStatus.SEARCHING))
+        self.assertFalse(os.path.exists(file_path))
+        self.assertTrue(os.path.exists(os.path.join(
+            DATA_FOLDER_PATH, core.download_lists.REJECTED_QUALITY_FOLDER_NAME, os.path.basename(file_path))))
+        self.assertIn(rejected_source, item.rejected_files)
+        self.assertEqual(item.num_quality_rejections, 1)
+        self.assertIn(rejected_source, item.as_dict()["rejected_files"])
+
+        # The rejected source is skipped if it shows up in the new search
+        if item.status == DownloadListItemStatus.PENDING:
+            core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Fake Artist - Fake Song.mp3", 8000000, "mp3", attributes)]
+        core.download_lists._file_search_response(self._make_response(item.token, "qualityuser", files))
+        self.assertEqual(item.download_candidates, [])
+
+        core.download_lists._file_search_response(self._make_response(item.token, "otheruser", files))
+        self.assertEqual(len(item.download_candidates), 1)
+
+        # Too many fakes in a row: give up
+        item.num_quality_rejections = core.download_lists.MAX_QUALITY_REJECTIONS - 1
+        item.status = DownloadListItemStatus.QUALITY_CHECK
+        item.download_username = "otheruser"
+        item.download_virtual_path = "@@abc\\Fake Artist - Fake Song.mp3"
+
+        with open(file_path, "wb") as handle:
+            handle.write(b"\0" * 1000)
+
+        core.download_lists._resolve_quality_check(
+            "Fake List", "Fake Artist - Fake Song", file_path, audioquality.QualityReport(16100))
+
+        self.assertEqual(item.status, DownloadListItemStatus.NOT_FOUND)
+
+    def test_quality_check_skipped_when_disabled_or_any_quality(self):
+
+        config.sections["transfers"]["downloadlistqualitycheck"] = False
+
+        download_list = core.download_lists.add_list(
+            "Unchecked List", download_folder_path=DATA_FOLDER_PATH, quality="high",
+            fuzzy_match_threshold=50, auto_download=True)
+        core.download_lists.add_list_items("Unchecked List", ["Plain Artist - Plain Song"])
+
+        item, _file_path = self._finish_download_with_file("Unchecked List", "Plain Artist - Plain Song")
+        self.assertEqual(item.status, DownloadListItemStatus.COMPLETED)
+
+        config.sections["transfers"]["downloadlistqualitycheck"] = True
+
+        download_list = core.download_lists.add_list(
+            "Any Quality List", download_folder_path=DATA_FOLDER_PATH, quality="any",
+            fuzzy_match_threshold=50, auto_download=True)
+        core.download_lists.add_list_items("Any Quality List", ["Any Artist - Any Song"])
+
+        item, _file_path = self._finish_download_with_file("Any Quality List", "Any Artist - Any Song")
+        self.assertEqual(item.status, DownloadListItemStatus.COMPLETED)
+
     def test_save_and_load_round_trip(self):
         """Verify a list with items survives a save + reload cycle."""
 

@@ -192,6 +192,7 @@ class Config:
                 "downloadliststalltimeout": 30,
                 "downloadlistminspeed": 1,
                 "downloadlistmaxconcurrent": 3,
+                "downloadlistqualitycheck": True,
                 "shared": [],
                 "buddyshared": [],
                 "trustedshared": [],
