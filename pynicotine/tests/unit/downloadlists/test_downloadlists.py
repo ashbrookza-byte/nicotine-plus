@@ -3,6 +3,7 @@
 
 import os
 import shutil
+import time
 
 from unittest import TestCase
 
@@ -1339,6 +1340,83 @@ class DownloadListsTest(TestCase):
 
         # Nothing left to reset
         self.assertEqual(core.download_lists.reset_not_found_items(), 0)
+
+    def _force_not_found(self, list_name, term):
+        """Exhaust an item's search variants and time budget so it ends Not Found."""
+
+        item = core.download_lists.lists[list_name].items[term]
+        item.dispatch_time = time.time() - core.download_lists.SEARCH_TIMEOUT - 1
+
+        for _attempt in range(12):
+            if item.status != DownloadListItemStatus.SEARCHING:
+                break
+
+            core.download_lists._escalate_item(list_name, term)
+
+        self.assertEqual(item.status, DownloadListItemStatus.NOT_FOUND)
+        return item
+
+    def test_not_found_item_suggests_the_closest_files_it_saw(self):
+        """Results that fell short of the match threshold are kept, best first,
+        as suggestions on the Not Found item -- and survive a save."""
+
+        download_list = core.download_lists.add_list(
+            "Suggest List", quality="any", fuzzy_match_threshold=80, auto_download=True)
+        core.download_lists.add_list_items("Suggest List", ["opel bicep fourtet"])
+
+        item = download_list.items["opel bicep fourtet"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [
+            (1, "@@abc\\04. Bicep - Opal [Four Tet Rmx].mp3", 8000000, "mp3", attributes),   # 2 of 3 words
+            (1, "@@abc\\Bicep - Glue.mp3", 8000000, "mp3", attributes),                      # 1 of 3 words
+            (1, "@@abc\\Unrelated - Song.mp3", 8000000, "mp3", attributes)                   # nothing
+        ]
+        core.download_lists._file_search_response(self._make_response(item.token, "someuser", files))
+
+        self.assertEqual(item.download_candidates, [])
+        self.assertEqual(len(item.near_misses), 1)
+
+        item = self._force_not_found("Suggest List", "opel bicep fourtet")
+
+        self.assertEqual(len(item.suggestions), 1)
+        self.assertEqual(item.suggestions[0]["filename"], "@@abc\\04. Bicep - Opal [Four Tet Rmx].mp3")
+        self.assertEqual(item.suggestions[0]["match"], 67)
+        self.assertEqual(item.suggestions[0]["searched_term"], "opel bicep fourtet")
+        self.assertEqual(item.as_dict()["suggestions"], item.suggestions)
+        self.assertEqual(
+            core.download_lists.suggestion_term(item.suggestions[0]["filename"]), "Bicep Opal Four Tet Rmx")
+
+    def test_not_found_item_without_near_misses_has_no_suggestions(self):
+
+        download_list = core.download_lists.add_list("No Suggest List", quality="any", auto_download=True)
+        core.download_lists.add_list_items("No Suggest List", ["nothing like this"])
+        core.download_lists._dispatch_item(download_list, download_list.items["nothing like this"])
+
+        item = self._force_not_found("No Suggest List", "nothing like this")
+        self.assertEqual(item.suggestions, [])
+
+    def test_retarget_list_item_keeps_position_and_searches_afresh(self):
+
+        download_list = core.download_lists.add_list("Retarget List", quality="any", auto_download=True)
+        core.download_lists.add_list_items("Retarget List", ["first", "opel bicep fourtet", "third"])
+
+        item = download_list.items["opel bicep fourtet"]
+        item.status = DownloadListItemStatus.NOT_FOUND
+        item.suggestions = [{"filename": "x.mp3", "match": 50, "searched_term": "opel bicep fourtet"}]
+
+        core.download_lists.retarget_list_item("Retarget List", "opel bicep fourtet", "Bicep Opal Four Tet Rmx")
+
+        self.assertEqual(list(download_list.items), ["first", "Bicep Opal Four Tet Rmx", "third"])
+        self.assertIs(download_list.items["Bicep Opal Four Tet Rmx"], item)
+        self.assertEqual(item.term, "Bicep Opal Four Tet Rmx")
+        self.assertIn(item.status, (DownloadListItemStatus.PENDING, DownloadListItemStatus.SEARCHING))
+        self.assertEqual(item.suggestions, [])
+
+        # Retargeting onto a term already in the list just drops the duplicate
+        core.download_lists.retarget_list_item("Retarget List", "third", "first")
+        self.assertEqual(list(download_list.items), ["first", "Bicep Opal Four Tet Rmx"])
 
     def test_save_and_load_round_trip(self):
         """Verify a list with items survives a save + reload cycle."""

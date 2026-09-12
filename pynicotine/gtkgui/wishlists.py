@@ -1159,7 +1159,8 @@ class Wishlists:
                 "status": {
                     "column_type": "text",
                     "title": _("Status"),
-                    "width": 90
+                    "width": 90,
+                    "tooltip_callback": self.on_status_tooltip
                 },
                 "progress": {
                     "column_type": "progress",
@@ -1226,11 +1227,16 @@ class Wishlists:
             window.application, self.spotify_completed_lists_view.widget, self.on_popup_lists_menu)
         self.spotify_completed_lists_popup_menu.add_items(*completed_menu_items)
 
-        self.items_popup_menu = PopupMenu(window.application, self.items_view.widget)
+        # Filled in per item on right-click (see on_popup_items_menu) with the
+        # closest files a Not Found item's searches did see
+        self.similar_results_menu = PopupMenu(window.application)
+
+        self.items_popup_menu = PopupMenu(window.application, self.items_view.widget, self.on_popup_items_menu)
         self.items_popup_menu.add_items(
             ("#" + _("_Search"), self.on_search_item),
             ("#" + _("Start _Next"), self.on_start_next_item),
             ("#" + _("_Reset"), self.on_reset_item),
+            (">" + _("Search _Instead For"), self.similar_results_menu),
             ("", None),
             ("#" + _("_Remove"), self.on_remove_item)
         )
@@ -1967,6 +1973,85 @@ class Wishlists:
             callback=self.on_remove_list_response,
             callback_data=names
         ).present()
+
+    def _selected_item(self):
+
+        if self.current_list_name is None:
+            return None
+
+        iterator = next(self.items_view.get_selected_rows(), None)
+
+        if iterator is None:
+            return None
+
+        term = self.items_view.get_row_value(iterator, "term")
+        download_list = core.download_lists.lists.get(self.current_list_name)
+        return download_list.items.get(term) if download_list is not None else None
+
+    @staticmethod
+    def _suggestion_label(suggestion):
+        # A menu label's "_" marks a mnemonic; a literal one is written "__"
+        filename = suggestion["filename"].replace("\\", "/").rsplit("/", 1)[-1].replace("_", "__")
+        return _("%(file)s  (%(match)s%% match, searched as \u201c%(term)s\u201d)") % {
+            "file": filename, "match": suggestion["match"], "term": suggestion["searched_term"]}
+
+    def on_popup_items_menu(self, _menu, _widget):
+        """Right-clicking a row selects it first, so the target item is the
+        selected one. Rebuild the "Search Instead For" submenu from its
+        suggestions: the closest files its searches saw without a good
+        enough match -- typically what a mistyped term actually meant."""
+
+        item = self._selected_item()
+        suggestions = item.suggestions if item is not None else []
+
+        self.similar_results_menu.clear()
+
+        if not suggestions:
+            label = _("(nothing similar was seen)")
+            self.similar_results_menu.add_items(("#" + label, None))
+            self.similar_results_menu.update_model()
+            self.similar_results_menu.actions[label].set_enabled(False)
+            return
+
+        for suggestion in suggestions:
+            self.similar_results_menu.add_items(
+                ("#" + self._suggestion_label(suggestion), self.on_search_instead_for, item.term, suggestion))
+
+        self.similar_results_menu.update_model()
+
+    def on_search_instead_for(self, _action, _parameter, term, suggestion):
+        """Replace the item's term with one made from the suggested file's
+        name and search for it afresh -- in place, keeping its position."""
+
+        new_term = core.download_lists.suggestion_term(suggestion["filename"])
+        log.add(_('Searching for "%(new)s" instead of "%(old)s"'), {"new": new_term, "old": term})
+        core.download_lists.retarget_list_item(self.current_list_name, term, new_term)
+
+    def on_status_tooltip(self, treeview, iterator):
+        """A Not Found row's status tooltip lists what its searches did see,
+        so a mistyped term stands out from a track nobody shares."""
+
+        download_list = core.download_lists.lists.get(self.current_list_name)
+        term = treeview.get_row_value(iterator, "term")
+        item = download_list.items.get(term) if download_list is not None else None
+
+        if item is None:
+            return None
+
+        if item.status != DownloadListItemStatus.NOT_FOUND:
+            return self.STATUS_LABELS.get(item.status, item.status)
+
+        if not item.suggestions:
+            return _("Not Found\n\nNo file resembling this term was seen in any of its searches.")
+
+        lines = [
+            _("%(file)s \u2014 %(match)s%% match, searched as \u201c%(term)s\u201d") % {
+                "file": suggestion["filename"].replace("\\", "/").rsplit("/", 1)[-1],
+                "match": suggestion["match"], "term": suggestion["searched_term"]}
+            for suggestion in item.suggestions
+        ]
+        return _("Not Found\n\nSimilar files seen while searching:\n%(files)s\n\n"
+                 "Right-click \u2192 Search Instead For to use one of them.") % {"files": "\n".join(lines)}
 
     def on_search_item(self, *_args):
         """Run a fresh Search Files search for the (first) selected item's

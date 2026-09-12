@@ -68,13 +68,13 @@ class DownloadListItem:
         "download_username", "download_virtual_path", "download_size", "download_attributes",
         "download_match_percentage", "download_candidates", "variant_index", "collect_timer_id",
         "escalation_timer_id", "download_percent", "stall_timer_id", "dispatch_time",
-        "download_start_time", "library_location"
+        "download_start_time", "library_location", "suggestions", "near_misses"
     )
 
     def __init__(self, term, list_name, time_added=None, status=DownloadListItemStatus.PENDING,
                  searched_term=None, download_username=None, download_virtual_path=None,
                  download_size=0, download_attributes=None, download_match_percentage=None,
-                 library_location=None):
+                 library_location=None, suggestions=None):
 
         self.term = term
         self.list_name = list_name
@@ -94,9 +94,18 @@ class DownloadListItem:
         self.download_attributes = download_attributes
         self.download_match_percentage = download_match_percentage
 
+        # For a Not Found item: the closest files the searches did see (each a
+        # dict with "filename", "match" and "searched_term"), so the user can
+        # tell a mistyped term from a track that's genuinely not shared, and
+        # pick one of them to search for instead
+        self.suggestions = suggestions or []
+
         # Transient, session-only state
         self.token = None
         self.download_candidates = []
+        # filename (lowercase) -> (match percentage, searched term, filename) of
+        # results seen while searching that didn't make the cut
+        self.near_misses = {}
         self.variant_index = 0
         self.collect_timer_id = None
         self.escalation_timer_id = None
@@ -156,6 +165,7 @@ class DownloadListItem:
             "download_virtual_path": self.download_virtual_path,
             "download_size": self.download_size,
             "download_match_percentage": self.download_match_percentage,
+            "suggestions": self.suggestions,
             "download_bitrate": attributes.bitrate if attributes else None,
             "download_length": attributes.length if attributes else None,
             "download_vbr": attributes.vbr if attributes else None,
@@ -372,6 +382,12 @@ class DownloadLists:
     # with "Too many files" and just sit there as Queued
     MAX_DOWNLOADS_PER_PEER = 2
 
+    # Results that fell short of the match threshold are still worth showing
+    # the user as "did you mean" suggestions once an item ends up Not Found --
+    # if they matched at least this much of the term -- up to this many
+    NEAR_MISS_MIN_PERCENT = 34
+    MAX_SUGGESTIONS = 5
+
     # Filler words in a term that a filename can't be expected to contain
     IGNORED_TERM_WORDS = {"feat", "ft", "featuring"}
 
@@ -399,6 +415,7 @@ class DownloadLists:
     # results come back for the exact term (e.g. extra featured artists, remix tags)
     BRACKETED_CONTENT_PATTERN = re.compile(r"[(\[][^)\]]*[)\]]")
     TERM_SEGMENT_SPLIT_PATTERN = re.compile(r"\s+-\s+")
+    LEADING_TRACK_NUMBER_PATTERN = re.compile(r"^\s*\d{1,3}\s*[-._)]+\s*")
     TEXT_TOKEN_PATTERN = re.compile(r"\w+")
     FEATURED_ARTIST_PATTERN = re.compile(r"\s*[(\[]?\b(feat\.?|ft\.?|featuring|with)\b[^-]*", re.IGNORECASE)
     EXTRA_ARTIST_SPLIT_PATTERN = re.compile(r"\s*(?:,|&|\bx\b|\bvs\.?\b)\s*", re.IGNORECASE)
@@ -529,6 +546,7 @@ class DownloadLists:
                     term=term, list_name=name, time_added=item_data.get("time_added"),
                     status=item_data.get("status", DownloadListItemStatus.PENDING),
                     searched_term=item_data.get("searched_term"),
+                    suggestions=item_data.get("suggestions"),
                     download_username=item_data.get("download_username"),
                     download_virtual_path=item_data.get("download_virtual_path"),
                     download_size=item_data.get("download_size", 0),
@@ -1243,6 +1261,77 @@ class DownloadLists:
         item.download_attributes = None
         item.download_match_percentage = None
         item.download_percent = 0
+        item.suggestions = []
+        item.near_misses = {}
+
+    def retarget_list_item(self, name, term, new_term):
+        """Replace an item's search term (e.g. with one of its Not Found
+        suggestions, or a corrected spelling) in place, keeping its position
+        in the list, and search for it afresh."""
+
+        download_list = self.lists.get(name)
+        item = download_list.items.get(term) if download_list is not None else None
+        new_term = new_term.strip()
+
+        if item is None or not new_term or new_term == term:
+            return
+
+        if new_term in download_list.items:
+            # Already listed under the new spelling: just drop this duplicate
+            self.remove_list_item(name, term)
+            return
+
+        self._clear_item_progress(item)
+        item.term = new_term
+        download_list.items = {
+            (new_term if key == term else key): value for key, value in download_list.items.items()}
+
+        if download_list.effective_auto_download:
+            self._queue.append((name, new_term))
+            self._kick_queue()
+
+        events.emit("update-download-list", name)
+        self._save()
+
+    def suggestion_term(self, filename):
+        """A search term made from a suggested file's name: no extension, track
+        number or punctuation ("04. Bicep - Opal [Four Tet Rmx].mp3" ->
+        "Bicep Opal Four Tet Rmx")."""
+
+        stem = os.path.splitext(filename.replace("\\", "/").rsplit("/", 1)[-1])[0]
+        stem = self.LEADING_TRACK_NUMBER_PATTERN.sub("", stem)
+        return self._sanitize_text(stem)
+
+    def _record_near_miss(self, item, match_percentage, filename):
+        """Remember a result that wasn't good enough to download, for the
+        suggestions shown if the item ends up Not Found."""
+
+        if match_percentage < self.NEAR_MISS_MIN_PERCENT:
+            return
+
+        key = filename.lower()
+        previous = item.near_misses.get(key)
+
+        if previous is not None and previous[0] >= match_percentage:
+            return
+
+        item.near_misses[key] = (match_percentage, item.searched_term or item.term, filename)
+
+        if len(item.near_misses) > self.MAX_SUGGESTIONS * 4:
+            # Keep the collection bounded on a busy network: drop the weakest
+            weakest_key = min(item.near_misses, key=lambda near_key: item.near_misses[near_key][0])
+            del item.near_misses[weakest_key]
+
+    def _settle_suggestions(self, item):
+        """Turn the near misses collected while searching into the item's
+        persisted suggestions, best first."""
+
+        ranked = sorted(item.near_misses.values(), key=itemgetter(0), reverse=True)
+        item.suggestions = [
+            {"filename": filename, "match": round(match_percentage), "searched_term": searched_term}
+            for match_percentage, searched_term, filename in ranked[:self.MAX_SUGGESTIONS]
+        ]
+        item.near_misses = {}
 
     def reset_not_found_items(self, name=None):
         """Search again for every item marked Not Found -- in one list, or in
@@ -1687,6 +1776,8 @@ class DownloadLists:
         item.searched_term = item.term
         item.variant_index = 0
         item.download_candidates = []
+        item.near_misses = {}
+        item.suggestions = []
         item.dispatch_time = time.time()
 
         item.token = self._next_token()
@@ -1812,6 +1903,7 @@ class DownloadLists:
 
             if remaining <= 0:
                 item.status = DownloadListItemStatus.NOT_FOUND
+                self._settle_suggestions(item)
                 self._forget_search(item)
 
                 events.emit("update-download-list-item", list_name, term)
@@ -2054,7 +2146,9 @@ class DownloadLists:
 
             if match_percentage < download_list.effective_fuzzy_match_threshold:
                 # Doesn't look enough like the original term, e.g. a search that was
-                # broadened to find any results at all matched an unrelated track
+                # broadened to find any results at all matched an unrelated track --
+                # but if it's at all close, it may be what a mistyped term meant
+                self._record_near_miss(item, match_percentage, virtual_path)
                 continue
 
             version_matches = (
