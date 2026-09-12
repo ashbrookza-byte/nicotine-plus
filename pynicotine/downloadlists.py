@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import time
+import unicodedata
 
 from collections import deque
 from operator import itemgetter
@@ -67,7 +68,7 @@ class DownloadListItem:
         "download_username", "download_virtual_path", "download_size", "download_attributes",
         "download_match_percentage", "download_candidates", "variant_index", "collect_timer_id",
         "escalation_timer_id", "download_percent", "stall_timer_id", "dispatch_time",
-        "library_location"
+        "download_start_time", "library_location"
     )
 
     def __init__(self, term, list_name, time_added=None, status=DownloadListItemStatus.PENDING,
@@ -102,6 +103,7 @@ class DownloadListItem:
         self.download_percent = 100 if status == DownloadListItemStatus.COMPLETED else 0
         self.stall_timer_id = None
         self.dispatch_time = None
+        self.download_start_time = None
 
     @property
     def h_quality(self):
@@ -357,6 +359,25 @@ class DownloadLists:
     # (moving out of the incomplete folder, hash-checking, etc.) at this point
     STALL_EXEMPT_PERCENT = 90
 
+    # A download the peer has accepted into its upload queue ("Queued" -- which
+    # is also how downloads.py presents a peer's "Too many files" limit, resuming
+    # it by itself later) is waiting its turn, not stalled. Only after this long
+    # in the queue is a different source looked for
+    QUEUED_WAIT_LIMIT = 20 * 60
+
+    # At most this many automatic downloads at once from any one peer. A big
+    # share (a DJ pool) turns up in nearly every search and would otherwise
+    # end up with every list's downloads in its queue, hitting its per-user
+    # file limit -- and then the user's own manual downloads from it bounce
+    # with "Too many files" and just sit there as Queued
+    MAX_DOWNLOADS_PER_PEER = 2
+
+    # Filler words in a term that a filename can't be expected to contain
+    IGNORED_TERM_WORDS = {"feat", "ft", "featuring"}
+
+    # Minimum word length for the forgiving comparisons (joined words, one typo)
+    FUZZY_WORD_MIN_LENGTH = 6
+
     QUALITY_LABELS = {
         "any": _("Any"),
         "good": _("Good (192 kbps+)"),
@@ -377,6 +398,8 @@ class DownloadLists:
     # Progressive search term simplification, used to broaden an item's search when no
     # results come back for the exact term (e.g. extra featured artists, remix tags)
     BRACKETED_CONTENT_PATTERN = re.compile(r"[(\[][^)\]]*[)\]]")
+    TERM_SEGMENT_SPLIT_PATTERN = re.compile(r"\s+-\s+")
+    TEXT_TOKEN_PATTERN = re.compile(r"\w+")
     FEATURED_ARTIST_PATTERN = re.compile(r"\s*[(\[]?\b(feat\.?|ft\.?|featuring|with)\b[^-]*", re.IGNORECASE)
     EXTRA_ARTIST_SPLIT_PATTERN = re.compile(r"\s*(?:,|&|\bx\b|\bvs\.?\b)\s*", re.IGNORECASE)
     COLLAPSE_WHITESPACE_PATTERN = re.compile(r"\s+")
@@ -1198,6 +1221,18 @@ class DownloadLists:
                 core.downloads.abort_downloads([transfer], status=TransferStatus.CANCELLED)
                 core.downloads.clear_downloads([transfer])
 
+        self._clear_item_progress(item)
+
+        if download_list.effective_auto_download:
+            self._queue.append((name, term))
+            self._kick_queue()
+
+        events.emit("update-download-list-item", name, term)
+        self._save()
+
+    def _clear_item_progress(self, item):
+        """Back to a freshly added item: no search or download state left."""
+
         self._forget_item(item)
 
         item.status = DownloadListItemStatus.PENDING
@@ -1209,12 +1244,35 @@ class DownloadLists:
         item.download_match_percentage = None
         item.download_percent = 0
 
-        if download_list.effective_auto_download:
-            self._queue.append((name, term))
+    def reset_not_found_items(self, name=None):
+        """Search again for every item marked Not Found -- in one list, or in
+        all of them -- as if it had just been added: e.g. once peers that were
+        offline are back, or after the matching rules changed. Returns how
+        many items were reset."""
+
+        num_reset = 0
+
+        for download_list in self.lists.values():
+            if name is not None and download_list.name != name:
+                continue
+
+            for term, item in download_list.items.items():
+                if item.status != DownloadListItemStatus.NOT_FOUND:
+                    continue
+
+                self._clear_item_progress(item)
+                num_reset += 1
+
+                if download_list.effective_auto_download:
+                    self._queue.append((download_list.name, term))
+
+                events.emit("update-download-list-item", download_list.name, term)
+
+        if num_reset:
+            self._save()
             self._kick_queue()
 
-        events.emit("update-download-list-item", name, term)
-        self._save()
+        return num_reset
 
     def start_item_next(self, name, term):
         """Move an item to the front of the dispatch queue, so it's searched
@@ -1412,6 +1470,37 @@ class DownloadLists:
         self._token = increment_token(self._token)
         return self._token
 
+    def owns_transfer(self, username, virtual_path):
+        """Whether a download was started by a download list (as opposed to
+        queued by hand from a search or browse)."""
+        return (username + virtual_path) in self._transfer_map
+
+    def _peer_is_busy(self, username):
+        """Whether a peer should be passed over for another source, if there
+        is one: it has recently rejected us for having too many files queued,
+        a download the user queued by hand is still waiting in its queue
+        (that one goes first), or our lists already have their share of
+        downloads there (see MAX_DOWNLOADS_PER_PEER)."""
+
+        downloads = core.downloads
+
+        if downloads.is_user_queue_limited(username):
+            return True
+
+        for users in (downloads.queued_users, downloads.failed_users):
+            for virtual_path, transfer in users.get(username, {}).items():
+                if transfer.status == TransferStatus.QUEUED and not self.owns_transfer(username, virtual_path):
+                    return True
+
+        num_active = sum(
+            1
+            for download_list in self.lists.values()
+            for item in download_list.items.values()
+            if item.status == DownloadListItemStatus.DOWNLOADING and item.download_username == username
+        )
+
+        return num_active >= self.MAX_DOWNLOADS_PER_PEER
+
     def _forget_search(self, item):
         """Stop tracking an item's in-flight search state (timers, collected
         candidates, and token bookkeeping). Leaves any active download
@@ -1520,8 +1609,58 @@ class DownloadLists:
         text = text.translate(self.REMOVED_SEARCH_CHARACTERS)
         return self.COLLAPSE_WHITESPACE_PATTERN.sub(" ", text).strip()
 
+    @staticmethod
+    def _fold_text(text):
+        """Lowercase and strip accents ("Lágrimas" -> "lagrimas"), so a term and
+        a filename that only differ in diacritics still match each other."""
+
+        decomposed = unicodedata.normalize("NFKD", text)
+        return "".join(char for char in decomposed if not unicodedata.combining(char)).lower()
+
+    @classmethod
+    def _text_tokens(cls, text):
+        return cls.TEXT_TOKEN_PATTERN.findall(text)
+
     def _term_words(self, term):
-        return [word for word in self._sanitize_text(term).lower().split() if word]
+        return [
+            word for word in self._fold_text(self._sanitize_text(term)).split()
+            if word and word not in self.IGNORED_TERM_WORDS
+        ]
+
+    def _effective_term_words(self, term, path_lower):
+        """The term's words a candidate actually has to contain. A term with an
+        "Artist - Title" (or a Spotify export's "Title - Artist, Artist, Artist")
+        separator is matched per part: once at least one artist of a multi-artist
+        part is found in the candidate's path, the remaining artists become
+        optional. A peer's filename rarely lists every featured or remixing
+        artist a playlist export does, and requiring all of them (with the
+        default 80% threshold) made such tracks "Not Found" while a manual
+        search plainly showed them. The title part (and at least one artist)
+        stays required, so a different track by the same artist still fails."""
+
+        segments = [segment for segment in self.TERM_SEGMENT_SPLIT_PATTERN.split(term) if segment.strip()]
+
+        if len(segments) < 2:
+            return self._term_words(term)
+
+        path_tokens = self._text_tokens(path_lower)
+        words = []
+
+        for segment in segments:
+            unit_words = [self._term_words(unit) for unit in self.EXTRA_ARTIST_SPLIT_PATTERN.split(segment)]
+            unit_words = [unit for unit in unit_words if unit]
+            matched_units = [
+                unit for unit in unit_words
+                if all(self._word_found(word, path_lower, path_tokens) for word in unit)
+            ]
+
+            if matched_units and len(matched_units) < len(unit_words):
+                unit_words = matched_units
+
+            for unit in unit_words:
+                words.extend(unit)
+
+        return words or self._term_words(term)
 
     def _send_search_text(self, item, raw_text):
 
@@ -1530,15 +1669,12 @@ class DownloadLists:
         if not text:
             return
 
-        if "remix" not in self._term_words(item.term):
-            # "-word" is Soulseek search syntax excluding results containing
-            # that word -- added after sanitizing, since "-" is itself one of
-            # the characters _sanitize_text() strips out. A peer that honors
-            # it won't even send back remixes in the first place, on top of
-            # _matches_remix_requirement()'s local backstop for ones that
-            # don't (or for the reverse case: a term that does want a remix
-            # has no single word to exclude the plain original by)
-            text += " -remix"
+        # Deliberately no "-remix" exclusion here even when the term has no
+        # "remix" in it: peers would then never send remixes back at all, and a
+        # track that only exists as a remix (a request typed from memory, or a
+        # Spotify title that already IS one) ended up Not Found although a
+        # manual search showed pages of it. Remixes are instead kept as a
+        # last-resort fallback locally (see _file_search_response)
 
         log.add_search(_('Searching for download list item "%s"'), text)
 
@@ -1577,6 +1713,14 @@ class DownloadLists:
         their filenames)."""
 
         variants = [term]
+
+        # Same term without accents: peers index their filenames verbatim, so a
+        # term with diacritics finds nothing on a peer whose file has none (and
+        # the folded text is what the local matching compares anyway)
+        folded = self._fold_text(term)
+
+        if folded != term.lower():
+            variants.append(folded)
 
         # Drop bracketed/parenthetical content (e.g. "(Radio Edit)", "[Remix]")
         no_brackets = self.COLLAPSE_WHITESPACE_PATTERN.sub(
@@ -1621,6 +1765,21 @@ class DownloadLists:
 
             if title_part and title_part.lower() not in (variant.lower() for variant in variants):
                 variants.append(title_part)
+
+        elif 3 <= len(self._sanitize_text(term).split()) <= 4:
+            # A short, free-form term (typed rather than exported) has no part
+            # to strip -- but a single misspelled word ("kelly clakson stronger")
+            # makes peers return nothing at all. Leaving each word out in turn
+            # finds the track by its remaining words; the local matching then
+            # still checks every ORIGINAL word (tolerating one typo, see
+            # _word_found), so a wrong track can't slip through
+            words = self._sanitize_text(term).split()
+
+            for index in range(len(words)):
+                shorter = " ".join(words[:index] + words[index + 1:])
+
+                if shorter.lower() not in (variant.lower() for variant in variants):
+                    variants.append(shorter)
 
         return variants
 
@@ -1701,7 +1860,55 @@ class DownloadLists:
         return True
 
     @staticmethod
-    def _match_percentage(term_words, filename_lower, path_lower):
+    def _is_one_edit_away(word, other):
+        """Whether two words differ by a single substituted, inserted or
+        deleted character (a typo), e.g. "clakson" and "clarkson"."""
+
+        if word == other:
+            return True
+
+        if abs(len(word) - len(other)) > 1:
+            return False
+
+        if len(word) == len(other):
+            return sum(1 for char_a, char_b in zip(word, other) if char_a != char_b) == 1
+
+        longer, shorter = (word, other) if len(word) > len(other) else (other, word)
+
+        for index in range(len(longer)):
+            if longer[:index] + longer[index + 1:] == shorter:
+                return True
+
+        return False
+
+    @classmethod
+    def _word_found(cls, word, text, text_tokens=None):
+        """Whether a term word occurs in a candidate's (folded, lowercase)
+        filename or path. Beyond the plain substring test, a longer word also
+        counts when the file merely joins or splits it differently ("fourtet"
+        vs "four tet") or differs from it by a single typo ("clakson" vs
+        "clarkson") -- short words are exempt, since one wrong letter turns
+        them into a different word entirely."""
+
+        if word in text:
+            return True
+
+        if len(word) < cls.FUZZY_WORD_MIN_LENGTH:
+            return False
+
+        if word in text.replace(" ", ""):
+            return True
+
+        if text_tokens is None:
+            text_tokens = cls._text_tokens(text)
+
+        return any(
+            len(token) >= cls.FUZZY_WORD_MIN_LENGTH - 1 and cls._is_one_edit_away(word, token)
+            for token in text_tokens
+        )
+
+    @classmethod
+    def _match_percentage(cls, term_words, filename_lower, path_lower):
         """Score how well the search term matches a candidate file. A word
         found in the filename itself counts in full; one found only in a
         parent folder counts for half, since many shares put the artist in
@@ -1717,12 +1924,14 @@ class DownloadLists:
         if not term_words:
             return 100.0
 
+        filename_tokens = cls._text_tokens(filename_lower)
+        path_tokens = cls._text_tokens(path_lower)
         score = 0.0
 
         for word in term_words:
-            if word in filename_lower:
+            if cls._word_found(word, filename_lower, filename_tokens):
                 score += 1.0
-            elif word in path_lower:
+            elif cls._word_found(word, path_lower, path_tokens):
                 score += 0.5
 
         return (score / len(term_words)) * 100
@@ -1821,7 +2030,13 @@ class DownloadLists:
         if core.network_filter.is_user_ip_ignored(username, ip_address):
             return
 
-        term_words = self._term_words(item.term)
+        full_term_words = self._term_words(item.term)
+        term_wants_remix = "remix" in full_term_words
+        # Only a structured "Title - Artist" / "Artist - Title" term (what a
+        # Spotify export produces) names a specific version of a track. A
+        # free-form term typed by hand is a keyword search: "remix" is just
+        # another keyword if it's there, and nothing to vet against if it isn't
+        vet_version = self.TERM_SEGMENT_SPLIT_PATTERN.search(item.term) is not None
         best_score = None
         best_candidate = None
 
@@ -1832,8 +2047,9 @@ class DownloadLists:
             if extension not in self.AUDIO_EXTENSIONS:
                 continue
 
-            path_lower = virtual_path.lower()
+            path_lower = self._fold_text(virtual_path)
             filename_lower = path_lower.replace("\\", "/").rsplit("/", 1)[-1]
+            term_words = self._effective_term_words(item.term, path_lower)
             match_percentage = self._match_percentage(term_words, filename_lower, path_lower)
 
             if match_percentage < download_list.effective_fuzzy_match_threshold:
@@ -1841,11 +2057,21 @@ class DownloadLists:
                 # broadened to find any results at all matched an unrelated track
                 continue
 
-            if not self._matches_remix_requirement(term_words, filename_lower):
-                # A remix of the original term's plain track, or vice versa -- a
+            version_matches = (
+                not vet_version or self._matches_remix_requirement(full_term_words, filename_lower))
+
+            if not version_matches and term_wants_remix:
+                # The term asks for a remix and this is the plain track -- a
                 # different version of the song, no matter how well its other
                 # words otherwise match
                 continue
+
+            # The reverse case -- a remix although the term didn't ask for one --
+            # is kept, but only as a fallback: version_matches leads the score
+            # below, so ANY candidate of the right version outranks every remix.
+            # It just no longer ends in Not Found when the track only exists as
+            # that remix (a request typed from memory, or a Spotify title that
+            # already is a remix without saying so)
 
             _h_quality, bitrate, _h_length, length = FileListMessage.parse_audio_quality_length(size, attributes)
 
@@ -1869,6 +2095,7 @@ class DownloadLists:
             capped_bitrate = min(bitrate, 320)
 
             score = (
+                version_matches,
                 round(match_percentage),
                 bool(msg.freeulslots),
                 keyword_match,
@@ -1911,7 +2138,17 @@ class DownloadLists:
             return
 
         candidates.sort(key=itemgetter(0), reverse=True)
-        _best_score, username, virtual_path, size, attributes = candidates[0]
+
+        # Best candidate from a peer that isn't busy (see _peer_is_busy); the
+        # best one overall only when every source is
+        chosen = next((candidate for candidate in candidates if not self._peer_is_busy(candidate[1])), candidates[0])
+        _best_score, username, virtual_path, size, attributes = chosen
+
+        if chosen is not candidates[0]:
+            log.add_search(
+                _('Taking "%(term)s" from %(user)s instead of busy peer %(busy_user)s'),
+                {"term": term, "user": username, "busy_user": candidates[0][1]}
+            )
 
         # Stop tracking the search itself; we're done with it now
         self._forget_search(item)
@@ -1931,6 +2168,7 @@ class DownloadLists:
         filename_lower = virtual_path.lower().replace("\\", "/").rsplit("/", 1)[-1]
         item.download_match_percentage = round(self._purity_percentage(self._term_words(item.term), filename_lower))
         item.download_percent = 0
+        item.download_start_time = time.time()
         item.stall_timer_id = events.schedule(
             delay=self.stall_timeout, callback=lambda: self._handle_stalled_download(list_name, term))
 
@@ -2049,6 +2287,19 @@ class DownloadLists:
             # schedule, so it could still fire in the exempt window (or even after
             # completion) if it was already in flight. Do nothing and let the ordinary
             # completion handling (or an already-delivered one) stand
+            return
+
+        if (transfer is not None
+                and transfer.status in (TransferStatus.QUEUED, TransferStatus.GETTING_STATUS)
+                and time.time() - (item.download_start_time or time.time()) < self.QUEUED_WAIT_LIMIT):
+            # The peer has accepted the request into its upload queue (also how a
+            # "Too many files" limit is presented, resuming by itself later): nothing
+            # is being sent yet, but that's waiting a turn, not a stall. Cancelling
+            # here used to re-find the same lone source and queue behind everyone
+            # again, over and over -- until a re-search happened to catch a quiet
+            # moment and marked a perfectly available track Not Found
+            item.stall_timer_id = events.schedule(
+                delay=self.stall_timeout, callback=lambda: self._handle_stalled_download(list_name, term))
             return
 
         log.add_search(

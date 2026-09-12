@@ -1067,6 +1067,279 @@ class DownloadListsTest(TestCase):
         self.assertEqual(match(term_words, filename, path), 50.0)
         self.assertLess(match(term_words, filename, path), 70)  # below the default fuzzy threshold
 
+    def test_extra_artists_become_optional_once_title_and_one_artist_match(self):
+        """A Spotify export's "Title - Artist, Artist, Artist" term: a peer's
+        filename that has the title and some of the artists is a full match --
+        the artists it doesn't list aren't held against it (with 8 words and
+        an 80% threshold, missing two of them used to mean Not Found)."""
+
+        lists = core.download_lists
+        term = "Si No Estas - Luna Dusk, Ikarus, MD DJ"
+
+        path = "music/luna dusk, ikarus - si no estas (original mix).mp3"
+        words = lists._effective_term_words(term, path)
+        self.assertEqual(words, ["si", "no", "estas", "luna", "dusk", "ikarus"])
+        self.assertEqual(lists._match_percentage(words, path.rsplit("/", 1)[-1], path), 100.0)
+
+        # Every artist present: nothing is dropped
+        path = "music/ikarus, md dj, luna dusk - si no estas (original mix).mp3"
+        self.assertEqual(len(lists._effective_term_words(term, path)), 8)
+
+    def test_title_and_at_least_one_artist_stay_required(self):
+        """The leniency only covers artists beyond the first match: a different
+        track by the same artist, or the same title by someone else, still
+        falls well short of the threshold."""
+
+        lists = core.download_lists
+        term = "Si No Estas - Luna Dusk, Ikarus, MD DJ"
+
+        # (well below the 80% default threshold -- two-letter words like "si"
+        # and "no" match incidentally almost anywhere, as they always did)
+        path = "music/luna dusk - otra cancion (original mix).mp3"
+        words = lists._effective_term_words(term, path)
+        self.assertLess(lists._match_percentage(words, path.rsplit("/", 1)[-1], path), 60)
+
+        path = "music/somebody else - si no estas.mp3"
+        words = lists._effective_term_words(term, path)
+        self.assertLess(lists._match_percentage(words, path.rsplit("/", 1)[-1], path), 60)
+
+    def test_accents_and_featuring_do_not_block_a_match(self):
+        """"Lágrimas" matches a file named "Lagrimas" (and vice versa), and a
+        "feat." in the term isn't a word the filename has to contain."""
+
+        lists = core.download_lists
+
+        self.assertEqual(lists._term_words("Lágrimas - MESTIZA (feat. Büya)"), ["lagrimas", "mestiza", "buya"])
+
+        term = "Lágrimas - MESTIZA, PAUZA, Argentina"
+        path = lists._fold_text("music/Mestiza, Pauza - Lagrimas (Original Mix).mp3")
+        words = lists._effective_term_words(term, path)
+        self.assertEqual(lists._match_percentage(words, path.rsplit("/", 1)[-1], path), 100.0)
+
+    def test_joined_words_and_single_typos_are_tolerated_in_longer_words(self):
+        """"fourtet" finds "four tet" and "clakson" finds "clarkson"; a short
+        word like "opel" is not bent into "opal", one letter being most of it."""
+
+        match = core.download_lists._match_percentage
+
+        path = "music/bicep - opal [four tet rmx].mp3"
+        self.assertEqual(match(["opal", "bicep", "fourtet"], path.rsplit("/", 1)[-1], path), 100.0)
+
+        path = "music/kelly clarkson - stronger (what doesn't kill you).mp3"
+        self.assertEqual(match(["kelly", "clakson", "stronger"], path.rsplit("/", 1)[-1], path), 100.0)
+
+        path = "music/bicep - opal [four tet rmx].mp3"
+        self.assertLess(match(["bicep", "opel", "fourtet"], path.rsplit("/", 1)[-1], path), 80)
+
+    def test_term_variants_include_accent_folded_and_drop_one_word(self):
+        """The accent-free spelling is searched as well (peers index filenames
+        verbatim), and a short free-form term is also tried with each word
+        left out so one misspelled word can't make it Not Found."""
+
+        variants = core.download_lists._get_term_variants("Lágrimas - MESTIZA")
+        self.assertEqual(variants[:2], ["Lágrimas - MESTIZA", "lagrimas - mestiza"])
+
+        variants = core.download_lists._get_term_variants("kelly clakson stronger")
+        self.assertEqual(
+            variants, ["kelly clakson stronger", "clakson stronger", "kelly stronger", "kelly clakson"])
+
+        # Not for structured terms (they have their own fallbacks) or long ones
+        self.assertEqual(
+            core.download_lists._get_term_variants("Artist - Title"), ["Artist - Title", "Artist", "Title"])
+        self.assertEqual(
+            core.download_lists._get_term_variants("one two three four five"), ["one two three four five"])
+
+    def test_queued_download_is_not_treated_as_stalled(self):
+        """A transfer the peer has accepted into its upload queue (including a
+        "Too many files" limit, which downloads.py presents as Queued and resumes
+        by itself) is waiting its turn: the stall timer just re-arms, until
+        the queued-wait limit is up."""
+
+        from pynicotine.transfers import TransferStatus
+
+        download_list = core.download_lists.add_list(
+            "Queue List", download_folder_path=DATA_FOLDER_PATH, quality="any",
+            fuzzy_match_threshold=50, auto_download=True
+        )
+        core.download_lists.add_list_items("Queue List", ["Busy Artist - Busy Song"])
+
+        item = download_list.items["Busy Artist - Busy Song"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Busy Artist\\Busy Artist - Busy Song.mp3", 8000000, "mp3", attributes)]
+        core.download_lists._file_search_response(self._make_response(item.token, "busyuser", files))
+        core.download_lists._finalize_item("Queue List", "Busy Artist - Busy Song")
+
+        transfer = core.downloads.transfers.get("busyuser" + item.download_virtual_path)
+        self.assertIsNotNone(transfer)
+        transfer.status = TransferStatus.QUEUED
+
+        original_timer_id = item.stall_timer_id
+        core.download_lists._handle_stalled_download("Queue List", "Busy Artist - Busy Song")
+
+        self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
+        self.assertEqual(item.download_username, "busyuser")
+        self.assertIsNotNone(item.stall_timer_id)
+        self.assertNotEqual(item.stall_timer_id, original_timer_id)
+
+        # Queued for longer than the limit: look for another source after all
+        item.download_start_time -= core.download_lists.QUEUED_WAIT_LIMIT + 1
+        core.download_lists._handle_stalled_download("Queue List", "Busy Artist - Busy Song")
+
+        self.assertEqual(item.status, DownloadListItemStatus.PENDING)
+        self.assertIsNone(item.download_username)
+
+    def _dispatch_with_two_sources(self, list_name, term, preferred_user, other_user):
+        """Dispatch an item and feed it a candidate from each of two users, the
+        first with free slots (so it scores higher). Returns the item."""
+
+        download_list = core.download_lists.add_list(
+            list_name, download_folder_path=DATA_FOLDER_PATH, quality="any",
+            fuzzy_match_threshold=50, auto_download=True)
+        core.download_lists.add_list_items(list_name, [term])
+        item = download_list.items[term]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, f"@@abc\\{term}.mp3", 8000000, "mp3", attributes)]
+        core.download_lists._file_search_response(
+            self._make_response(item.token, preferred_user, files, freeulslots=True))
+        core.download_lists._file_search_response(
+            self._make_response(item.token, other_user, files, freeulslots=False, inqueue=3))
+
+        self.assertEqual(len(item.download_candidates), 2)
+        return item
+
+    def test_finalize_avoids_peer_with_a_manual_download_waiting(self):
+        """A download the user queued by hand that is still waiting at a peer
+        goes first: the list takes its download from another source instead
+        of competing for the same peer's per-user slots."""
+
+        from pynicotine.transfers import TransferStatus
+
+        core.downloads.enqueue_download("pooluser", "@@abc\\Hand Picked Song.mp3", size=1000)
+        manual = core.downloads.transfers.get("pooluser@@abc\\Hand Picked Song.mp3")
+        self.assertIsNotNone(manual)
+        manual.status = TransferStatus.QUEUED
+        self.assertFalse(core.download_lists.owns_transfer("pooluser", "@@abc\\Hand Picked Song.mp3"))
+
+        item = self._dispatch_with_two_sources("Manual First List", "Some Artist - Some Song", "pooluser", "otheruser")
+        core.download_lists._finalize_item("Manual First List", "Some Artist - Some Song")
+
+        self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
+        self.assertEqual(item.download_username, "otheruser")
+        self.assertTrue(core.download_lists.owns_transfer("otheruser", item.download_virtual_path))
+
+    def test_finalize_avoids_peer_that_rejected_for_too_many_files(self):
+        """A peer that recently answered "Too many files" is passed over while
+        its requests are being paced."""
+
+        core.downloads._user_queue_limits["pooluser"] = 5
+        try:
+            item = self._dispatch_with_two_sources("Limited Peer List", "Busy Artist - Song", "pooluser", "otheruser")
+            core.download_lists._finalize_item("Limited Peer List", "Busy Artist - Song")
+        finally:
+            core.downloads._user_queue_limits.pop("pooluser", None)
+
+        self.assertEqual(item.download_username, "otheruser")
+
+    def test_finalize_caps_automatic_downloads_per_peer(self):
+        """Once a peer already has MAX_DOWNLOADS_PER_PEER of our automatic
+        downloads, further items take another source when there is one --
+        and still the capped peer when it is the only source."""
+
+        download_list = core.download_lists.add_list("Cap List", quality="any", auto_download=True)
+        core.download_lists.add_list_items("Cap List", ["First Song", "Second Song"])
+
+        for term in ("First Song", "Second Song"):
+            item = download_list.items[term]
+            item.status = DownloadListItemStatus.DOWNLOADING
+            item.download_username = "pooluser"
+
+        self.assertTrue(core.download_lists._peer_is_busy("pooluser"))
+        self.assertFalse(core.download_lists._peer_is_busy("otheruser"))
+
+        item = self._dispatch_with_two_sources("Cap Test List", "Third Artist - Third Song", "pooluser", "otheruser")
+        core.download_lists._finalize_item("Cap Test List", "Third Artist - Third Song")
+        self.assertEqual(item.download_username, "otheruser")
+
+        item = self._dispatch_with_two_sources("Cap Only List", "Fourth Artist - Fourth Song", "pooluser", "pooluser")
+        core.download_lists._finalize_item("Cap Only List", "Fourth Artist - Fourth Song")
+        self.assertEqual(item.download_username, "pooluser")
+
+    def test_limited_retries_put_manual_downloads_before_list_downloads(self):
+        """When a peer's "Too many files" rejections are retried a few at a
+        time, downloads queued by hand are tried before a list's automatic
+        ones, whatever order they were queued in."""
+
+        from pynicotine.slskmessages import TransferRejectReason
+
+        download_list = core.download_lists.add_list("Retry List", quality="any", auto_download=True)
+        core.download_lists.add_list_items("Retry List", ["List Song"])
+        item = download_list.items["List Song"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\List Song.mp3", 8000000, "mp3", attributes)]
+        core.download_lists._file_search_response(self._make_response(item.token, "pooluser", files))
+        core.download_lists._finalize_item("Retry List", "List Song")
+
+        automatic = core.downloads.transfers.get("pooluser@@abc\\List Song.mp3")
+        core.downloads.enqueue_download("pooluser", "@@abc\\Hand Picked Song.mp3", size=1000)
+        manual = core.downloads.transfers.get("pooluser@@abc\\Hand Picked Song.mp3")
+        self.assertIsNotNone(automatic)
+        self.assertIsNotNone(manual)
+
+        # Both bounced off the peer's limit, the automatic one first
+        for transfer in (automatic, manual):
+            core.downloads._abort_transfer(transfer, status=TransferRejectReason.QUEUED)
+
+        failed_paths = [
+            virtual_path for virtual_path in core.downloads.failed_users["pooluser"]
+            if virtual_path in (automatic.virtual_path, manual.virtual_path)]
+        self.assertEqual(failed_paths, [automatic.virtual_path, manual.virtual_path])
+
+        core.downloads._user_queue_limits["pooluser"] = 1
+        core.downloads._enqueue_limited_transfers("pooluser")
+
+        # Only one retry allowed: it went to the manual download
+        self.assertNotEqual(manual.status, TransferRejectReason.QUEUED)
+        self.assertEqual(automatic.status, TransferRejectReason.QUEUED)
+
+    def test_reset_not_found_items_requeues_every_not_found_song(self):
+        """Every Not Found item in every list goes back to Pending and into the
+        search queue; items in any other state are left alone."""
+
+        first = core.download_lists.add_list("Retry All A", quality="any", auto_download=True)
+        second = core.download_lists.add_list("Retry All B", quality="any", auto_download=True)
+        core.download_lists.add_list_items("Retry All A", ["Missing One", "Found One"])
+        core.download_lists.add_list_items("Retry All B", ["Missing Two"])
+
+        for download_list, term in ((first, "Missing One"), (second, "Missing Two")):
+            item = download_list.items[term]
+            item.status = DownloadListItemStatus.NOT_FOUND
+            item.searched_term = term.lower()
+
+        found = first.items["Found One"]
+        found.status = DownloadListItemStatus.COMPLETED
+        found.download_username = "someuser"
+
+        core.download_lists._queue.clear()
+
+        self.assertEqual(core.download_lists.reset_not_found_items(), 2)
+
+        for download_list, term in ((first, "Missing One"), (second, "Missing Two")):
+            item = download_list.items[term]
+            self.assertIn(item.status, (DownloadListItemStatus.PENDING, DownloadListItemStatus.SEARCHING))
+            self.assertIsNone(item.download_username)
+
+        self.assertEqual(found.status, DownloadListItemStatus.COMPLETED)
+        self.assertEqual(found.download_username, "someuser")
+
+        # Nothing left to reset
+        self.assertEqual(core.download_lists.reset_not_found_items(), 0)
+
     def test_save_and_load_round_trip(self):
         """Verify a list with items survives a save + reload cycle."""
 
@@ -1473,10 +1746,11 @@ class DownloadListsTest(TestCase):
 
         self.assertEqual(item.download_candidates, [])
 
-    def test_remix_candidate_rejected_when_term_has_no_remix(self):
+    def test_remix_candidate_is_only_a_fallback_when_term_has_no_remix(self):
         """The original term doesn't say "remix" -- a candidate that's some
-        specific remix is a different version of the track and must not be
-        picked, no matter how well its other words otherwise match."""
+        specific remix is kept, but any candidate of the right (plain) version
+        beats it, however much better the remix's bitrate or slots are. It only
+        gets downloaded when nothing else turned up, instead of Not Found."""
 
         download_list = core.download_lists.add_list(
             "No Remix List", quality="any", fuzzy_match_threshold=50, auto_download=True)
@@ -1485,13 +1759,72 @@ class DownloadListsTest(TestCase):
         item = download_list.items["Blissful Thinking - Das Pharaoh"]
         core.download_lists._dispatch_item(download_list, item)
 
+        remix_attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        remix_files = [
+            (1, "@@abc\\Das Pharaoh - Blissful Thinking (Someone Remix).mp3", 8000000, "mp3", remix_attributes)]
+        core.download_lists._file_search_response(
+            self._make_response(item.token, "remixuser", remix_files, freeulslots=True))
+
+        self.assertEqual(len(item.download_candidates), 1)
+
+        plain_attributes = FileAttributes(bitrate=128, length=200, vbr=0)
+        plain_files = [(1, "@@abc\\Das Pharaoh - Blissful Thinking.mp3", 4000000, "mp3", plain_attributes)]
+        core.download_lists._file_search_response(
+            self._make_response(item.token, "plainuser", plain_files, freeulslots=False, inqueue=5))
+
+        self.assertEqual(len(item.download_candidates), 2)
+
+        core.download_lists._finalize_item("No Remix List", "Blissful Thinking - Das Pharaoh")
+
+        self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
+        self.assertEqual(item.download_username, "plainuser")
+
+    def test_typed_term_ignores_remix_status_entirely(self):
+        """A free-form term typed by hand (no "Title - Artist" separator) is a
+        keyword search: a remix and the plain track are equal candidates, and
+        whichever is otherwise better (here: free slots) is picked."""
+
+        download_list = core.download_lists.add_list(
+            "Typed List", quality="any", fuzzy_match_threshold=50, auto_download=True)
+        core.download_lists.add_list_items("Typed List", ["bicep atlas"])
+
+        item = download_list.items["bicep atlas"]
+        core.download_lists._dispatch_item(download_list, item)
+
         attributes = FileAttributes(bitrate=320, length=200, vbr=0)
-        files = [(1, "@@abc\\Das Pharaoh - Blissful Thinking (Someone Remix).mp3", 8000000, "mp3", attributes)]
-        msg = self._make_response(item.token, "someuser", files)
+        plain_files = [(1, "@@abc\\Bicep - Atlas (Original Mix).mp3", 8000000, "mp3", attributes)]
+        remix_files = [(1, "@@abc\\Bicep - Atlas (Someone Remix).mp3", 8000000, "mp3", attributes)]
+        core.download_lists._file_search_response(
+            self._make_response(item.token, "plainuser", plain_files, freeulslots=False))
+        core.download_lists._file_search_response(
+            self._make_response(item.token, "remixuser", remix_files, freeulslots=True))
 
-        core.download_lists._file_search_response(msg)
+        self.assertEqual(len(item.download_candidates), 2)
+        # Neither candidate carries a version penalty
+        self.assertTrue(all(candidate[0][0] for candidate in item.download_candidates))
 
-        self.assertEqual(item.download_candidates, [])
+        core.download_lists._finalize_item("Typed List", "bicep atlas")
+        self.assertEqual(item.download_username, "remixuser")
+
+    def test_remix_candidate_downloaded_when_nothing_else_exists(self):
+        """A structured term whose track only exists as a remix (e.g. a Spotify
+        title that already is a remix without saying so) is downloaded as that
+        remix rather than ending in Not Found."""
+
+        download_list = core.download_lists.add_list(
+            "Remix Only List", quality="any", fuzzy_match_threshold=50, auto_download=True)
+        core.download_lists.add_list_items("Remix Only List", ["Wait - M83, David Mackay"])
+
+        item = download_list.items["Wait - M83, David Mackay"]
+        core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=296, vbr=0)
+        files = [(1, "@@abc\\m83 - wait (shimza, ewerseen, david mackay remix).mp3", 11000000, "mp3", attributes)]
+        core.download_lists._file_search_response(self._make_response(item.token, "someuser", files))
+        core.download_lists._finalize_item("Remix Only List", "Wait - M83, David Mackay")
+
+        self.assertEqual(item.status, DownloadListItemStatus.DOWNLOADING)
+        self.assertTrue(item.download_virtual_path.endswith("david mackay remix).mp3"))
 
     def test_plain_candidate_rejected_when_term_wants_remix(self):
         """The original term explicitly asks for a remix -- a candidate that's
@@ -1618,11 +1951,10 @@ class DownloadListsTest(TestCase):
 
         self.assertEqual(item.download_candidates, [])
 
-    def test_search_text_excludes_remix_when_term_has_no_remix(self):
-        """"-word" is Soulseek search syntax excluding results containing that
-        word -- appended to the actual network search request (not just
-        filtered locally afterwards) when the term itself has no remix, so a
-        peer that honors it won't send remixes back in the first place."""
+    def test_search_text_does_not_exclude_remix_when_term_has_no_remix(self):
+        """No "-remix" exclusion is added to the network search request: peers
+        would then never return a track that only exists as a remix, which
+        is instead handled locally as a fallback candidate."""
 
         from pynicotine.events import events
         from pynicotine.slskmessages import FileSearch
@@ -1644,7 +1976,8 @@ class DownloadListsTest(TestCase):
 
         searches = [msg for msg in sent_messages if isinstance(msg, FileSearch)]
         self.assertEqual(len(searches), 1)
-        self.assertTrue(searches[0].searchterm.endswith(" -remix"))
+        self.assertNotIn("-remix", searches[0].searchterm)
+        self.assertEqual(searches[0].searchterm, "Blissful Thinking Das Pharaoh")
 
     def test_search_text_does_not_exclude_remix_when_term_wants_one(self):
         """The term already asks for a remix -- excluding "remix" from its own

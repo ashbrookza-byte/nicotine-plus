@@ -59,6 +59,7 @@ import json
 import os
 import re
 import threading
+import time
 import unicodedata
 
 from urllib.error import HTTPError
@@ -890,6 +891,11 @@ class LexiconSync:
     # Lexicon is closed, a pass costs one refused localhost connection.
     POLL_INTERVAL = 60
 
+    # How long Lexicon may stay unreachable (after the prompt about it went
+    # unanswered) before waiting songs are searched for without the library
+    # check, instead of sitting at "Checking…" indefinitely
+    LIBRARY_CHECK_GRACE = 5 * 60
+
     def __init__(self):
 
         self.state_file_path = os.path.join(config.data_folder_path, self.STATE_FILE_BASENAME)
@@ -918,6 +924,7 @@ class LexiconSync:
         # been shown for the current outage, so it doesn't reappear on every
         # background retry (a user-initiated Retry resets it)
         self._unreachable_notified = False
+        self._unreachable_since = None
 
         for event_name, callback in (
             ("start", self._start),
@@ -1262,14 +1269,30 @@ class LexiconSync:
 
         except LexiconAPIError as error:
             log.add_debug("Lexicon: library check blocked, Lexicon unreachable: %s", error)
+            now = time.time()
+
+            if self._unreachable_since is None:
+                self._unreachable_since = now
 
             if not self._unreachable_notified:
                 self._unreachable_notified = True
                 events.invoke_main_thread(events.emit, "lexicon-unreachable", len(waiting))
 
+            elif now - self._unreachable_since >= self.LIBRARY_CHECK_GRACE:
+                # The prompt went unanswered (or unseen) and Lexicon has stayed down:
+                # don't leave the songs at "Checking…" forever. They're searched for
+                # without the check (so one already owned may be re-downloaded); the
+                # next outage starts a fresh grace period
+                log.add(_("Lexicon: still not reachable after %(minutes)i minutes, searching for "
+                          "%(num)s waiting song(s) without checking the library first"),
+                        {"minutes": self.LIBRARY_CHECK_GRACE // 60, "num": len(waiting)})
+                self._unreachable_since = None
+                events.invoke_main_thread(core.download_lists.release_library_check_items)
+
             return
 
         self._unreachable_notified = False
+        self._unreachable_since = None
         self._save_state()
 
         member_cache = {}

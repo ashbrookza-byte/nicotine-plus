@@ -323,9 +323,12 @@ class Config:
                 "maxresults": 300,
                 "enable_history": True,
                 "history": [],
-                "enablefilters": False,
-                "filters_visible": False,
-                "defilter": [],
+                # Result filters on by default, with only the "Free slot" filter
+                # set: a result from a peer with no free upload slot won't
+                # download any time soon, so it's only in the way
+                "enablefilters": True,
+                "filters_visible": True,
+                "defilter": ["", "", "", "", True, "", "", "", False],
                 "filtercc": [],
                 "filterin": [],
                 "filterout": [],

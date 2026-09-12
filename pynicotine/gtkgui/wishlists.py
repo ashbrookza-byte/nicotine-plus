@@ -22,6 +22,7 @@ from pynicotine.gtkgui.widgets.filechooser import FolderChooser
 from pynicotine.gtkgui.widgets.popupmenu import PopupMenu
 from pynicotine.gtkgui.widgets.theme import add_css_class
 from pynicotine.gtkgui.widgets.treeview import TreeView
+from pynicotine.logfacility import log
 from pynicotine.spotifywatch import SPOTIFY_SCRAPER_AVAILABLE
 
 
@@ -1044,6 +1045,7 @@ class Wishlists:
             self.list_settings_button,
             self.lists_pane,
             self.pause_resume_button,
+            self.retry_not_found_button,
             self.spotify_category_section,
             self.spotify_completed_lists_container,
             self.spotify_completed_section,
@@ -1736,6 +1738,39 @@ class Wishlists:
 
     def on_wishlist_settings(self, *_args):
         WishlistSettingsDialog(self.window.application, self.on_wishlist_settings_saved).present()
+
+    def on_retry_not_found(self, *_args):
+        """Search again for every Not Found song across all lists, after
+        confirming how many that is."""
+
+        num_not_found = sum(
+            download_list.num_not_found for download_list in core.download_lists.lists.values())
+
+        if not num_not_found:
+            log.add(_("No songs are marked Not Found"))
+            return
+
+        OptionDialog(
+            application=self.window.application,
+            title=_("Retry Not Found Songs?"),
+            message=_(
+                "Search again for the %(num)s song(s) marked Not Found across all lists? Each one is "
+                "queued as if it had just been added, and lists that are paused stay paused."
+            ) % {"num": num_not_found},
+            buttons=[
+                ("cancel", _("_Cancel")),
+                ("ok", _("_Retry"))
+            ],
+            callback=self.on_retry_not_found_response
+        ).present()
+
+    def on_retry_not_found_response(self, _dialog, response_id, _data):
+
+        if response_id != "ok":
+            return
+
+        num_reset = core.download_lists.reset_not_found_items()
+        log.add(_("Searching again for %(num)s song(s) previously marked Not Found"), {"num": num_reset})
 
     def on_popup_lists_menu(self, menu, _widget):
         """Right-clicking a row selects it first, so by the time this fires,

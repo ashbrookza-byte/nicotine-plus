@@ -49,6 +49,18 @@
               </object>
             </child>
             <child>
+              <object class="GtkButton" id="retry_not_found_button">
+                <property name="label" translatable="yes">Retry _Not Found…</property>
+                <property name="tooltip-text" translatable="yes">Search again for every song marked Not Found, in all lists</property>
+                <property name="margin-bottom">6</property>
+                <property name="margin-end">6</property>
+                <property name="margin-start">6</property>
+                <property name="use-underline">True</property>
+                <property name="visible">True</property>
+                <signal name="clicked" handler="on_retry_not_found"/>
+              </object>
+            </child>
+            <child>
               <object class="GtkLabel" id="folders_heading">
                 <property name="label" translatable="yes">Folders</property>
                 <property name="xalign">0</property>

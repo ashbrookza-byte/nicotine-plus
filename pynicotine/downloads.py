@@ -385,6 +385,21 @@ class Downloads(Transfers):
 
         return True
 
+    def is_user_queue_limited(self, username):
+        """Whether this user recently rejected a download request for having
+        too many of our files queued, so further requests are being paced."""
+        return username in self._user_queue_limits
+
+    @staticmethod
+    def _is_automatic_download(download):
+        """Whether a download was started by a download list rather than
+        queued by hand from a search or browse."""
+
+        if core.download_lists is None:
+            return False
+
+        return core.download_lists.owns_transfer(download.username, download.virtual_path)
+
     def _enqueue_limited_transfers(self, username):
 
         num_limited_transfers = 0
@@ -393,10 +408,18 @@ class Downloads(Transfers):
         if queue_size_limit is None:
             return
 
-        for download in self.failed_users.get(username, {}).copy().values():
-            if download.status != TransferRejectReason.QUEUED:
-                continue
+        limited_downloads = [
+            download for download in self.failed_users.get(username, {}).copy().values()
+            if download.status == TransferRejectReason.QUEUED
+        ]
 
+        # Downloads queued by hand go first. The peer's per-user limit is what
+        # bounced these, and a download list's automatic transfers to the same
+        # peer must not keep taking its slots ahead of something the user
+        # picked out and clicked on themselves
+        limited_downloads.sort(key=self._is_automatic_download)
+
+        for download in limited_downloads:
             if num_limited_transfers >= queue_size_limit:
                 # Only enqueue a small number of downloads at a time
                 return
