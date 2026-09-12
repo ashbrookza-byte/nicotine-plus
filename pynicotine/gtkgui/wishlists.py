@@ -2045,7 +2045,7 @@ class Wishlists:
             return _("Not Found\n\nNo file resembling this term was seen in any of its searches.")
 
         lines = [
-            _("%(file)s \u2014 %(match)s%% match, searched as \u201c%(term)s\u201d") % {
+            _("%(file)s: %(match)s%% match, searched as \u201c%(term)s\u201d") % {
                 "file": suggestion["filename"].replace("\\", "/").rsplit("/", 1)[-1],
                 "match": suggestion["match"], "term": suggestion["searched_term"]}
             for suggestion in item.suggestions
