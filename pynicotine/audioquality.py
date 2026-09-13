@@ -7,17 +7,21 @@ A lossy encode throws away everything above a cutoff frequency that depends
 on its bitrate (roughly 16 kHz at 128 kbps, 19-20 kHz at 320 kbps), and
 re-encoding such a file as "320 kbps" or FLAC doesn't bring that content
 back. Spek shows this as a hard horizontal edge in the spectrogram; this
-module measures the same edge from a slice of the file, so a download whose
-claimed quality is a fake can be thrown out and searched for again.
+module measures the same edge, so a download whose claimed quality is a fake
+can be thrown out and searched for again.
 
-Decoding is done by ffmpeg (or afconvert on macOS) to raw mono PCM; the
-spectrum itself is a small pure-Python FFT over a few dozen windows spread
-over several segments of the whole track (a quiet intro or breakdown has
-little treble of its own, so the segment with the most decides), which takes
-well under a second in a background thread and needs no extra packages.
+ffmpeg (or afconvert on macOS) decodes short slices from several points of
+the track to 16-bit stereo PCM; a small pure-Python FFT averages a handful
+of windows per slice into a spectrum, and the cutoff is where sustained
+band averages sink into the treble noise floor. Each channel and each slice
+is judged on its own and the highest cutoff wins: a band-limited encode
+never exceeds its cutoff anywhere, while a real file only has to somewhere
+(a quiet intro, a breakdown, or one channel of an odd stereo mix has little
+treble of its own). No extra Python packages are needed.
 """
 
 import cmath
+import json
 import math
 import os
 import shutil
@@ -28,20 +32,36 @@ import tempfile
 import wave
 
 SAMPLE_RATE = 44100
+NUM_CHANNELS = 2
+BYTES_PER_FRAME = 2 * NUM_CHANNELS
 WINDOW_SIZE = 4096
-NUM_SEGMENTS = 6
 WINDOWS_PER_SEGMENT = 8
-MAX_ANALYSIS_SECONDS = 12 * 60
+SEGMENT_FRAMES = WINDOW_SIZE * WINDOWS_PER_SEGMENT
+SEGMENT_SECONDS = SEGMENT_FRAMES / SAMPLE_RATE
+NUM_SEGMENTS = 6
 
-# How far above the spectrum's noise floor a band must be to count as content,
-# and how wide a band is (32 bins of a 4096-point window at 44.1 kHz = 344 Hz)
+# Without a known duration (no ffprobe), this much is decoded from the start
+# and the segments are spread over it
+FALLBACK_DECODE_SECONDS = 5 * 60
+DECODE_TIMEOUT = 120
+
+# How far above the treble noise floor a band must average to count as
+# content, how wide a band is (32 bins of a 4096-point window at 44.1 kHz is
+# 344 Hz), how far below the loudest low/mid band the floor is taken to be
+# at most (content that reaches Nyquist evenly, e.g. noisy or very bright
+# material, has no quiet treble band to read the floor from), and below what
+# peak level a slice counts as silence
 NOISE_MARGIN_DB = 12.0
 BAND_BINS = 32
+MAX_FLOOR_BELOW_PEAK_DB = 60.0
+SILENCE_PEAK_DB = -70.0
 
 # Highest cutoff a lossy encode at each bitrate typically leaves, best first.
-# A measured cutoff is reported as the first class it reaches
+# A measured cutoff is reported as the first class it reaches. A 320 kbps
+# LAME encode lowpasses at 20.5 kHz and reads about 20.3 here; real lossless
+# from a full-range master reads above 20.6
 QUALITY_CLASSES = (
-    (20500, "lossless"),
+    (20600, "lossless"),
     (19200, 320),
     (18300, 256),
     (17200, 192),
@@ -51,16 +71,15 @@ QUALITY_CLASSES = (
 )
 
 # Lowest cutoff a download list's quality preference accepts. "high" means
-# 320 kbps or lossless, so a file whose content stops well below where a
-# real 320 kbps encode stops was made from something worse
+# 320 kbps or lossless; a cutoff below 19 kHz means the content came from a
+# 192 kbps or worse encode, whatever the file claims. (256 vs 320 can't be
+# told apart this way, and isn't worth rejecting a download over.)
 REQUIRED_CUTOFF_HZ = {
-    "lossless": 20000,
+    "lossless": 20600,
     "high": 19000,
     "good": 17500,
     "any": 0
 }
-
-MAX_CLASS_LABELS = {"lossless": "lossless"}
 
 
 class QualityReport:
@@ -87,52 +106,149 @@ class QualityReport:
         return f"{self.cutoff_hz / 1000:.1f} kHz cutoff ({self.effective_quality_label})"
 
 
+# Decoding #
+
+def _afconvert_path():
+
+    if sys.platform != "darwin":
+        return None
+
+    path = "/usr/bin/afconvert"
+    return path if os.path.exists(path) else None
+
+
 def decoder_available():
-
-    if shutil.which("ffmpeg") is not None:
-        return True
-
-    return sys.platform == "darwin" and os.path.exists("/usr/bin/afconvert")
+    return shutil.which("ffmpeg") is not None or _afconvert_path() is not None
 
 
-def _decode_with_ffmpeg(ffmpeg_path, file_path, seconds):
+def _run(command):
 
-    command = [
-        ffmpeg_path, "-v", "error", "-nostdin", "-i", file_path, "-t", str(seconds),
-        "-vn", "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "-"
-    ]
-    result = subprocess.run(command, capture_output=True, timeout=120, check=False)
-    return result.stdout
+    result = subprocess.run(command, capture_output=True, timeout=DECODE_TIMEOUT, check=False)
+    return result.stdout if result.returncode == 0 else b""
 
 
-def _decode_with_afconvert(file_path, seconds):
+def probe_duration(file_path):
+    """Length of the file's audio in seconds, or None if it can't be told."""
 
-    with tempfile.TemporaryDirectory() as folder_path:
-        wav_path = os.path.join(folder_path, "decoded.wav")
-        command = [
-            "/usr/bin/afconvert", "-f", "WAVE", "-d", f"LEI16@{SAMPLE_RATE}", "-c", "1", file_path, wav_path]
-        subprocess.run(command, capture_output=True, timeout=120, check=False)
+    ffprobe_path = shutil.which("ffprobe")
 
-        if not os.path.exists(wav_path):
+    if ffprobe_path is None:
+        return None
+
+    output = _run([
+        ffprobe_path, "-v", "error", "-select_streams", "a:0", "-show_entries", "format=duration",
+        "-of", "json", file_path
+    ])
+
+    try:
+        duration = float(json.loads(output)["format"]["duration"])
+
+    except (ValueError, KeyError, TypeError):
+        return None
+
+    return duration if duration > 0 else None
+
+
+def _decode_with_ffmpeg(ffmpeg_path, file_path, start_seconds, seconds):
+
+    return _run([
+        ffmpeg_path, "-v", "error", "-nostdin", "-ss", f"{start_seconds:.3f}", "-i", file_path,
+        "-t", f"{seconds:.3f}", "-map", "0:a:0", "-vn", "-f", "s16le", "-ac", str(NUM_CHANNELS),
+        "-ar", str(SAMPLE_RATE), "-"
+    ])
+
+
+class _AfconvertDecoder:
+    """afconvert has no seeking, so the whole file is converted to a
+    temporary WAV once and slices are read from that."""
+
+    def __init__(self, afconvert_path, file_path):
+
+        self.folder_path = tempfile.mkdtemp(prefix="nicotine-audioquality-")
+        self.wav_path = os.path.join(self.folder_path, "decoded.wav")
+
+        _run([
+            afconvert_path, "-f", "WAVE", "-d", f"LEI16@{SAMPLE_RATE}", "-c", str(NUM_CHANNELS),
+            file_path, self.wav_path
+        ])
+
+    def duration(self):
+
+        try:
+            with wave.open(self.wav_path, "rb") as handle:
+                return handle.getnframes() / SAMPLE_RATE
+
+        except (OSError, wave.Error, EOFError):
+            return None
+
+    def read(self, start_seconds, seconds):
+
+        try:
+            with wave.open(self.wav_path, "rb") as handle:
+                handle.setpos(min(int(start_seconds * SAMPLE_RATE), handle.getnframes()))
+                return handle.readframes(int(seconds * SAMPLE_RATE))
+
+        except (OSError, wave.Error, EOFError):
             return b""
 
-        with wave.open(wav_path, "rb") as handle:
-            return handle.readframes(int(seconds * SAMPLE_RATE))
+    def close(self):
+        shutil.rmtree(self.folder_path, ignore_errors=True)
 
 
-def decode_pcm(file_path, seconds=MAX_ANALYSIS_SECONDS):
-    """Mono 16-bit PCM of the file (up to the given length)."""
+def decode_segments(file_path):
+    """Yield raw 16-bit stereo PCM for NUM_SEGMENTS slices spread evenly over
+    the track (one slice from the start if its length can't be told)."""
 
     ffmpeg_path = shutil.which("ffmpeg")
+    afconvert = None
 
     if ffmpeg_path is not None:
-        return _decode_with_ffmpeg(ffmpeg_path, file_path, seconds)
+        duration = probe_duration(file_path)
 
-    if sys.platform == "darwin" and os.path.exists("/usr/bin/afconvert"):
-        return _decode_with_afconvert(file_path, seconds)
+        def read(start_seconds, seconds):
+            return _decode_with_ffmpeg(ffmpeg_path, file_path, start_seconds, seconds)
 
-    return b""
+    else:
+        afconvert_path = _afconvert_path()
 
+        if afconvert_path is None:
+            return
+
+        afconvert = _AfconvertDecoder(afconvert_path, file_path)
+        duration = afconvert.duration()
+        read = afconvert.read
+
+    try:
+        if duration is None:
+            pcm = read(0, FALLBACK_DECODE_SECONDS)
+            num_frames = len(pcm) // BYTES_PER_FRAME
+
+            for start_frame in _segment_starts(num_frames):
+                start_frame = int(start_frame)
+                yield pcm[start_frame * BYTES_PER_FRAME:(start_frame + SEGMENT_FRAMES) * BYTES_PER_FRAME]
+
+            return
+
+        for start_seconds in _segment_starts(duration, seconds=True):
+            yield read(start_seconds, SEGMENT_SECONDS)
+
+    finally:
+        if afconvert is not None:
+            afconvert.close()
+
+
+def _segment_starts(length, seconds=False):
+    """Start positions of NUM_SEGMENTS slices spread over a track of the
+    given length (frames, or seconds), fewer for a short one."""
+
+    segment_length = SEGMENT_SECONDS if seconds else SEGMENT_FRAMES
+    num_segments = max(1, min(NUM_SEGMENTS, int(length // segment_length)))
+    usable = max(0, length - segment_length)
+
+    return [usable * (index + 0.5) / num_segments for index in range(num_segments)]
+
+
+# Spectrum #
 
 def _fft(values):
     """In-place iterative radix-2 FFT of a list of complex numbers whose
@@ -174,17 +290,20 @@ def _fft(values):
     return values
 
 
-def average_spectrum_db(pcm, num_windows=WINDOWS_PER_SEGMENT, window_size=WINDOW_SIZE):
-    """Average power per frequency bin, in dB, over windows spread evenly
-    across the PCM. None when there's too little audio to judge."""
+_HANN = [0.5 - 0.5 * math.cos(2 * math.pi * i / WINDOW_SIZE) for i in range(WINDOW_SIZE)]
 
-    num_samples = len(pcm) // 2
+
+def average_spectrum_db(samples, num_windows=WINDOWS_PER_SEGMENT, window_size=WINDOW_SIZE):
+    """Average power per frequency bin, in dB, over windows spread evenly
+    across a sequence of 16-bit samples. None with too few samples."""
+
+    num_samples = len(samples)
 
     if num_samples < window_size:
         return None
 
-    samples = struct.unpack(f"<{num_samples}h", pcm[:num_samples * 2])
-    hann = [0.5 - 0.5 * math.cos(2 * math.pi * i / window_size) for i in range(window_size)]
+    hann = _HANN if window_size == WINDOW_SIZE else [
+        0.5 - 0.5 * math.cos(2 * math.pi * i / window_size) for i in range(window_size)]
     num_bins = window_size // 2 + 1
     power = [0.0] * num_bins
     num_windows = max(1, min(num_windows, num_samples // window_size))
@@ -214,7 +333,7 @@ def cutoff_frequency(spectrum_db, sample_rate=SAMPLE_RATE):
     bin_hz = sample_rate / 2 / (num_bins - 1)
     peak_db = max(spectrum_db[int(200 / bin_hz):int(8000 / bin_hz)])
 
-    if peak_db < -70:
+    if peak_db < SILENCE_PEAK_DB:
         return None
 
     band_means = [
@@ -223,7 +342,7 @@ def cutoff_frequency(spectrum_db, sample_rate=SAMPLE_RATE):
     ]
     first_treble_band = int(4000 / bin_hz) // BAND_BINS
     treble_bands = sorted(band_means[first_treble_band:])
-    floor_db = treble_bands[len(treble_bands) // 50]
+    floor_db = min(treble_bands[len(treble_bands) // 50], peak_db - MAX_FLOOR_BELOW_PEAK_DB)
     threshold_db = max(floor_db + NOISE_MARGIN_DB, peak_db - 80)
 
     for band_index in range(len(band_means) - 1, -1, -1):
@@ -233,34 +352,49 @@ def cutoff_frequency(spectrum_db, sample_rate=SAMPLE_RATE):
     return 0.0
 
 
+def split_channels(pcm):
+    """Left and right sample sequences of interleaved 16-bit stereo PCM."""
+
+    num_samples = len(pcm) // 2
+    samples = struct.unpack(f"<{num_samples}h", pcm[:num_samples * 2])
+    return samples[0::NUM_CHANNELS], samples[1::NUM_CHANNELS]
+
+
+def analyze_pcm_segments(segments):
+    """Highest cutoff found in any channel of any of the given PCM slices,
+    or None when none of them could be judged."""
+
+    cutoffs = []
+
+    for pcm in segments:
+        if len(pcm) < WINDOW_SIZE * BYTES_PER_FRAME:
+            continue
+
+        left, right = split_channels(pcm)
+        channels = (left,) if left == right else (left, right)
+
+        for samples in channels:
+            spectrum_db = average_spectrum_db(samples)
+
+            if spectrum_db is None:
+                continue
+
+            cutoff_hz = cutoff_frequency(spectrum_db)
+
+            if cutoff_hz is not None:
+                cutoffs.append(cutoff_hz)
+
+    return max(cutoffs) if cutoffs else None
+
+
 def analyze_file(file_path):
     """QualityReport for an audio file, or None when it can't be judged
     (no decoder, unreadable, too short, or silent)."""
 
     try:
-        pcm = decode_pcm(file_path)
+        cutoff_hz = analyze_pcm_segments(decode_segments(file_path))
 
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
-    num_samples = len(pcm) // 2
-    segment_samples = max(WINDOW_SIZE * WINDOWS_PER_SEGMENT, num_samples // NUM_SEGMENTS)
-    cutoffs = []
-
-    for start in range(0, num_samples, segment_samples):
-        spectrum_db = average_spectrum_db(pcm[start * 2:(start + segment_samples) * 2])
-
-        if spectrum_db is None:
-            continue
-
-        cutoff_hz = cutoff_frequency(spectrum_db)
-
-        if cutoff_hz is not None:
-            cutoffs.append(cutoff_hz)
-
-    if not cutoffs:
-        return None
-
-    # The segment with the most treble decides: a band-limited encode never
-    # exceeds its cutoff anywhere, while a real one only needs to somewhere
-    return QualityReport(max(cutoffs))
+    return QualityReport(cutoff_hz) if cutoff_hz is not None else None

@@ -128,6 +128,15 @@ class DownloadListItem:
         self.download_start_time = None
 
     @property
+    def h_measured_quality(self):
+        """What the spectrum check found, e.g. "19.6 kHz (~320 kbps)"."""
+
+        if self.quality_cutoff_hz is None:
+            return ""
+
+        return audioquality.QualityReport(self.quality_cutoff_hz).describe()
+
+    @property
     def h_quality(self):
 
         if self.download_attributes is None:
@@ -297,7 +306,8 @@ class DownloadList:
             1 for item in self.items.values()
             if item.status in (
                 DownloadListItemStatus.PENDING, DownloadListItemStatus.LIBRARY_CHECK,
-                DownloadListItemStatus.SEARCHING, DownloadListItemStatus.DOWNLOADING
+                DownloadListItemStatus.SEARCHING, DownloadListItemStatus.DOWNLOADING,
+                DownloadListItemStatus.QUALITY_CHECK
             )
         )
 
@@ -1296,6 +1306,9 @@ class DownloadLists:
         item.download_match_percentage = None
         item.download_percent = 0
         item.quality_cutoff_hz = None
+        # A fresh start gets a fresh allowance of fakes to try past, but the
+        # sources already known to be fakes stay known
+        item.num_quality_rejections = 0
         item.suggestions = []
         item.near_misses = {}
 
@@ -1439,6 +1452,7 @@ class DownloadLists:
                 "downloaded_file": item.download_filename,
                 "user": item.download_username or "",
                 "quality": item.h_quality,
+                "measured_quality": item.h_measured_quality,
                 "length": item.h_length
             }
             for item in download_list.items.values()
@@ -1452,13 +1466,13 @@ class DownloadLists:
             writer = csv.writer(handle)
             writer.writerow([
                 _("Search Term"), _("Searched Term"), _("Status"), _("Downloaded File"),
-                _("User"), _("Quality"), _("Length")
+                _("User"), _("Quality"), _("Measured Quality"), _("Length")
             ])
 
             for row in rows:
                 writer.writerow([
                     row["term"], row["searched_term"], row["status"], row["downloaded_file"],
-                    row["user"], row["quality"], row["length"]
+                    row["user"], row["quality"], row["measured_quality"], row["length"]
                 ])
 
     # Watch Folder #
@@ -2420,9 +2434,16 @@ class DownloadLists:
         self._check_list_complete(list_name)
 
     def _run_quality_check(self, list_name, term, file_path):
-        """Background thread: measure the file's spectral cutoff."""
+        """Background thread: measure the file's spectral cutoff. Whatever
+        goes wrong, the item must not be left at "Checking Quality" forever."""
 
-        report = audioquality.analyze_file(file_path)
+        try:
+            report = audioquality.analyze_file(file_path)
+
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            log.add_debug("Quality check of %s failed: %s", (file_path, error))
+            report = None
+
         events.invoke_main_thread(self._resolve_quality_check, list_name, term, file_path, report)
 
     def _resolve_quality_check(self, list_name, term, file_path, report):
@@ -2469,10 +2490,8 @@ class DownloadLists:
             self._check_list_complete(list_name)
             return
 
-        rejected_files = item.rejected_files
         num_rejections = item.num_quality_rejections
         self._clear_item_progress(item)
-        item.rejected_files = rejected_files
         item.num_quality_rejections = num_rejections
 
         if download_list.effective_auto_download:
@@ -2489,10 +2508,18 @@ class DownloadLists:
         folder_path = os.path.join(
             download_list.effective_download_folder_path or os.path.dirname(file_path),
             self.REJECTED_QUALITY_FOLDER_NAME)
-        target_path = os.path.join(folder_path, os.path.basename(file_path))
+        basename = os.path.basename(file_path)
+        name_root, extension = os.path.splitext(basename)
+        target_path = os.path.join(folder_path, basename)
+        counter = 1
 
         try:
             os.makedirs(encode_path(folder_path), exist_ok=True)
+
+            while os.path.exists(encode_path(target_path)):
+                target_path = os.path.join(folder_path, f"{name_root} ({counter}){extension}")
+                counter += 1
+
             os.replace(encode_path(file_path), encode_path(target_path))
 
         except OSError as error:

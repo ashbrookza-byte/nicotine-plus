@@ -5,6 +5,7 @@ import os
 import shutil
 import time
 
+from unittest import mock
 from unittest import TestCase
 
 from pynicotine.config import config
@@ -1418,7 +1419,7 @@ class DownloadListsTest(TestCase):
         core.download_lists.retarget_list_item("Retarget List", "third", "first")
         self.assertEqual(list(download_list.items), ["first", "Bicep Opal Four Tet Rmx"])
 
-    def _finish_download_with_file(self, list_name, term, username="qualityuser"):
+    def _finish_download_with_file(self, list_name, term, username="qualityuser", lossless=False):
         """Dispatch, match and finish a download for the item, with an actual
         (dummy) file at the finished download's path. Returns item, file path."""
 
@@ -1428,8 +1429,12 @@ class DownloadListsTest(TestCase):
         item = download_list.items[term]
         core.download_lists._dispatch_item(download_list, item)
 
-        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
-        files = [(1, f"@@abc\\{term}.mp3", 1000, "mp3", attributes)]
+        if lossless:
+            attributes = FileAttributes(length=200, sample_rate=44100, bit_depth=16)
+            files = [(1, f"@@abc\\{term}.flac", 1000, "flac", attributes)]
+        else:
+            attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+            files = [(1, f"@@abc\\{term}.mp3", 1000, "mp3", attributes)]
         core.download_lists._file_search_response(self._make_response(item.token, username, files))
         core.download_lists._finalize_item(list_name, term)
 
@@ -1533,6 +1538,239 @@ class DownloadListsTest(TestCase):
             "Fake List", "Fake Artist - Fake Song", file_path, audioquality.QualityReport(16100))
 
         self.assertEqual(item.status, DownloadListItemStatus.NOT_FOUND)
+
+    def test_late_quality_result_after_reset_or_removal_is_ignored(self):
+        """The analysis runs in a thread: by the time its result arrives the
+        user may have reset the item, or removed the whole list."""
+
+        from pynicotine import audioquality
+
+        config.sections["transfers"]["downloadlistqualitycheck"] = True
+
+        if not audioquality.decoder_available():
+            self.skipTest("no audio decoder installed")
+
+        core.download_lists.add_list(
+            "Late List", download_folder_path=DATA_FOLDER_PATH, quality="high", auto_download=True)
+        core.download_lists.add_list_items("Late List", ["Late Artist - Late Song"])
+
+        item, file_path = self._finish_download_with_file("Late List", "Late Artist - Late Song")
+        self.assertEqual(item.status, DownloadListItemStatus.QUALITY_CHECK)
+
+        core.download_lists.reset_list_item("Late List", "Late Artist - Late Song")
+        self.assertNotEqual(item.status, DownloadListItemStatus.QUALITY_CHECK)
+
+        core.download_lists._resolve_quality_check(
+            "Late List", "Late Artist - Late Song", file_path, audioquality.QualityReport(16100))
+
+        # Neither completed nor rejected by the stale result; the file is left alone
+        self.assertNotEqual(item.status, DownloadListItemStatus.COMPLETED)
+        self.assertEqual(item.num_quality_rejections, 0)
+        self.assertTrue(os.path.exists(file_path))
+
+        core.download_lists.remove_list("Late List")
+        core.download_lists._resolve_quality_check(
+            "Late List", "Late Artist - Late Song", file_path, audioquality.QualityReport(16100))
+
+    def _wait_for_quality_verdict(self, item):
+        """The analysis thread hands its verdict to the main thread through the
+        event queue; pump it the way the main loop would."""
+
+        from pynicotine.events import events
+
+        for _attempt in range(100):
+            events.process_thread_events()
+
+            if item.status != DownloadListItemStatus.QUALITY_CHECK:
+                return
+
+            time.sleep(0.05)
+
+        self.fail("quality check never resolved")
+
+    def test_quality_check_thread_delivers_its_verdict_to_the_main_thread(self):
+
+        from pynicotine import audioquality
+
+        config.sections["transfers"]["downloadlistqualitycheck"] = True
+
+        if not audioquality.decoder_available():
+            self.skipTest("no audio decoder installed")
+
+        core.download_lists.add_list(
+            "Thread List", download_folder_path=DATA_FOLDER_PATH, quality="high", auto_download=True)
+        core.download_lists.add_list_items("Thread List", ["Thread Artist - Thread Song", "Crash Artist - Crash Song"])
+
+        with mock.patch("pynicotine.audioquality.analyze_file", return_value=audioquality.QualityReport(20300)):
+            item, file_path = self._finish_download_with_file("Thread List", "Thread Artist - Thread Song")
+            self._wait_for_quality_verdict(item)
+
+        self.assertEqual(item.status, DownloadListItemStatus.COMPLETED)
+        self.assertEqual(item.quality_cutoff_hz, 20300)
+        self.assertTrue(os.path.exists(file_path))
+
+        # An analysis that blows up must still resolve the item, as unjudged
+        with mock.patch("pynicotine.audioquality.analyze_file", side_effect=RuntimeError("boom")):
+            item, _file_path = self._finish_download_with_file("Thread List", "Crash Artist - Crash Song")
+            self._wait_for_quality_verdict(item)
+
+        self.assertEqual(item.status, DownloadListItemStatus.COMPLETED)
+        self.assertIsNone(item.quality_cutoff_hz)
+
+    def test_unjudgeable_download_is_kept(self):
+
+        from pynicotine import audioquality
+
+        config.sections["transfers"]["downloadlistqualitycheck"] = True
+
+        if not audioquality.decoder_available():
+            self.skipTest("no audio decoder installed")
+
+        core.download_lists.add_list(
+            "Unjudged List", download_folder_path=DATA_FOLDER_PATH, quality="high", auto_download=True)
+        core.download_lists.add_list_items("Unjudged List", ["Odd Artist - Odd Song"])
+
+        item, file_path = self._finish_download_with_file("Unjudged List", "Odd Artist - Odd Song")
+        core.download_lists._resolve_quality_check("Unjudged List", "Odd Artist - Odd Song", file_path, None)
+
+        self.assertEqual(item.status, DownloadListItemStatus.COMPLETED)
+        self.assertTrue(os.path.exists(file_path))
+
+    def test_quality_bar_follows_the_list_quality_setting(self):
+        """A 19.6 kHz file is fine for "high" or "good" but not for a
+        "lossless only" list; a 17.6 kHz one is fine only for "good"."""
+
+        from pynicotine import audioquality
+
+        config.sections["transfers"]["downloadlistqualitycheck"] = True
+
+        if not audioquality.decoder_available():
+            self.skipTest("no audio decoder installed")
+
+        expectations = (
+            ("lossless", 19600, DownloadListItemStatus.PENDING),
+            ("high", 19600, DownloadListItemStatus.COMPLETED),
+            ("good", 17600, DownloadListItemStatus.COMPLETED),
+            ("high", 17600, DownloadListItemStatus.PENDING),
+        )
+
+        for index, (quality, cutoff_hz, expected_status) in enumerate(expectations):
+            list_name = f"Bar List {index}"
+            term = f"Bar Artist - Bar Song {index}"
+            core.download_lists.add_list(
+                list_name, download_folder_path=DATA_FOLDER_PATH, quality=quality, auto_download=True)
+            core.download_lists.add_list_items(list_name, [term])
+
+            item, file_path = self._finish_download_with_file(list_name, term, lossless=(quality == "lossless"))
+            core.download_lists._resolve_quality_check(list_name, term, file_path, audioquality.QualityReport(cutoff_hz))
+
+            if expected_status == DownloadListItemStatus.COMPLETED:
+                self.assertEqual(item.status, expected_status, (quality, cutoff_hz))
+            else:
+                self.assertIn(item.status, (DownloadListItemStatus.PENDING, DownloadListItemStatus.SEARCHING),
+                              (quality, cutoff_hz))
+
+    def test_rejected_files_do_not_overwrite_each_other(self):
+
+        from pynicotine import audioquality
+
+        config.sections["transfers"]["downloadlistqualitycheck"] = True
+
+        if not audioquality.decoder_available():
+            self.skipTest("no audio decoder installed")
+
+        download_list = core.download_lists.add_list(
+            "Collide List", download_folder_path=DATA_FOLDER_PATH, quality="high", auto_download=True)
+        core.download_lists.add_list_items("Collide List", ["Same Artist - Same Song"])
+        rejected_folder = os.path.join(DATA_FOLDER_PATH, core.download_lists.REJECTED_QUALITY_FOLDER_NAME)
+
+        item, file_path = self._finish_download_with_file("Collide List", "Same Artist - Same Song", username="user1")
+        core.download_lists._resolve_quality_check(
+            "Collide List", "Same Artist - Same Song", file_path, audioquality.QualityReport(16100))
+
+        # Second source, same filename
+        if item.status == DownloadListItemStatus.PENDING:
+            core.download_lists._dispatch_item(download_list, item)
+
+        attributes = FileAttributes(bitrate=320, length=200, vbr=0)
+        files = [(1, "@@abc\\Same Artist - Same Song.mp3", 1000, "mp3", attributes)]
+        core.download_lists._file_search_response(self._make_response(item.token, "user2", files))
+        core.download_lists._finalize_item("Collide List", "Same Artist - Same Song")
+
+        with open(file_path, "wb") as handle:
+            handle.write(b"\0" * 1000)
+
+        from pynicotine.transfers import TransferStatus
+        transfer = core.downloads.transfers.get("user2" + item.download_virtual_path)
+        transfer.status = TransferStatus.FINISHED
+        core.download_lists._update_download(transfer, True)
+        self.assertEqual(item.status, DownloadListItemStatus.QUALITY_CHECK)
+
+        core.download_lists._resolve_quality_check(
+            "Collide List", "Same Artist - Same Song", file_path, audioquality.QualityReport(16100))
+
+        rejected = sorted(os.listdir(rejected_folder))
+        self.assertIn("Same Artist - Same Song.mp3", rejected)
+        self.assertIn("Same Artist - Same Song (1).mp3", rejected)
+        self.assertEqual(item.num_quality_rejections, 2)
+        self.assertEqual(len(item.rejected_files), 2)
+
+    def test_manual_reset_forgives_the_strike_count_but_not_the_fakes(self):
+
+        download_list = core.download_lists.add_list("Strike List", quality="high", auto_download=True)
+        core.download_lists.add_list_items("Strike List", ["Strike Artist - Strike Song"])
+        item = download_list.items["Strike Artist - Strike Song"]
+        item.status = DownloadListItemStatus.NOT_FOUND
+        item.rejected_files = {"user1@@abc\\a.mp3", "user2@@abc\\b.mp3"}
+        item.num_quality_rejections = 3
+        item.quality_cutoff_hz = 16100
+
+        core.download_lists.reset_list_item("Strike List", "Strike Artist - Strike Song")
+
+        self.assertEqual(item.num_quality_rejections, 0)
+        self.assertIsNone(item.quality_cutoff_hz)
+        self.assertEqual(item.rejected_files, {"user1@@abc\\a.mp3", "user2@@abc\\b.mp3"})
+
+    def test_quality_fields_survive_save_and_load(self):
+
+        download_list = core.download_lists.add_list("Persist Quality List", quality="high", auto_download=False)
+        core.download_lists.add_list_items("Persist Quality List", ["Kept Artist - Kept Song"])
+        item = download_list.items["Kept Artist - Kept Song"]
+        item.status = DownloadListItemStatus.COMPLETED
+        item.rejected_files = {"user1@@abc\\a.mp3"}
+        item.num_quality_rejections = 1
+        item.quality_cutoff_hz = 20300
+        core.download_lists._save()
+
+        core.download_lists.lists.clear()
+        core.download_lists._load()
+
+        loaded = core.download_lists.lists["Persist Quality List"].items["Kept Artist - Kept Song"]
+        self.assertEqual(loaded.rejected_files, {"user1@@abc\\a.mp3"})
+        self.assertEqual(loaded.num_quality_rejections, 1)
+        self.assertEqual(loaded.quality_cutoff_hz, 20300)
+        self.assertEqual(loaded.h_measured_quality, "20.3 kHz cutoff (~320 kbps)")
+
+        rows = core.download_lists.get_summary_rows("Persist Quality List")
+        self.assertEqual(rows[0]["measured_quality"], "20.3 kHz cutoff (~320 kbps)")
+
+        # An interrupted check comes back as pending, not stuck at Checking Quality
+        loaded.status = DownloadListItemStatus.QUALITY_CHECK
+        core.download_lists._save()
+        core.download_lists.lists.clear()
+        core.download_lists._load()
+        loaded = core.download_lists.lists["Persist Quality List"].items["Kept Artist - Kept Song"]
+        self.assertEqual(loaded.status, DownloadListItemStatus.PENDING)
+
+    def test_quality_check_counts_as_still_pending_for_list_completion(self):
+
+        download_list = core.download_lists.add_list("Pending Quality List", quality="high", auto_download=True)
+        core.download_lists.add_list_items("Pending Quality List", ["Wait Artist - Wait Song"])
+        item = download_list.items["Wait Artist - Wait Song"]
+        item.status = DownloadListItemStatus.QUALITY_CHECK
+
+        self.assertEqual(download_list.num_pending, 1)
+        self.assertFalse(download_list.is_complete)
 
     def test_quality_check_skipped_when_disabled_or_any_quality(self):
 
